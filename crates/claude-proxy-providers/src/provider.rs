@@ -417,6 +417,10 @@ pub struct NativeResponsesResponse {
 }
 
 /// Trait implemented by upstream provider adapters.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to methods that return already-must-use boxed futures"
+)]
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Provider identifier (e.g., "openai", "anthropic").
