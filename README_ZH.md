@@ -281,10 +281,13 @@ ChatGPT provider 会优先通过 OAuth 从 Codex `/models` 获取在线模型目
 | `gpt-5.6-terra` | Sonnet | 872k | `low`…`ultra` | 是 |
 | `gpt-5.6-luna` | Haiku | 872k | `low`…`max` | 是 |
 | `gpt-6-astra` | 可选高级模型 | 272k | `low`…`ultra` | 是 |
+| `gpt-6-sol` | 可选通用模型 | 272k | `low`…`ultra` | 是 |
+| `gpt-6-luna` | 可选轻量模型 | 272k | `low`…`max` | 是 |
+| `gpt-6.1-sol` | 可选通用模型 | 272k | `low`…`ultra` | 是 |
 
-Astra 的 ChatGPT 回退使用 Codex 目录中的 272K 默认窗口，不自动启用可选的 872K 扩展窗口。`openai/gpt-6-astra` 则声明公开 API 的 1,050,000 context、128,000 output 和 `low` 到 `max` 推理能力，Messages 请求也使用 Responses；两种提供商的限制分别处理。
+Astra、GPT-6 Sol/Luna 和 GPT-6.1 Sol 的 ChatGPT 回退使用 Codex 目录中的 272K 默认窗口，不自动启用可选的 872K 扩展窗口。`openai/gpt-6-astra` 则声明公开 API 的 1,050,000 context、128,000 output 和 `low` 到 `max` 推理能力，Messages 请求也使用 Responses；两种提供商的限制分别处理。
 
-所有新建 ChatGPT 映射默认使用 `high`。TUI 的 Reasoning picker 对所有 Provider 都按当前模型声明的 `reasoning_effort_levels` 过滤，并在打开时按需拉取、缓存模型能力；能力明确为空时只显示 `unset`，拿不到能力或使用目录外的自定义模型时才显示完整兼容列表。以 GPT-5.6 为例，Sol/Terra 显示 `low` 到 `ultra`，Luna 只显示 `low` 到 `max`，不会再给 Luna 显示 `default`、`none` 或 `minimal`。`unset` 用于清除代理侧强制覆盖。`ultra` 遵循 Codex 语义：上游请求发送 `max`；Sol/Terra/Astra 且请求包含委派工具时，同时启用主动多代理指令，否则仅按 `max` 发送并记录警告。Luna 不支持 `ultra`，会降为 `max`。
+所有新建 ChatGPT 映射默认使用 `high`。TUI 的 Reasoning picker 对所有 Provider 都按当前模型声明的 `reasoning_effort_levels` 过滤，并在打开时按需拉取、缓存模型能力；能力明确为空时只显示 `unset`，拿不到能力或使用目录外的自定义模型时才显示完整兼容列表。以 GPT-5.6 为例，Sol/Terra 显示 `low` 到 `ultra`，Luna 只显示 `low` 到 `max`，不会再给 Luna 显示 `default`、`none` 或 `minimal`。`unset` 用于清除代理侧强制覆盖。`ultra` 遵循 Codex 语义：上游请求发送 `max`；支持 `ultra` 的 Sol/Terra/Astra 模型且请求包含委派工具时，同时启用主动多代理指令，否则仅按 `max` 发送并记录警告。Luna 不支持 `ultra`，会降为 `max`。
 
 #### Claude Code 虚拟 1M 与真实上游窗口
 
@@ -520,7 +523,11 @@ Outputs 能力和不支持的参数。每个模型还会返回 `provider` 和可
 Codex 后端不接受 `max_output_tokens`；Proxy 会在 `unsupported_parameters` 中声明并在
 转发前移除。原生 OpenAI Provider 仍会原样收到 `max_output_tokens`。
 
-最后一个流式消费者断开后，Proxy 会立即停止上游读取；仍有其他共享消费者时继续传输。ChatGPT 客户端仅在已知 HTTPS ChatGPT 域名存储上游 `__oailb` 路由 Cookie，并遵守域名、路径、安全传输和过期规则。
+服务档位只在请求或配置指定时发送；显式 `flex` 不会因为目录缺少该档位而被移除，目录中的默认档位提示也不会隐式启用 priority。Flex 容量不足在开流前返回 HTTP 503 和 `x-should-retry: false`。
+
+Responses 错误会保留服务端重试建议和请求 ID。HTTP 等待建议超过 5 秒时，代理交还调用方安排重试，不提前重试。未知的不完整响应原因在 Messages/Chat 翻译路径报告为错误；原生 Responses 保留原始终止事件。长度截断和内容过滤保持已有结束原因映射，用量仍被记录。收到终止 SSE 事件后立即结束上游读取。
+
+最后一个流式消费者断开后，Proxy 会立即停止上游读取；仍有其他共享消费者时继续传输。ChatGPT 客户端仅在已知 HTTPS/WSS ChatGPT 域名存储上游 `__oailb` 路由 Cookie，并在同一 provider 的 HTTP 与 WebSocket 之间共享，遵守域名、路径、安全传输和过期规则。WebSocket 连接及续接状态按凭证所有者和路由配置隔离。
 
 ### OpenAI 客户端接入
 

@@ -257,9 +257,24 @@ requests for this model also use Responses. The ChatGPT fallback uses the Codex
 catalog's 272,000-token default context; online metadata and explicit capability
 overrides take precedence. These provider limits are separate.
 
+The ChatGPT fallback catalog also includes `gpt-6-sol`, `gpt-6-luna`, and
+`gpt-6.1-sol`, using Responses Lite and the 272,000-token default context.
+Service tiers are sent only when requested or configured; an explicit `flex`
+tier is retained even when the catalog omits it. Flex capacity failures return
+503 with `x-should-retry: false` before streaming begins.
+
+Responses failures retain server retry advice and request IDs. HTTP retry delays
+over five seconds are returned to the caller instead of retried early. Unknown
+incomplete-response reasons are errors on translated Messages/Chat streams;
+native Responses preserves the original terminal event. Token-limit and
+content-filter finish reasons retain their existing mappings. Terminal SSE events
+close the upstream read without waiting for the server to close its socket.
+
 Disconnecting the last streaming consumer closes the upstream read immediately;
 other consumers of a shared request can continue. ChatGPT clients retain only the
-upstream `__oailb` routing cookie on known HTTPS ChatGPT hosts. Model caches are
+upstream `__oailb` routing cookie on known HTTPS/WSS ChatGPT hosts, shared between
+the provider's HTTP and WebSocket transports. WebSocket connections and
+continuations are isolated by credential ownership and routing configuration. Model caches are
 invalidated when their provider or authentication scope changes. Existing context
 capability caches are refreshed after upgrading to the new identity-scoped format.
 

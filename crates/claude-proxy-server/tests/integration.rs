@@ -167,6 +167,7 @@ async fn mock_responses(headers: HeaderMap, Json(payload): Json<serde_json::Valu
     let is_compaction = input
         .iter()
         .any(|item| item["type"] == "compaction_trigger");
+    assert_eq!(payload["input"], json!(native_codex_input(is_compaction)));
     let force_failure = payload
         .pointer("/metadata/force_failure")
         .and_then(serde_json::Value::as_bool)
@@ -324,7 +325,16 @@ fn native_codex_input(compaction: bool) -> Vec<serde_json::Value> {
         json!({
             "type": "message",
             "role": "user",
-            "content": [{"type": "input_text", "text": "Hi"}]
+            "content": [{"type": "input_text", "text": "Hi"}, {"type":"input_image", "file_id":"file-native"}]
+        }),
+        json!({
+            "type":"message", "role":"assistant", "phase":"partial_answer",
+            "status":"completed", "encrypted_content":"opaque-output",
+            "content":[{"type":"output_text", "text":"partial", "annotations":[], "logprobs":[]}]
+        }),
+        json!({
+            "type":"additional_tools", "id":"at-incremental", "role":"developer",
+            "tools":[{"type":"namespace", "name":"later", "tools":[]}]
         }),
     ];
     if compaction {

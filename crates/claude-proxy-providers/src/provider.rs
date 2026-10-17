@@ -142,6 +142,9 @@ pub enum ProviderError {
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
 
+    #[error("flex capacity unavailable: {0}")]
+    FlexUnavailable(String),
+
     #[error("model not found: {0}")]
     ModelNotFound(String),
 

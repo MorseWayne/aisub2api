@@ -121,6 +121,13 @@ pub(super) fn build_body_with_context(
     )?;
     if let Some(object) = body.as_object_mut() {
         object.remove("stop");
+        if context
+            .model
+            .is_some_and(|model| !model.capabilities.limits.reasoning_effort_levels.is_empty())
+        {
+            object.remove("temperature");
+            object.remove("top_p");
+        }
         object.remove("max_output_tokens");
         object.insert("stream".to_string(), json!(true));
         apply_codex_defaults(object, context);

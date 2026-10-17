@@ -2842,6 +2842,7 @@ fn provider_error_kind(error: &ProviderError) -> &'static str {
         ProviderError::Timeout => "timeout",
         ProviderError::UpstreamError { .. } => "upstream",
         ProviderError::ServiceUnavailable(_) => "service_unavailable",
+        ProviderError::FlexUnavailable(_) => "flex_unavailable",
         ProviderError::Network(_) => "network",
         ProviderError::WithUpstreamMetadata { .. } => unreachable!(),
     }
@@ -2891,6 +2892,16 @@ fn provider_error_to_response(error: &ProviderError) -> Response {
         ProviderError::UpstreamError { status, body } => {
             error!("Upstream error (HTTP {status}): {body}");
             upstream_error_to_response(*status, body)
+        }
+        ProviderError::FlexUnavailable(msg) => {
+            let mut response = error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &ErrorResponse::api_error(msg),
+            );
+            response
+                .headers_mut()
+                .insert("x-should-retry", HeaderValue::from_static("false"));
+            response
         }
         ProviderError::ServiceUnavailable(msg) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4497,6 +4508,28 @@ mod tests {
                     .unwrap()
                     .contains("response budget exceeded")
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn flex_capacity_errors_are_terminal_for_all_downstream_protocols() {
+        let error = ProviderError::FlexUnavailable("no Flex capacity".to_string());
+        for response in [
+            provider_error_to_response(&error),
+            crate::downstream::provider_error_response(
+                &DownstreamProtocol::chat_completions("model", false),
+                &error,
+            ),
+            crate::downstream::provider_error_response(
+                &DownstreamProtocol::responses("model", serde_json::Map::new()),
+                &error,
+            ),
+        ] {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()["x-should-retry"], "false");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["message"], "no Flex capacity");
         }
     }
 

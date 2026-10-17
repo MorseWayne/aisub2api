@@ -305,6 +305,12 @@ pub(crate) fn provider_error_response(
                     ),
                 }
             }
+            ProviderError::FlexUnavailable(message) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorResponse::api_error(message),
+                None,
+                false,
+            ),
             ProviderError::ServiceUnavailable(message) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorResponse::api_error(message),
@@ -325,6 +331,13 @@ pub(crate) fn provider_error_response(
         response
             .headers_mut()
             .insert("x-should-retry", HeaderValue::from_static("true"));
+    } else if matches!(
+        error.without_upstream_metadata(),
+        ProviderError::FlexUnavailable(_)
+    ) {
+        response
+            .headers_mut()
+            .insert("x-should-retry", HeaderValue::from_static("false"));
     }
     if let Some(seconds) = retry_after
         && let Ok(value) = HeaderValue::from_str(&seconds.to_string())

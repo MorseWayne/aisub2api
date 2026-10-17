@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use crate::http::{json_headers_to_header_map, upstream_error_metadata_from_parts};
 use crate::provider::ProviderEvent;
 use base64::Engine;
 use claude_proxy_config::settings::ReasoningMarkerMode;
@@ -560,6 +561,7 @@ impl ChatGptWebSocketSession {
 struct ContinuationKey {
     provider_id: String,
     account_id: String,
+    auth_identity: String,
     model: String,
     stable_client_conversation_id: String,
     schema_version: &'static str,
@@ -671,6 +673,7 @@ struct CachedWebSocketConnection {
 struct WebSocketConnectionKey {
     provider_id: String,
     account_id: String,
+    auth_identity: String,
     model: String,
     session_id: String,
     thread_id: String,
@@ -686,6 +689,10 @@ fn websocket_connection_key(
     WebSocketConnectionKey {
         provider_id: provider.id.clone(),
         account_id: token.account_id.as_deref().unwrap_or_default().to_string(),
+        auth_identity: super::model_identity::with_routing_headers(
+            &token.model_cache_identity(),
+            &provider.runtime,
+        ),
         model: body
             .get("model")
             .and_then(Value::as_str)
@@ -700,6 +707,7 @@ fn websocket_connection_key(
 fn same_continuation_fallback_scope(left: &ContinuationKey, right: &ContinuationKey) -> bool {
     left.provider_id == right.provider_id
         && left.account_id == right.account_id
+        && left.auth_identity == right.auth_identity
         && left.model == right.model
         && left.schema_version == right.schema_version
 }
@@ -789,6 +797,10 @@ fn continuation_key(
     Some(ContinuationKey {
         provider_id: provider.id.clone(),
         account_id: token.account_id.as_deref()?.trim().to_string(),
+        auth_identity: super::model_identity::with_routing_headers(
+            &token.model_cache_identity(),
+            &provider.runtime,
+        ),
         model: body.get("model")?.as_str()?.trim().to_string(),
         stable_client_conversation_id: stable_client_conversation_id?.trim().to_string(),
         schema_version: CHATGPT_CONTINUATION_SCHEMA_VERSION,
@@ -1683,22 +1695,33 @@ async fn connect_websocket(
         )
     })?;
     request.headers_mut().extend(headers);
+    provider
+        .routing_cookies
+        .websocket_request_headers(&url, request.headers_mut());
     let connector = websocket_tls_connector(&provider.extra_ca_certs)?;
     let resolved_proxy = resolve_websocket_proxy(provider.proxy.as_deref(), &url)?;
     let proxy_source = resolved_proxy.source;
     let proxy_enabled = resolved_proxy.url.is_some();
     let connect_timeout = websocket_connect_timeout(provider);
+    let map_connect_error = |error| {
+        if let WsError::Http(response) = &error {
+            provider
+                .routing_cookies
+                .store_websocket_response(&url, response.headers());
+        }
+        map_websocket_connect_error(error)
+    };
 
     let (stream, response) = tokio::time::timeout(connect_timeout, async {
         if let Some(proxy) = resolved_proxy.url.as_deref() {
             let socket = connect_proxy_tunnel(proxy, &url, connect_timeout).await?;
             client_async_tls_with_config(request, socket, None, connector)
                 .await
-                .map_err(map_websocket_connect_error)
+                .map_err(map_connect_error)
         } else {
             connect_async_tls_with_config(request, None, false, connector)
                 .await
-                .map_err(map_websocket_connect_error)
+                .map_err(map_connect_error)
         }
     })
     .await
@@ -1710,6 +1733,9 @@ async fn connect_websocket(
         )
     })??;
 
+    provider
+        .routing_cookies
+        .store_websocket_response(&url, response.headers());
     info!(
         transport = "websocket",
         status = response.status().as_u16(),
@@ -2384,43 +2410,25 @@ fn map_wrapped_websocket_error_event(value: &Value, original_text: &str) -> Prov
         .and_then(|event| event.error.as_ref())
         .and_then(|error| error.code.as_deref());
 
+    let headers = parsed
+        .as_ref()
+        .and_then(|event| event.headers.clone())
+        .map(json_headers_to_header_map)
+        .unwrap_or_default();
+    let metadata =
+        upstream_error_metadata_from_parts(status, &headers, original_text, message.clone());
     if code == Some(WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE) {
         return ProviderError::Overloaded {
             message,
-            retry_after: None,
-        };
+            retry_after: metadata.retry_after,
+        }
+        .with_upstream_metadata(metadata);
     }
-
+    if code == Some("flex_unavailable") {
+        return ProviderError::FlexUnavailable(message).with_upstream_metadata(metadata);
+    }
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    let headers = parsed
-        .and_then(|event| event.headers)
-        .map(json_headers_to_header_map)
-        .unwrap_or_default();
     map_chatgpt_error_status_body_with_headers(status, &headers, original_text.to_string())
-}
-
-fn json_headers_to_header_map(headers: serde_json::Map<String, Value>) -> HeaderMap {
-    let mut mapped = HeaderMap::new();
-    for (name, value) in headers {
-        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
-            continue;
-        };
-        let Some(header_value) = json_header_value(value) else {
-            continue;
-        };
-        mapped.insert(header_name, header_value);
-    }
-    mapped
-}
-
-fn json_header_value(value: Value) -> Option<HeaderValue> {
-    let value = match value {
-        Value::String(value) => value,
-        Value::Number(value) => value.to_string(),
-        Value::Bool(value) => value.to_string(),
-        _ => return None,
-    };
-    HeaderValue::from_str(&value).ok()
 }
 
 fn is_terminal_response_event(value: &Value) -> bool {
@@ -2466,6 +2474,23 @@ mod tests {
     use super::*;
     use claude_proxy_config::settings::{ProviderRequestConfig, ProviderRuntimeConfig};
     use serde_json::json;
+
+    #[test]
+    fn websocket_connection_limit_preserves_retry_after() {
+        let value = json!({"type":"error", "status":429, "error":{"code":"websocket_connection_limit_reached", "message":"too many sockets"}, "headers":{"retry-after-ms":90500, "x-request-id":"req-ws"}});
+        let error = map_wrapped_websocket_error_event(&value, &value.to_string());
+        assert!(matches!(
+            error.without_upstream_metadata(),
+            ProviderError::Overloaded {
+                retry_after: Some(91),
+                ..
+            }
+        ));
+        assert_eq!(
+            error.upstream_metadata().unwrap().request_id.as_deref(),
+            Some("req-ws")
+        );
+    }
 
     #[test]
     fn websocket_connect_timeout_uses_runtime_attempt_timeout_override() {
@@ -2601,6 +2626,7 @@ mod tests {
         let cached_key = ContinuationKey {
             provider_id: "chatgpt".to_string(),
             account_id: "account".to_string(),
+            auth_identity: "owner".to_string(),
             model: "gpt-5.5".to_string(),
             stable_client_conversation_id: "cp-synth-old".to_string(),
             schema_version: CHATGPT_CONTINUATION_SCHEMA_VERSION,
@@ -2660,6 +2686,7 @@ mod tests {
         let cached_key = ContinuationKey {
             provider_id: "chatgpt".to_string(),
             account_id: "account".to_string(),
+            auth_identity: "owner".to_string(),
             model: "gpt-5.5".to_string(),
             stable_client_conversation_id: "explicit-old".to_string(),
             schema_version: CHATGPT_CONTINUATION_SCHEMA_VERSION,
@@ -2929,6 +2956,7 @@ mod tests {
         let cached_key = ContinuationKey {
             provider_id: "chatgpt".to_string(),
             account_id: "account".to_string(),
+            auth_identity: "owner".to_string(),
             model: "gpt-5.5".to_string(),
             stable_client_conversation_id: "cp-synth-old".to_string(),
             schema_version: CHATGPT_CONTINUATION_SCHEMA_VERSION,
@@ -2986,6 +3014,7 @@ mod tests {
         let key = ContinuationKey {
             provider_id: "chatgpt".to_string(),
             account_id: "account".to_string(),
+            auth_identity: "owner".to_string(),
             model: "gpt-5.5".to_string(),
             stable_client_conversation_id: "conversation".to_string(),
             schema_version: CHATGPT_CONTINUATION_SCHEMA_VERSION,
@@ -3035,6 +3064,7 @@ mod tests {
         let key = ContinuationKey {
             provider_id: "chatgpt".to_string(),
             account_id: "account".to_string(),
+            auth_identity: "owner".to_string(),
             model: "gpt-5.3-codex".to_string(),
             stable_client_conversation_id: "conversation".to_string(),
             schema_version: CHATGPT_CONTINUATION_SCHEMA_VERSION,

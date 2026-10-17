@@ -23,6 +23,8 @@ use crate::tool_args::sanitize_tool_arguments;
 use crate::tool_choice::normalize_for_responses;
 
 mod correlation;
+mod errors;
+use errors::responses_error_event;
 mod signature;
 
 #[cfg(test)]
@@ -1538,6 +1540,9 @@ where
                             {
                                 return;
                             }
+                            if converter.stopped {
+                                return;
+                            }
                         }
                     }
                 }
@@ -1732,68 +1737,16 @@ fn response_sse_event(data: Value) -> SseEvent {
     SseEvent { event, data }
 }
 
-fn responses_error_event(value: &Value) -> Option<ProviderError> {
-    match value.get("type").and_then(Value::as_str) {
-        Some("error") => {
-            let status = value
-                .get("status")
-                .or_else(|| value.get("status_code"))
-                .and_then(Value::as_u64)
-                .and_then(|status| u16::try_from(status).ok())
-                .unwrap_or(200);
-            Some(ProviderError::UpstreamError {
-                status,
-                body: value.to_string(),
-            })
-        }
-        Some("response.failed") => Some(responses_failed_error(value)),
-        _ => None,
-    }
-}
-
 fn responses_stream_error(value: &Value, preserve_failed_events: bool) -> Option<ProviderError> {
     if preserve_failed_events
-        && value.get("type").and_then(Value::as_str) == Some("response.failed")
+        && value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| matches!(kind, "response.failed" | "response.incomplete"))
     {
         None
     } else {
         responses_error_event(value)
-    }
-}
-
-fn responses_failed_error(value: &Value) -> ProviderError {
-    let response = value.get("response").unwrap_or(value);
-    let error = response.get("error").unwrap_or(response);
-    let code = error
-        .get("code")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .filter(|message| !message.trim().is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            if code.is_empty() {
-                "Responses API request failed".to_string()
-            } else {
-                format!("Responses API request failed ({code})")
-            }
-        });
-
-    match code {
-        "context_length_exceeded" => ProviderError::RequestTooLarge(message),
-        "invalid_prompt" | "bio_policy" | "cyber_policy" | "insufficient_quota"
-        | "usage_not_included" => ProviderError::InvalidRequest(message),
-        "rate_limit_exceeded" => ProviderError::RateLimited { retry_after: None },
-        "server_error" | "server_is_overloaded" | "slow_down" => ProviderError::Overloaded {
-            message,
-            retry_after: None,
-        },
-        _ => ProviderError::UpstreamError {
-            status: 200,
-            body: value.to_string(),
-        },
     }
 }
 
@@ -3855,10 +3808,7 @@ mod tests {
             .expect("stream should emit error")
             .expect_err("error SSE frame should fail the stream");
         match error.without_upstream_metadata() {
-            ProviderError::UpstreamError { status, body } => {
-                assert_eq!(*status, 200);
-                assert!(body.contains("context_length_exceeded"));
-            }
+            ProviderError::RequestTooLarge(message) => assert_eq!(message, "too long"),
             other => panic!("unexpected error: {other}"),
         }
     }
@@ -3928,7 +3878,7 @@ mod tests {
             ("rate_limit_exceeded", "rate_limited"),
             ("server_error", "overloaded"),
             ("server_is_overloaded", "overloaded"),
-            ("slow_down", "overloaded"),
+            ("slow_down", "rate_limited"),
         ];
 
         for (code, expected) in cases {

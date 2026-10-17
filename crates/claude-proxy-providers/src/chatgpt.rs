@@ -3,6 +3,9 @@
 //! Uses the same OpenAI Auth device flow and Codex Responses endpoint that
 //! opencode uses for ChatGPT Pro/Plus authentication.
 
+#[cfg(test)]
+#[path = "chatgpt/alignment_tests.rs"]
+mod alignment_tests;
 mod auth;
 pub mod capability_cache;
 mod model_identity;
@@ -666,6 +669,7 @@ pub struct ChatGptProvider {
     id: String,
     base_url: String,
     http_client: Client,
+    routing_cookies: Arc<routing_cookie::RoutingCookieJar>,
     endpoint: String,
     models_endpoint: String,
     usage_endpoint: String,
@@ -694,7 +698,8 @@ impl ChatGptProvider {
         config: &ProviderConfig,
         settings: &Settings,
     ) -> Result<Self, ProviderError> {
-        let http_client = build_http_client(&config.proxy, settings)?;
+        let routing_cookies = Arc::new(routing_cookie::RoutingCookieJar::default());
+        let http_client = build_http_client(&config.proxy, settings, Arc::clone(&routing_cookies))?;
         let auth =
             ChatGptAuth::new(http_client.clone(), settings.http.max_response_body_bytes).await?;
         let chatgpt_config = config.chatgpt.clone().unwrap_or_default();
@@ -705,6 +710,7 @@ impl ChatGptProvider {
             id: id.to_string(),
             base_url,
             http_client,
+            routing_cookies,
             endpoint: codex_responses_endpoint(&config.base_url),
             models_endpoint: codex_models_endpoint(&config.base_url),
             usage_endpoint: codex_usage_endpoint(&config.base_url),
@@ -794,6 +800,11 @@ impl ChatGptProvider {
             self.runtime.openai.service_tier.as_deref(),
             self.chatgpt_config.fast_mode,
         )?;
+        // Flex is an explicit request option even when discovery omits it.
+        // Catalog default_service_tier is a UI hint, not an implicit request tier.
+        if requested == "flex" {
+            return Some(requested);
+        }
         let model = normalize_chatgpt_model_id(model);
         let remote_support = self
             .remote_model(model)
@@ -805,7 +816,6 @@ impl ChatGptProvider {
                 .find(|spec| spec.model_id == model)
                 .map(|spec| spec.service_tiers.contains(&requested))
         });
-
         if supported == Some(false) {
             warn!(
                 model,
@@ -2182,10 +2192,9 @@ impl Provider for ChatGptProvider {
         let mut request = apply_openai_intent(request);
         let requested_ultra = normalize_chatgpt_reasoning(&mut request);
         let model_info = self.model_info(&request.model);
-        let model_context = model_info.as_ref().filter(|model| {
-            model.model_id.starts_with("gpt-5.6")
-                || crate::openai_compat::is_gpt_6_astra(&model.model_id)
-        });
+        let model_context = model_info
+            .as_ref()
+            .filter(|model| supports_chatgpt_reasoning_aliases(&model.model_id));
         let ultra_supported = model_info.as_ref().is_some_and(|model| {
             model
                 .capabilities
@@ -2775,9 +2784,13 @@ fn is_version_token(token: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '+'))
 }
 
-fn build_http_client(proxy: &str, settings: &Settings) -> Result<Client, ProviderError> {
+fn build_http_client(
+    proxy: &str,
+    settings: &Settings,
+    routing_cookies: Arc<routing_cookie::RoutingCookieJar>,
+) -> Result<Client, ProviderError> {
     let mut builder = Client::builder()
-        .cookie_provider(Arc::new(routing_cookie::RoutingCookieJar::default()))
+        .cookie_provider(routing_cookies)
         .connect_timeout(Duration::from_secs(settings.http.connect_timeout))
         .read_timeout(Duration::from_secs(settings.http.read_timeout));
 
@@ -3354,6 +3367,19 @@ fn map_chatgpt_error_status_body_with_headers(
             StatusCode::NOT_FOUND => ProviderError::ModelNotFound(message),
             StatusCode::PAYLOAD_TOO_LARGE => ProviderError::RequestTooLarge(message),
             StatusCode::TOO_MANY_REQUESTS
+                if crate::http::upstream_error_code(&body).as_deref()
+                    == Some("flex_unavailable") =>
+            {
+                ProviderError::FlexUnavailable(message)
+            }
+            StatusCode::SERVICE_UNAVAILABLE
+                if crate::http::upstream_error_code(&body).as_deref() == Some("slow_down") =>
+            {
+                ProviderError::RateLimited {
+                    retry_after: metadata.retry_after,
+                }
+            }
+            StatusCode::TOO_MANY_REQUESTS
                 if is_non_retryable_rate_limit_headers(headers)
                     || is_non_retryable_rate_limit_error_body(&body) =>
             {
@@ -3716,6 +3742,30 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
         reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
         service_tiers: &["priority"],
     },
+    ChatGptModelSpec {
+        model_id: "gpt-6-sol",
+        context_window: 272_000,
+        image_input: true,
+        responses_lite: true,
+        reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
+        service_tiers: &["priority"],
+    },
+    ChatGptModelSpec {
+        model_id: "gpt-6-luna",
+        context_window: 272_000,
+        image_input: true,
+        responses_lite: true,
+        reasoning_efforts: &["low", "medium", "high", "xhigh", "max"],
+        service_tiers: &["priority"],
+    },
+    ChatGptModelSpec {
+        model_id: "gpt-6.1-sol",
+        context_window: 272_000,
+        image_input: true,
+        responses_lite: true,
+        reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
+        service_tiers: &["priority"],
+    },
 ];
 
 fn chatgpt_models(config: &ChatGptProviderConfig) -> Vec<ModelInfo> {
@@ -3919,9 +3969,17 @@ fn normalize_chatgpt_model_id(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
+fn supports_chatgpt_reasoning_aliases(model: &str) -> bool {
+    model.starts_with("gpt-5.6")
+        || matches!(
+            model,
+            "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna" | "gpt-6.1-sol"
+        )
+}
+
 fn normalize_chatgpt_reasoning(request: &mut MessagesRequest) -> bool {
     let model = normalize_chatgpt_model_id(&request.model);
-    if !model.starts_with("gpt-5.6") && !crate::openai_compat::is_gpt_6_astra(model) {
+    if !supports_chatgpt_reasoning_aliases(model) {
         return false;
     }
 
@@ -3982,7 +4040,7 @@ fn normalize_chatgpt_reasoning(request: &mut MessagesRequest) -> bool {
 
 fn normalize_chatgpt_native_reasoning(body: &mut Value, model: &str) {
     let model = normalize_chatgpt_model_id(model);
-    if !model.starts_with("gpt-5.6") && !crate::openai_compat::is_gpt_6_astra(model) {
+    if !supports_chatgpt_reasoning_aliases(model) {
         return;
     }
     let Some(effort) = body
@@ -4950,7 +5008,10 @@ mod tests {
                 "gpt-5.6-sol",
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
-                "gpt-6-astra"
+                "gpt-6-astra",
+                "gpt-6-sol",
+                "gpt-6-luna",
+                "gpt-6.1-sol"
             ]
         );
         assert!(chatgpt_model_info("gpt-5.4", &ChatGptProviderConfig::default()).is_none());
@@ -7404,6 +7465,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chatgpt_websocket_continuation_credential_owner_mismatch_sends_full_input() {
+        let mut second_body = chatgpt_websocket_test_body();
+        second_body["input"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {"role": "user", "content": "next"}
+        ]);
+        let (endpoint, requests, handshakes) = websocket_one_request_per_connection_server(vec![
+            vec![
+                websocket_response_created("resp-ws-1"),
+                websocket_response_completed_with_output(
+                    "resp-ws-1",
+                    json!([{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "hello"}]
+                    }]),
+                ),
+            ],
+            vec![
+                websocket_response_created("resp-ws-2"),
+                websocket_response_completed("resp-ws-2"),
+            ],
+        ])
+        .await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+
+        let first = provider
+            .chat_prepared_with_token(
+                chatgpt_test_prepared_request_with_body(
+                    14,
+                    chatgpt_websocket_test_body(),
+                    Some("conversation-account-mismatch"),
+                ),
+                chatgpt_test_token(),
+            )
+            .await
+            .expect("first websocket stream should start");
+        assert!(
+            collect_stream_results(first)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        let mut second_token = chatgpt_test_token();
+        second_token.access_token = "different-opaque-owner".to_string();
+        let second = provider
+            .chat_prepared_with_token(
+                chatgpt_test_prepared_request_with_body(
+                    15,
+                    second_body,
+                    Some("conversation-account-mismatch"),
+                ),
+                second_token,
+            )
+            .await
+            .expect("second websocket stream should start");
+        assert!(
+            collect_stream_results(second)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        assert_eq!(handshakes.lock().unwrap().len(), 2);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].get("previous_response_id").is_none());
+        assert_eq!(requests[1]["input"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[tokio::test]
     async fn chatgpt_websocket_continuation_body_mismatch_sends_full_input() {
         let mut second_body = chatgpt_websocket_test_body();
         second_body["service_tier"] = json!("priority");
@@ -9256,6 +9391,7 @@ mod tests {
             id: "chatgpt".to_string(),
             base_url: endpoint.clone(),
             http_client: Client::new(),
+            routing_cookies: Arc::new(routing_cookie::RoutingCookieJar::default()),
             endpoint,
             models_endpoint: "http://127.0.0.1/models".to_string(),
             usage_endpoint: "http://127.0.0.1/usage".to_string(),

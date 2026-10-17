@@ -1,5 +1,27 @@
 # Changelog
 
+## v4.0.3 - 2026-10-17
+
+### Added
+
+- Added ChatGPT fallback capabilities for GPT-6 Sol, GPT-6 Luna, and GPT-6.1 Sol, including Responses Lite, image input, reasoning aliases, and the Codex catalog's 272K default context.
+
+### Fixed
+
+- Preserve server retry advice in HTTP, Responses SSE, and WebSocket errors. HTTP delays over five seconds are returned to the caller without an early local retry.
+- Classify throttling, credit/spend limits, and Flex capacity failures correctly. Explicit Flex configuration survives catalogs that omit it; capacity failures return HTTP 503 with `x-should-retry: false` before streaming starts.
+- Report unknown incomplete-response reasons as errors on translated streams while preserving native terminal events and usage. Release terminal SSE connections without waiting for upstream socket closure.
+- Share the scoped ChatGPT `__oailb` routing cookie between HTTP and secure WebSocket transports, including rejected handshakes.
+- Partition WebSocket connections and continuations by credential ownership and routing configuration, preventing reuse across different owners with the same account identifier.
+
+### Changed
+
+- Aligned with Codex `e790ce271` and added coverage for incremental tool catalogs, numeric reasoning, image file references, partial answers, and encrypted output replay. Existing default model and implicit service-tier behavior remain unchanged.
+
+### Validation
+
+- Passed all 617 workspace tests, formatting checks, and Clippy with warnings denied. Provider validation used local mocks; real ChatGPT model access and Flex availability were not tested.
+
 ## v4.0.2 - 2026-09-09
 
 ### Added

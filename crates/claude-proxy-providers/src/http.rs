@@ -47,6 +47,10 @@ const NON_RETRYABLE_RATE_LIMIT_VALUES: &[&str] = &[
     "hard_limit",
     "payment_required",
     "quota_exceeded",
+    "credit_balance_exhausted",
+    "organization_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "usage_not_included",
 ];
 const NON_RETRYABLE_RATE_LIMIT_BODY_POINTERS: &[&str] = &[
     "/error/code",
@@ -279,6 +283,16 @@ pub async fn send_upstream_request_with_policy(
             return response;
         }
 
+        // Long server delays belong to the caller's retry schedule. Do not
+        // shorten them and retry early, or hold this request open indefinitely.
+        if response
+            .as_ref()
+            .ok()
+            .and_then(retry_after_delay)
+            .is_some_and(|delay| delay > MAX_RETRY_AFTER_DELAY)
+        {
+            return response;
+        }
         warn_retrying_upstream_request(attempt, max_attempts, &response);
         sleep(retry_delay(attempt, response.as_ref().ok(), policy)).await;
     }
@@ -495,6 +509,14 @@ pub(crate) fn is_non_retryable_rate_limit_error_body(body: &str) -> bool {
         })
 }
 
+pub(crate) fn upstream_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<Value>(body)
+        .ok()?
+        .pointer("/error/code")?
+        .as_str()
+        .map(str::to_string)
+}
+
 fn value_contains_non_retryable_rate_limit(value: &str) -> bool {
     let value = value.to_ascii_lowercase();
     NON_RETRYABLE_RATE_LIMIT_VALUES
@@ -535,12 +557,12 @@ fn retry_after_delay_secs(value: &str) -> Option<Duration> {
 
 fn retry_after_delay_from_now(value: &str, now: SystemTime) -> Option<Duration> {
     if let Ok(secs) = value.parse::<u64>() {
-        return Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER_DELAY));
+        return Some(Duration::from_secs(secs));
     }
 
     let retry_at: SystemTime = DateTime::parse_from_rfc2822(value).ok()?.to_utc().into();
     let delay = retry_at.duration_since(now).unwrap_or(Duration::ZERO);
-    Some(delay.min(MAX_RETRY_AFTER_DELAY))
+    Some(delay)
 }
 
 fn retry_after_delay(response: &reqwest::Response) -> Option<Duration> {
@@ -562,7 +584,7 @@ fn retry_after_delay_from_headers(headers: &reqwest::header::HeaderMap) -> Optio
 
 fn retry_after_ms_delay(value: &str) -> Option<Duration> {
     let ms = value.parse::<u64>().ok()?;
-    Some(Duration::from_millis(ms).min(MAX_RETRY_AFTER_DELAY))
+    Some(Duration::from_millis(ms))
 }
 
 fn retry_after_seconds_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u64> {
@@ -601,6 +623,12 @@ pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError
         401 => ProviderError::Authentication(message),
         404 => ProviderError::ModelNotFound(message),
         413 => ProviderError::RequestTooLarge(message),
+        429 if upstream_error_code(&body).as_deref() == Some("flex_unavailable") => {
+            ProviderError::FlexUnavailable(message)
+        }
+        503 if upstream_error_code(&body).as_deref() == Some("slow_down") => {
+            ProviderError::RateLimited { retry_after }
+        }
         429 if non_retryable_rate_limit => ProviderError::InvalidRequest(message),
         429 => ProviderError::RateLimited { retry_after },
         status if is_retryable_overload_status(status) => ProviderError::Overloaded {
@@ -610,6 +638,30 @@ pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError
         _ => ProviderError::UpstreamError { status, body },
     };
     error.with_upstream_metadata(metadata)
+}
+
+pub(crate) fn json_headers_to_header_map(headers: serde_json::Map<String, Value>) -> HeaderMap {
+    let mut mapped = HeaderMap::new();
+    for (name, value) in headers {
+        let Ok(header_name) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Some(header_value) = json_header_value(value) else {
+            continue;
+        };
+        mapped.insert(header_name, header_value);
+    }
+    mapped
+}
+
+fn json_header_value(value: Value) -> Option<HeaderValue> {
+    let value = match value {
+        Value::String(value) => value,
+        Value::Number(value) => value.to_string(),
+        Value::Bool(value) => value.to_string(),
+        _ => return None,
+    };
+    HeaderValue::from_str(&value).ok()
 }
 
 pub fn upstream_error_metadata_from_parts(
@@ -963,15 +1015,15 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_delay_clamps_large_values() {
+    fn retry_after_delay_preserves_server_advice() {
         assert_eq!(retry_after_delay_secs("1"), Some(Duration::from_secs(1)));
-        assert_eq!(retry_after_delay_secs("60"), Some(MAX_RETRY_AFTER_DELAY));
+        assert_eq!(retry_after_delay_secs("60"), Some(Duration::from_secs(60)));
         assert_eq!(retry_after_delay_secs("not-a-number"), None);
         assert_eq!(
             retry_after_ms_delay("1500"),
             Some(Duration::from_millis(1500))
         );
-        assert_eq!(retry_after_ms_delay("90000"), Some(MAX_RETRY_AFTER_DELAY));
+        assert_eq!(retry_after_ms_delay("90000"), Some(Duration::from_secs(90)));
     }
 
     #[test]
@@ -988,7 +1040,7 @@ mod tests {
         );
         assert_eq!(
             retry_after_delay_from_now("Tue, 14 Nov 2023 22:14:30 GMT", now),
-            Some(MAX_RETRY_AFTER_DELAY)
+            Some(Duration::from_secs(70))
         );
     }
 
@@ -1004,6 +1056,42 @@ mod tests {
             &Err(ProviderError::InvalidRequest("bad request".to_string())),
             policy
         ));
+    }
+
+    #[tokio::test]
+    async fn long_server_retry_delay_is_returned_without_an_early_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 1024];
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let length = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(length, 0);
+                request.extend_from_slice(&buffer[..length]);
+            }
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 90\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+            drop(socket);
+            assert!(
+                timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let request = reqwest::Client::new().get(format!("http://{address}/"));
+        let response = timeout(Duration::from_secs(2), send_upstream_request(request))
+            .await
+            .expect("long retry advice must return promptly")
+            .unwrap();
+        let error = map_upstream_response(response).await;
+        assert!(matches!(
+            error.without_upstream_metadata(),
+            ProviderError::RateLimited {
+                retry_after: Some(90)
+            }
+        ));
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -1085,6 +1173,34 @@ mod tests {
                 header.name == "x-ratelimit-remaining-requests" && header.value == "0"
             }));
         }
+    }
+
+    #[tokio::test]
+    async fn flex_and_throttling_codes_override_generic_http_status_classification() {
+        let response = response_with_status_headers_and_body(
+            "429 Too Many Requests",
+            &[],
+            r#"{"error":{"code":"flex_unavailable","message":"no capacity"}}"#,
+        )
+        .await;
+        let error = map_upstream_response(response).await;
+        assert!(matches!(
+            error.without_upstream_metadata(),
+            ProviderError::FlexUnavailable(_)
+        ));
+        let response = response_with_status_headers_and_body(
+            "503 Service Unavailable",
+            &[("retry-after", "90")],
+            r#"{"error":{"code":"slow_down","message":"try later"}}"#,
+        )
+        .await;
+        let error = map_upstream_response(response).await;
+        assert!(matches!(
+            error.without_upstream_metadata(),
+            ProviderError::RateLimited {
+                retry_after: Some(90)
+            }
+        ));
     }
 
     #[tokio::test]
