@@ -1576,6 +1576,10 @@ fn concurrency_closed_response(protocol: &DownstreamProtocol) -> Response {
     response
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "HTTP admission returns a ready-to-send protocol rejection directly"
+)]
 async fn acquire_request_permit(
     state: &AppState,
     start: std::time::Instant,
@@ -1600,6 +1604,10 @@ async fn acquire_request_permit(
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "HTTP admission returns a ready-to-send protocol rejection directly"
+)]
 async fn acquire_provider_permit(
     state: &AppState,
     provider_id: &str,
