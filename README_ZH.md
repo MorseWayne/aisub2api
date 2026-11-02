@@ -1,23 +1,24 @@
-# claude-proxy
+# aisub2api
 
-**让 Claude Code 自由使用 ChatGPT/Codex、OpenAI、GitHub Copilot、Gemini、OpenRouter、Anthropic 和自定义模型。**
+**将 ChatGPT/Codex、GitHub Copilot 等 AI 订阅转换为兼容 API。**
 
-> Use Claude Code with the models and accounts you already have — through one fast, observable gateway.
+> Turn the AI subscriptions you already pay for into local Anthropic and OpenAI compatible APIs.
 
-[![CI](https://github.com/MorseWayne/claude-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/MorseWayne/claude-proxy/actions/workflows/ci.yml)
-[![Release](https://github.com/MorseWayne/claude-proxy/actions/workflows/release.yml/badge.svg)](https://github.com/MorseWayne/claude-proxy/actions/workflows/release.yml)
-[![GitHub Release](https://img.shields.io/github/v/release/MorseWayne/claude-proxy?display_name=tag)](https://github.com/MorseWayne/claude-proxy/releases/latest)
+[![CI](https://github.com/MorseWayne/aisub2api/actions/workflows/ci.yml/badge.svg)](https://github.com/MorseWayne/aisub2api/actions/workflows/ci.yml)
+[![Release](https://github.com/MorseWayne/aisub2api/actions/workflows/release.yml/badge.svg)](https://github.com/MorseWayne/aisub2api/actions/workflows/release.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/MorseWayne/aisub2api?display_name=tag)](https://github.com/MorseWayne/aisub2api/releases/latest)
 [![Rust](https://img.shields.io/badge/built_with-Rust-dca282.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#许可证)
 
 [English](README.md) · [立即安装](#安装) · [快速开始](#快速开始) · [查看 Provider](#支持的-provider)
 
-`claude-proxy` 是面向 Claude Code 和 Anthropic Messages API 客户端的多模型网关。它以单个原生二进制运行，零运行时依赖，并通过 CLI/TUI 统一管理模型路由、账号认证和生产运行状态。
+`aisub2api` 是本地运行的 AI 订阅转 API 工具。它通过 OAuth 接入 ChatGPT/Codex 和 GitHub Copilot 账号，并暴露 Anthropic Messages、OpenAI Chat Completions 和流式 Responses API；API key Provider 与多模型路由作为补充能力保留。项目以单个 Rust 原生二进制运行，零运行时依赖。
 
-## 为什么选择 claude-proxy
+## 为什么选择 aisub2api
 
-- **已有账号直接接入**：ChatGPT 和 GitHub Copilot 支持 OAuth，无需手动维护 API key。
-- **多 Provider 原生路由**：一份配置同时使用 OpenAI、Anthropic、Copilot、ChatGPT、OpenRouter、Google 和私有兼容服务。
+- **订阅直接转 API**：通过 OAuth 使用已有 ChatGPT/Codex 和 GitHub Copilot 订阅，无需为同一能力额外维护 API key。
+- **Agent 协议适配**：理解 Anthropic Messages、OpenAI Chat Completions/Responses、tool call、thinking、流式事件和 Codex 请求语义，不是简单 HTTP 转发。
+- **多 Provider 路由**：同一入口也可接入 OpenAI、Anthropic、OpenRouter、Google 和私有兼容服务。
 - **Claude Code 上下文增强**：为符合条件的 ChatGPT 模型提供虚拟 1M 投影、GPT-5.6 默认 872K 上游窗口、本地上下文预检和自动压缩信号。
 - **按模型能力配置推理**：模型别名、推理强度和能力约束由真实模型元数据驱动，避免发送不支持的参数。
 - **可观察、可运营**：内置 TUI Dashboard、SQLite 历史指标、限流、并发控制、热重载、守护进程和请求去重。
@@ -28,44 +29,48 @@
 Linux / macOS:
 
 ```bash
-curl -fsSL https://github.com/MorseWayne/claude-proxy/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/MorseWayne/aisub2api/releases/latest/download/install.sh | bash
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://github.com/MorseWayne/claude-proxy/releases/latest/download/install.ps1 | iex
+irm https://github.com/MorseWayne/aisub2api/releases/latest/download/install.ps1 | iex
 ```
 
-或从 [GitHub Releases](https://github.com/MorseWayne/claude-proxy/releases) 下载预编译二进制。Linux x86_64 安装脚本默认下载静态链接的 `x86_64-unknown-linux-musl` 版本；`x86_64-unknown-linux-gnu` 版本仍可在 Releases 中手动下载。
+或从 [GitHub Releases](https://github.com/MorseWayne/aisub2api/releases) 下载预编译二进制。Linux x86_64 安装脚本默认下载静态链接的 `x86_64-unknown-linux-musl` 版本；`x86_64-unknown-linux-gnu` 版本仍可在 Releases 中手动下载。
+
+### 从旧名称升级
+
+首次运行 `aisub2api` 时，如果新目录尚不存在，程序会把旧名称下的配置、OAuth token、metrics、日志和模型能力缓存原子迁移到 `aisub2api`。升级前应先停止旧守护进程。如果新旧目录同时存在，程序不会自动合并或覆盖，并会输出警告。
 
 ## 快速开始
 
 ```bash
 # 添加 OpenAI provider（交互式输入 API key，并自动拉取模型列表）
-claude-proxy provider add openai
+aisub2api provider add openai
 
 # 添加 GitHub Copilot provider（自动引导 OAuth 认证）
-claude-proxy provider add copilot
+aisub2api provider add copilot
 
 # 添加 ChatGPT provider（使用 ChatGPT Pro/Plus 账号 OAuth 认证）
-claude-proxy provider add chatgpt
+aisub2api provider add chatgpt
 
 # 启动代理服务
-claude-proxy server start
+aisub2api server start
 
 # 将 Claude Code 指向本地代理
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8082
 export ANTHROPIC_API_KEY=freecc
 ```
 
-之后，Claude Code 发出的 Anthropic Messages API 请求会进入 `claude-proxy`，再按配置路由到对应上游模型。
+之后，Claude Code 发出的 Anthropic Messages API 请求会进入 `aisub2api`，再按配置路由到对应上游模型。
 
 ## 界面预览
 
 在一个 TUI 中管理 Provider、模型路由、OAuth 登录和运行指标：
 
-![多 Provider 管理](images/multi-providers.png)
+![ChatGPT 订阅接入](images/tui-chatgpt-add-provider.svg)
 
 <details>
 <summary>查看更多 CLI、TUI 与 Claude Code 集成截图</summary>
@@ -80,27 +85,19 @@ export ANTHROPIC_API_KEY=freecc
 
 ### 模型路由配置
 
-![模型路由配置](images/model-route.png)
+![模型路由配置](images/tui-chatgpt-model-aliases.svg)
 
 ### 配置与服务控制
 
 ![配置与服务控制](images/config-server-commands.svg)
 
-### TUI 模型选择
+### ChatGPT OAuth
 
-![TUI 模型选择](images/tui-model-selection.png)
-
-### TUI 指标仪表盘
-
-![TUI 仪表盘](images/metrics-dashboard.png)
+![ChatGPT OAuth](images/tui-chatgpt-oauth.svg)
 
 ### Metrics API
 
 ![Metrics API](images/metrics-api.svg)
-
-### 在 Claude Code 中使用
-
-![Claude Code 集成](images/claude-code-usage.png)
 
 </details>
 
@@ -124,7 +121,7 @@ Claude Code / SDK / Client
         │
         │ Anthropic Messages API
         ▼
-claude-proxy /v1/messages
+aisub2api /v1/messages
         │
         ├─ 认证：x-api-key 或 Authorization: Bearer
         ├─ 限流：按 API key 的 token bucket
@@ -151,58 +148,58 @@ sonnet = "anthropic/claude-sonnet-4-20250514"
 haiku = "anthropic/claude-haiku-4-5-20251001"
 ```
 
-当客户端请求 Claude 模型名时，`claude-proxy` 会优先匹配别名；没有命中时，则使用默认 provider 并把模型名原样传给上游。
+当客户端请求 Claude 模型名时，`aisub2api` 会优先匹配别名；没有命中时，则使用默认 provider 并把模型名原样传给上游。
 
 ## CLI 命令
 
 ### Provider 管理
 
 ```bash
-claude-proxy provider list              # 列出已配置的 provider
-claude-proxy provider current           # 显示当前默认模型
-claude-proxy provider add [id]          # 添加 provider（省略 ID 则交互式输入）
-claude-proxy provider edit <id>         # 编辑 provider 配置
-claude-proxy provider delete <id>       # 删除 provider
-claude-proxy provider switch <id>       # 切换默认模型到指定 provider
-claude-proxy provider test <id>         # 测试 API key 是否可用
-claude-proxy provider speedtest <id>    # 测试 provider 延迟
-claude-proxy provider fetch-models <id> # 拉取并缓存模型列表
+aisub2api provider list              # 列出已配置的 provider
+aisub2api provider current           # 显示当前默认模型
+aisub2api provider add [id]          # 添加 provider（省略 ID 则交互式输入）
+aisub2api provider edit <id>         # 编辑 provider 配置
+aisub2api provider delete <id>       # 删除 provider
+aisub2api provider switch <id>       # 切换默认模型到指定 provider
+aisub2api provider test <id>         # 测试 API key 是否可用
+aisub2api provider speedtest <id>    # 测试 provider 延迟
+aisub2api provider fetch-models <id> # 拉取并缓存模型列表
 ```
 
 ### 配置管理
 
 ```bash
-claude-proxy config show                # 查看配置（密钥脱敏）
-claude-proxy config edit                # 用 $EDITOR 打开配置文件
-claude-proxy config validate            # 校验配置文件
-claude-proxy config path                # 打印配置文件路径
-claude-proxy config export [path]       # 导出配置（省略路径则输出到 stdout）
-claude-proxy config import <path>       # 从文件导入配置
+aisub2api config show                # 查看配置（密钥脱敏）
+aisub2api config edit                # 用 $EDITOR 打开配置文件
+aisub2api config validate            # 校验配置文件
+aisub2api config path                # 打印配置文件路径
+aisub2api config export [path]       # 导出配置（省略路径则输出到 stdout）
+aisub2api config import <path>       # 从文件导入配置
 ```
 
 ### 服务管理
 
 ```bash
-claude-proxy server start               # 前台启动代理服务
-claude-proxy server start --daemon      # 以守护进程启动（仅 Unix）
-claude-proxy server stop                # 停止守护进程（仅 Unix）
-claude-proxy server restart             # 通过 SIGUSR1 重载配置（仅 Unix）
-claude-proxy server status              # 查看守护进程运行状态
+aisub2api server start               # 前台启动代理服务
+aisub2api server start --daemon      # 以守护进程启动（仅 Unix）
+aisub2api server stop                # 停止守护进程（仅 Unix）
+aisub2api server restart             # 通过 SIGUSR1 重载配置（仅 Unix）
+aisub2api server status              # 查看守护进程运行状态
 ```
 
 ### 本地维护
 
 ```bash
-claude-proxy logs                       # 实时打印日志（默认跟随当前日志文件）
-claude-proxy logs --file /path/app.log  # 跟随指定日志文件
-claude-proxy clean --yes                # 清空本地日志和 metrics.db（服务运行时需先停止或加 --force）
+aisub2api logs                       # 实时打印日志（默认跟随当前日志文件）
+aisub2api logs --file /path/app.log  # 跟随指定日志文件
+aisub2api clean --yes                # 清空本地日志和 metrics.db（服务运行时需先停止或加 --force）
 ```
 
 
 ## TUI 终端控制台
 
 ```bash
-claude-proxy tui
+aisub2api tui
 ```
 
 TUI 提供 8 个页面：Dashboard、Providers、Server、Limits、HTTP、Logging、Model、System。
@@ -221,7 +218,7 @@ TUI 提供 8 个页面：Dashboard、Providers、Server、Limits、HTTP、Loggin
 #### 1. 启动 TUI 并进入 Providers
 
 ```bash
-claude-proxy tui
+aisub2api tui
 ```
 
 - 用 `↑↓` 选择左侧菜单的 **Providers**，按 `Enter` 进入内容区。
@@ -252,14 +249,14 @@ ChatGPT 使用 OAuth，因此 Providers 详情里的 **API Key** 会显示为 `O
 
 如果需要修改 `Base URL` 或 `Proxy`：在 Providers 详情页按 `→` / `Enter` 进入详情，移动到字段后按 `e` 编辑，确认后按 `Ctrl+S` 保存。
 
-使用 Pi 0.76.0+ 作为客户端时，自动化脚本可以用 `pi --session-id <id>` 固定项目内会话。claude-proxy 会把安全的客户端 session header 转成 ChatGPT prompt-cache / continuation key，稳定 session id 有助于提高 ChatGPT/Codex 的缓存亲和性。
+使用 Pi 0.76.0+ 作为客户端时，自动化脚本可以用 `pi --session-id <id>` 固定项目内会话。aisub2api 会把安全的客户端 session header 转成 ChatGPT prompt-cache / continuation key，稳定 session id 有助于提高 ChatGPT/Codex 的缓存亲和性。
 
 高级场景可以在 TOML 里覆盖 ChatGPT Codex 请求身份头；默认值通常不需要修改，默认会使用 Codex 风格的 `originator` 和 `User-Agent`。`User-Agent` 会优先使用本地 `codex --version` 探测到的版本；探测失败时使用内置默认值：
 
 ```toml
 [providers.chatgpt.chatgpt]
 # originator = "codex_cli_rs"
-# user_agent = "codex_cli_rs/1.0.0 (claude-proxy)"
+# user_agent = "codex_cli_rs/1.0.0 (aisub2api)"
 # claude_code_context = "auto" # "standard" 可关闭虚拟 1M 投影
 
 # 可选：在线 /models 目录不可用或需要本地强制覆盖时使用。
@@ -271,7 +268,7 @@ reasoning_effort_levels = ["low", "medium", "high", "xhigh", "max", "ultra"]
 responses_lite = true
 ```
 
-ChatGPT provider 会优先通过 OAuth 从 Codex `/models` 获取在线模型目录，并把最近一次成功获取的上下文能力写入 XDG cache 下的 `claude-proxy/chatgpt/model-capabilities.json`。能力来源优先级为：显式 `model_capabilities` 覆盖 > 同 provider / Base URL / 身份摘要 / 模型的远端缓存 > 内置能力表。身份摘要包含可用的账号、用户、邮箱、套餐及额外路由头信息；已知身份的普通 token 轮换可以继续复用，身份改变或 provider 被替换后，旧刷新结果会被拒绝。持久化缓存已升级到 v2，旧条目会重新获取，token 存储格式不变。对 GPT-5.6，在线目录同时返回 `context_window` 与 `max_context_window` 时，默认采用后者的 872K 支持上限；其他模型仍优先使用 `context_window`。缓存不保存原始账号或 token，并采用临时文件加原子重命名写入。
+ChatGPT provider 会优先通过 OAuth 从 Codex `/models` 获取在线模型目录，并把最近一次成功获取的上下文能力写入 XDG cache 下的 `aisub2api/chatgpt/model-capabilities.json`。能力来源优先级为：显式 `model_capabilities` 覆盖 > 同 provider / Base URL / 身份摘要 / 模型的远端缓存 > 内置能力表。身份摘要包含可用的账号、用户、邮箱、套餐及额外路由头信息；已知身份的普通 token 轮换可以继续复用，身份改变或 provider 被替换后，旧刷新结果会被拒绝。持久化缓存已升级到 v2，旧条目会重新获取，token 存储格式不变。对 GPT-5.6，在线目录同时返回 `context_window` 与 `max_context_window` 时，默认采用后者的 872K 支持上限；其他模型仍优先使用 `context_window`。缓存不保存原始账号或 token，并采用临时文件加原子重命名写入。
 
 当前内置 ChatGPT 回退能力如下：
 
@@ -342,7 +339,7 @@ haiku = { name = "chatgpt/gpt-5.6-luna", reasoning_effort = "high" }
 | `Auth Token` | `freecc` | Claude Code 连接本地代理时使用的 API key |
 | `Admin Token` | 留空或自定义 | 管理接口 token；留空时复用 `Auth Token` |
 
-按 `Ctrl+S` 保存后，TUI 会写入 `~/.config/claude-proxy/config.toml`，并同步 Claude Code 配置里的环境变量：
+按 `Ctrl+S` 保存后，TUI 会写入 `~/.config/aisub2api/config.toml`，并同步 Claude Code 配置里的环境变量：
 
 ```json
 {
@@ -365,7 +362,7 @@ haiku = { name = "chatgpt/gpt-5.6-luna", reasoning_effort = "high" }
 退出 TUI 后启动代理：
 
 ```bash
-claude-proxy server start
+aisub2api server start
 ```
 
 再用 Claude Code 或任意 Anthropic Messages API 客户端访问本地代理。请求模型名可以直接使用：
@@ -376,10 +373,10 @@ claude-proxy server start
 如果要确认配置是否生效：
 
 ```bash
-claude-proxy provider list
-claude-proxy provider current
-claude-proxy provider test chatgpt
-claude-proxy config show
+aisub2api provider list
+aisub2api provider current
+aisub2api provider test chatgpt
+aisub2api config show
 ```
 
 常用按键速查：
@@ -398,7 +395,7 @@ claude-proxy config show
 
 ## 配置文件
 
-路径：`~/.config/claude-proxy/config.toml`
+路径：`~/.config/aisub2api/config.toml`
 
 ```toml
 [providers.openai]
@@ -439,7 +436,7 @@ provider_type = "chatgpt"
 
 [providers.chatgpt.chatgpt]
 # originator = "codex_cli_rs"
-# user_agent = "codex_cli_rs/1.0.0 (claude-proxy)"
+# user_agent = "codex_cli_rs/1.0.0 (aisub2api)"
 
 [model]
 default = "openai/gpt-4.1"
@@ -480,7 +477,7 @@ max_sse_frame_bytes = 1048576           # 上游单个未闭合 SSE frame 上限
 
 [log]
 level = "info"
-file = ""                               # 默认写入 config_dir/claude-proxy.log
+file = ""                               # 默认写入 config_dir/aisub2api.log
 with_stdout = true
 raw_api_payloads = false                # 调试时再开启，可能包含敏感信息
 raw_sse_events = false
@@ -687,20 +684,20 @@ for await (const event of stream) {
 
 ## 与其他开源工具对比
 
-| 工具 | 核心定位 | claude-proxy 的差异 |
+| 工具 | 核心定位 | aisub2api 的差异 |
 |------|----------|---------------------|
-| LiteLLM Proxy | 通用 LLM 网关，覆盖大量模型 API | claude-proxy 更聚焦 Claude Code/Anthropic Messages API 本地代理，单二进制和 TUI 更轻量 |
-| OpenRouter | 托管式多模型路由平台 | claude-proxy 可把 OpenRouter 作为上游，同时保留本地配置、认证和指标控制权 |
-| LocalAI / vLLM | 本地模型推理服务 | claude-proxy 不负责推理，而是统一转发到云端、账号型或私有兼容上游 |
-| one-api / new-api | 多渠道 API 分发与管理面板 | claude-proxy 更适合开发者本机和 Claude Code 工作流，支持 Copilot/ChatGPT OAuth 与终端操作 |
-| 简单反向代理 | HTTP 转发 | claude-proxy 会理解 Anthropic/OpenAI 协议、模型路由、流式事件、token 指标和 Provider 生命周期 |
+| LiteLLM Proxy | 通用 LLM 网关，覆盖大量模型 API | aisub2api 聚焦把 ChatGPT/Codex、Copilot 等订阅账号通过 OAuth 暴露为兼容 API，并保留 agent 协议语义 |
+| OpenRouter | 托管式多模型路由平台 | aisub2api 直接复用本地订阅账号，也可把 OpenRouter 作为补充上游 |
+| LocalAI / vLLM | 本地模型推理服务 | aisub2api 不负责推理，而是统一转发到云端、账号型或私有兼容上游 |
+| one-api / new-api | 多渠道 API 分发与管理面板 | aisub2api 更适合开发者本机的订阅转 API 场景，内置 ChatGPT/Copilot OAuth 与 agent 协议适配 |
+| 简单反向代理 | HTTP 转发 | aisub2api 会理解 Anthropic/OpenAI 协议、模型路由、流式事件、token 指标和 Provider 生命周期 |
 
-如果你已经有 LiteLLM、one-api、new-api 或自建 OpenAI 兼容网关，`claude-proxy` 仍然可以作为 Claude Code 前置适配层，把这些服务包装成 Claude 兼容入口。
+如果你已经有 LiteLLM、one-api、new-api 或自建 OpenAI 兼容网关，可以继续把它们作为 API-key 上游；`aisub2api` 的核心价值仍是把订阅账号转换成 Claude Code、Codex 等客户端可使用的兼容 API。
 
 ## 典型使用场景
 
+- **订阅账号转 API**：通过 OAuth 把 Copilot / ChatGPT 账号能力暴露为 Anthropic 或 OpenAI 兼容接口。
 - **Claude Code 多模型切换**：在一个终端会话里用不同 alias 切换 GPT、Claude、Gemini 或 OpenRouter 模型。
-- **复用 Copilot / ChatGPT 账号能力**：通过 OAuth provider 接入账号型上游，减少手动管理 token 的成本。
 - **团队内统一出口**：给团队提供一个 Anthropic 兼容入口，同时在本地记录用量和延迟。
 - **企业网络环境**：通过代理和额外 CA 证书访问上游模型服务。
 - **调试模型成本**：用 TUI Dashboard 观察模型维度 token 用量和错误率。
@@ -713,7 +710,7 @@ for await (const event of stream) {
 cargo install-local
 ```
 
-Cargo 会将 `claude-proxy` 安装到 `$CARGO_HOME/bin`（通常是 `~/.cargo/bin`）。
+Cargo 会将 `aisub2api` 安装到 `$CARGO_HOME/bin`（通常是 `~/.cargo/bin`）。
 如需安装到其他根目录，例如 `~/.local/bin`，可以运行：
 
 ```bash
@@ -721,13 +718,13 @@ CARGO_INSTALL_ROOT="$HOME/.local" cargo install-local
 ```
 
 该快捷命令等价于
-`cargo install --path crates/claude-proxy-cli --locked --force`；Cargo 的 install 命令默认使用 Release profile 编译，提交到仓库的 lockfile 用于保证本地安装结果可复现。
+`cargo install --path crates/aisub2api-cli --locked --force`；Cargo 的 install 命令默认使用 Release profile 编译，提交到仓库的 lockfile 用于保证本地安装结果可复现。
 
 如果只需编译而不安装：
 
 ```bash
 cargo build --release
-# 二进制文件位于 target/release/claude-proxy
+# 二进制文件位于 target/release/aisub2api
 ```
 
 构建 Linux musl 静态链接版本：
@@ -735,7 +732,7 @@ cargo build --release
 ```bash
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
-# 二进制文件位于 target/x86_64-unknown-linux-musl/release/claude-proxy
+# 二进制文件位于 target/x86_64-unknown-linux-musl/release/aisub2api
 ```
 
 常用开发命令：

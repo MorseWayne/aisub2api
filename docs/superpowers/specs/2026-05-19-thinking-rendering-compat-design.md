@@ -6,7 +6,7 @@ Date: 2026-05-19
 
 Claude Code 只把 Anthropic Messages 流中的结构化 thinking block 当作 thinking 渲染：`content_block_start.content_block.type = "thinking"` 后接 `content_block_delta.delta.type = "thinking_delta"`。如果上游把推理内容作为普通 `text_delta` 返回，即使文本里有 `[thinking]...[/thinking]` 标记，Claude Code 也会把它显示在当前会话正文中。
 
-GitNexus 对 `claude-code` 的分析确认：`text_delta` 会进入 `streamingText`；`thinking_delta` 不进入普通文本显示。`claude-proxy` 当前仅处理 typed reasoning 字段：Chat Completions 的 `reasoning_content`、Responses 的 `response.reasoning_*` 事件；普通 content/output_text 中的 tagged thinking 仍会作为 text 输出。
+GitNexus 对 `claude-code` 的分析确认：`text_delta` 会进入 `streamingText`；`thinking_delta` 不进入普通文本显示。`aisub2api` 当前仅处理 typed reasoning 字段：Chat Completions 的 `reasoning_content`、Responses 的 `response.reasoning_*` 事件；普通 content/output_text 中的 tagged thinking 仍会作为 text 输出。
 
 ## 目标
 
@@ -73,7 +73,7 @@ GitNexus 对 `claude-code` 的分析确认：`text_delta` 会进入 `streamingTe
 - 工作区验证：
   - `cargo fmt --check`
   - provider 目标测试
-  - `cargo test -p claude-proxy-providers`
+  - `cargo test -p aisub2api-providers`
   - `cargo test` 如时间允许
   - `cargo clippy -- -D warnings`
   - `gitnexus_detect_changes(scope=all)`

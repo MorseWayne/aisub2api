@@ -2,7 +2,7 @@
 
 Date: 2026-05-25
 Status: Approved for planning
-Scope: `claude-proxy` ChatGPT/OpenAI provider layer
+Scope: `aisub2api` ChatGPT/OpenAI provider layer
 
 Related notes: [Claude Code Third-Party Provider Quality Gates](./2026-05-28-claude-code-third-party-provider-quality-gates.md)
 
@@ -241,9 +241,9 @@ Run:
 
 - `cargo fmt --check`
 - targeted provider tests
-- `cargo test -p claude-proxy-providers chatgpt`
-- `cargo test -p claude-proxy-providers responses`
-- `cargo test -p claude-proxy-providers`
+- `cargo test -p aisub2api-providers chatgpt`
+- `cargo test -p aisub2api-providers responses`
+- `cargo test -p aisub2api-providers`
 - `cargo test`
 - `cargo clippy -- -D warnings`
 - `git diff --check`

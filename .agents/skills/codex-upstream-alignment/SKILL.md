@@ -1,16 +1,16 @@
 ---
 name: codex-upstream-alignment
-description: Force-sync the local openai/codex reference checkout from its authoritative remote, analyze upstream changes, and determine or implement what claude-proxy must follow across endpoints, wire protocols, models, tools, auth, and streaming behavior. Use when updating `/home/wayne/source/open/codex`, comparing Codex revisions, or planning claude-proxy alignment from a Codex delta; do not use for generic API compatibility work without an upstream Codex change.
+description: Force-sync the local openai/codex reference checkout from its authoritative remote, analyze upstream changes, and determine or implement what aisub2api must follow across endpoints, wire protocols, models, tools, auth, and streaming behavior. Use when updating `/home/wayne/source/open/codex`, comparing Codex revisions, or planning aisub2api alignment from a Codex delta; do not use for generic API compatibility work without an upstream Codex change.
 ---
 
 # Codex Upstream Alignment
 
-Synchronize openai/codex with the remote as the source of truth, reduce its changes to the subset relevant to claude-proxy, and produce an evidence-backed follow-up plan or implementation.
+Synchronize openai/codex with the remote as the source of truth, reduce its changes to the subset relevant to aisub2api, and produce an evidence-backed follow-up plan or implementation.
 
 ## Repositories and Baseline
 
 - Upstream checkout: `/home/wayne/source/open/codex`.
-- Target repository: `/home/wayne/source/open/claude-proxy`.
+- Target repository: `/home/wayne/source/open/aisub2api`.
 - Read [references/upstream-baseline.md](references/upstream-baseline.md) before computing the upstream range.
 - If the requested paths differ or do not exist, discover the actual checkouts before proceeding.
 
@@ -29,7 +29,7 @@ When the user asks to update or sync Codex, or invokes this skill to start the a
 5. Remove untracked files and directories in this reference checkout with `git clean -fd`. Leave ignored build caches alone; removing ignored files requires an explicit request.
 6. Verify `HEAD` equals the fetched commit and `git status --short` is clean. Read any changed upstream instructions before continuing the review.
 
-This replacement policy applies only to the identified Codex reference checkout. Preserve local work in claude-proxy and other repositories. Analysis-only requests that explicitly exclude synchronization must not reset or clean the checkout. Tool or filesystem permission requirements still apply; this policy removes the skill's extra confirmation gate.
+This replacement policy applies only to the identified Codex reference checkout. Preserve local work in aisub2api and other repositories. Analysis-only requests that explicitly exclude synchronization must not reset or clean the checkout. Tool or filesystem permission requirements still apply; this policy removes the skill's extra confirmation gate.
 
 Record `before_sha`, `after_sha`, the fetched target, and the local changes replaced. Keep the synchronization revision separate from the reviewed baseline and record the exact analyzed range. Do not treat a successful fetch as a completed working-tree update.
 
@@ -37,7 +37,7 @@ Record `before_sha`, `after_sha`, the fetched target, and the local changes repl
 
 Start from the recorded baseline, not from an arbitrary release date. Use commit history and file-level diff statistics to narrow the range before reading individual implementations.
 
-Prioritize changes that can alter claude-proxy's observable contract:
+Prioritize changes that can alter aisub2api's observable contract:
 
 - Responses, compact, models, Realtime/WebSocket, and other endpoint request builders.
 - Request fields, headers, query parameters, content encoding, authentication, and routing metadata.
@@ -48,9 +48,9 @@ Prioritize changes that can alter claude-proxy's observable contract:
 
 Relevant upstream entry points commonly include `codex-rs/codex-api`, `codex-rs/core`, `codex-rs/protocol`, `codex-rs/models-manager`, and transport/client crates. Search the actual changed tree rather than assuming these paths remain stable.
 
-Do not propose proxy work for UI-only, sandbox-only, local persistence, or app-server changes unless they modify the wire behavior claude-proxy consumes or exposes.
+Do not propose proxy work for UI-only, sandbox-only, local persistence, or app-server changes unless they modify the wire behavior aisub2api consumes or exposes.
 
-## 3. Map Each Change to claude-proxy
+## 3. Map Each Change to aisub2api
 
 Use CodeGraph first when available for unfamiliar request and response flows. Trace from the downstream handler through model resolution and provider selection to the upstream request, then back through event decoding and downstream encoding.
 
@@ -61,7 +61,7 @@ Classify each relevant upstream change as:
 - **Not applicable**: explain why Codex behavior does not belong in this proxy.
 - **Needs live verification**: static code does not establish a private backend contract.
 
-Keep three contracts distinct: public OpenAI behavior, claude-proxy's intentionally exposed subset, and provider-specific behavior such as the ChatGPT/Codex backend. A model appearing in `/v1/models` proves visibility, not full endpoint compatibility.
+Keep three contracts distinct: public OpenAI behavior, aisub2api's intentionally exposed subset, and provider-specific behavior such as the ChatGPT/Codex backend. A model appearing in `/v1/models` proves visibility, not full endpoint compatibility.
 
 Present the result as a compact matrix containing upstream commit/file evidence, wire-level change, current proxy behavior, status, recommended action, compatibility impact, and verification needed. Mark inference separately from observed behavior.
 
@@ -79,7 +79,7 @@ If the delta touches Responses, Structured Outputs, ChatGPT request normalizatio
 
 ## 5. Verify Proportionally
 
-Test the smallest changed layer first, then the full affected flow. For claude-proxy release-quality verification, normally run:
+Test the smallest changed layer first, then the full affected flow. For aisub2api release-quality verification, normally run:
 
 ```bash
 cargo fmt --all -- --check
@@ -94,6 +94,6 @@ Update `references/upstream-baseline.md` with the reviewed Codex commit, date, p
 
 ## Mutation and Release Boundaries
 
-Syncing Codex authorizes the local replacement described in section 1, not authoring upstream changes or pushing to its remote. Analysis does not authorize editing claude-proxy runtime code unless the user asks for implementation; maintain the review report and baseline as part of the alignment workflow.
+Syncing Codex authorizes the local replacement described in section 1, not authoring upstream changes or pushing to its remote. Analysis does not authorize editing aisub2api runtime code unless the user asks for implementation; maintain the review report and baseline as part of the alignment workflow.
 
 Do not commit, push, tag, publish, restart services, or monitor CI unless requested. When release work is requested, preserve unrelated files, stage only the scoped changes, verify commit and tag identity after pushing, and stop without checking CI when the user says not to track it.

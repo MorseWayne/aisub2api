@@ -239,12 +239,12 @@ Required behavior matrix:
 Validation commands:
 
 ```bash
-cargo test -p claude-proxy-config chatgpt
-cargo test -p claude-proxy-providers --lib chatgpt_responses_body
-cargo test -p claude-proxy-providers --lib test_convert_to_responses
-cargo test -p claude-proxy-providers --lib custom_tool
-cargo test -p claude-proxy-providers --lib continuation
-cargo clippy -p claude-proxy-config -p claude-proxy-providers -- -D warnings
+cargo test -p aisub2api-config chatgpt
+cargo test -p aisub2api-providers --lib chatgpt_responses_body
+cargo test -p aisub2api-providers --lib test_convert_to_responses
+cargo test -p aisub2api-providers --lib custom_tool
+cargo test -p aisub2api-providers --lib continuation
+cargo clippy -p aisub2api-config -p aisub2api-providers -- -D warnings
 cargo fmt --all --check
 git diff --check
 ```

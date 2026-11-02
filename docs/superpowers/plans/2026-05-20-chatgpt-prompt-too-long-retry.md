@@ -6,14 +6,14 @@
 
 **Architecture:** Keep generic Responses conversion unchanged. Add ChatGPT-specific prompt-too-long detection and request-body shrinking around `ChatGptProvider::chat`, modeled after Claude Code and Codex: normal request first, reactive bounded retry only after PTL errors.
 
-**Tech Stack:** Rust, `serde_json::Value`, existing `reqwest` provider path, existing `cargo test -p claude-proxy-providers chatgpt::tests::...` tests.
+**Tech Stack:** Rust, `serde_json::Value`, existing `reqwest` provider path, existing `cargo test -p aisub2api-providers chatgpt::tests::...` tests.
 
 ---
 
 ### Task 1: Pure Retry Helpers
 
 **Files:**
-- Modify: `crates/claude-proxy-providers/src/chatgpt.rs`
+- Modify: `crates/aisub2api-providers/src/chatgpt.rs`
 
 - [ ] **Step 1: Write failing tests**
 
@@ -21,7 +21,7 @@ Add unit tests for PTL detection, token-gap parsing, oldest-group deletion, tool
 
 - [ ] **Step 2: Run tests to verify failure**
 
-Run: `cargo test -p claude-proxy-providers chatgpt::tests::prompt_too_long -- --nocapture`
+Run: `cargo test -p aisub2api-providers chatgpt::tests::prompt_too_long -- --nocapture`
 Expected: FAIL because helpers do not exist yet.
 
 - [ ] **Step 3: Implement helpers**
@@ -35,13 +35,13 @@ Add private helpers in `chatgpt.rs` for:
 
 - [ ] **Step 4: Run helper tests**
 
-Run: `cargo test -p claude-proxy-providers chatgpt::tests::prompt_too_long -- --nocapture`
+Run: `cargo test -p aisub2api-providers chatgpt::tests::prompt_too_long -- --nocapture`
 Expected: PASS.
 
 ### Task 2: Provider Retry Loop
 
 **Files:**
-- Modify: `crates/claude-proxy-providers/src/chatgpt.rs`
+- Modify: `crates/aisub2api-providers/src/chatgpt.rs`
 
 - [ ] **Step 1: Write failing provider test**
 
@@ -49,7 +49,7 @@ Add a local HTTP server test where the first ChatGPT `/responses` call returns a
 
 - [ ] **Step 2: Run test to verify failure**
 
-Run: `cargo test -p claude-proxy-providers chatgpt::tests::chatgpt_retries_prompt_too_long_with_shrunk_body -- --nocapture`
+Run: `cargo test -p aisub2api-providers chatgpt::tests::chatgpt_retries_prompt_too_long_with_shrunk_body -- --nocapture`
 Expected: FAIL because `chat` does not retry PTL yet.
 
 - [ ] **Step 3: Implement retry loop**
@@ -59,14 +59,14 @@ Move non-success response handling in `ChatGptProvider::chat` behind a bounded l
 - [ ] **Step 4: Run targeted tests**
 
 Run:
-- `cargo test -p claude-proxy-providers chatgpt::tests::prompt_too_long -- --nocapture`
-- `cargo test -p claude-proxy-providers chatgpt::tests::chatgpt_retries_prompt_too_long_with_shrunk_body -- --nocapture`
+- `cargo test -p aisub2api-providers chatgpt::tests::prompt_too_long -- --nocapture`
+- `cargo test -p aisub2api-providers chatgpt::tests::chatgpt_retries_prompt_too_long_with_shrunk_body -- --nocapture`
 
 Expected: PASS.
 
 ### Task 3: Verification
 
 - [ ] Run `cargo fmt --check`.
-- [ ] Run `cargo test -p claude-proxy-providers chatgpt::tests:: -- --nocapture`.
-- [ ] Run `cargo test -p claude-proxy-providers`.
+- [ ] Run `cargo test -p aisub2api-providers chatgpt::tests:: -- --nocapture`.
+- [ ] Run `cargo test -p aisub2api-providers`.
 - [ ] Run `gitnexus_detect_changes(scope=all)` and confirm affected flows match ChatGPT provider retry behavior.

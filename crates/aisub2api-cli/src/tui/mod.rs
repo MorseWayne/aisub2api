@@ -1,0 +1,4188 @@
+pub mod app;
+pub mod pages;
+pub mod theme;
+pub mod ui;
+pub mod widgets;
+
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::TryRecvError;
+use std::time::{Duration, Instant};
+
+use base64::{Engine as _, engine::general_purpose};
+use crossterm::{
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::Terminal;
+use ratatui::backend::{Backend, CrosstermBackend};
+use serde_json::{Map, Value};
+
+use aisub2api_core::{Message, MessageContent, MessagesRequest, ModelInfo, Role};
+use aisub2api_providers::provider::ProviderError;
+
+use aisub2api_config::Settings;
+use aisub2api_config::settings::{
+    ChatGptProviderConfig, ClaudeCodeContextMode, CopilotProviderConfig, ModelAliasConfig,
+    ModelConfig, ModelReasoningEffort, ProviderConfig, ProviderType,
+};
+use app::{
+    App, ConfirmAction, ConfirmKind, ConfirmOverlay, EditableSection, ErrorDiagnostics,
+    FetchResult, Focus, InputAction, InputOverlay, LiveMetrics, LiveModelMetrics, LoadingOverlay,
+    ModelCapability, NavItem, OAuthOverlay, OAuthResult, OAuthStep, ObservabilityMetrics,
+    ObservabilitySummary, Overlay, PickerAction, PickerOverlay, ProviderCheckOk,
+    ProviderCheckResult, ProviderCheckStatus, ProviderField, ProviderFocus, StoredMetrics, Toast,
+};
+use tracing::{error, info};
+
+const TICK_RATE: Duration = Duration::from_millis(200);
+const METRICS_FETCH_INTERVAL: Duration = Duration::from_secs(5);
+const CUSTOM_MODEL_ITEM: &str = "Custom model...";
+
+pub fn run() -> anyhow::Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let settings = load_settings();
+    let result = run_app(&mut terminal, settings);
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+fn load_settings() -> Settings {
+    match Settings::config_file_path() {
+        Some(path) if path.exists() => Settings::load(&path).unwrap_or_else(|e| {
+            eprintln!("Warning: failed to load config, using defaults: {e}");
+            Settings::default()
+        }),
+        _ => Settings::default(),
+    }
+}
+
+fn run_app<B: Backend>(terminal: &mut Terminal<B>, settings: Settings) -> anyhow::Result<()>
+where
+    <B as Backend>::Error: Send + Sync + 'static,
+{
+    let mut app = App::new(settings);
+    let mut last_tick = Instant::now();
+
+    loop {
+        // Clamp content index
+        app.clamp_content_idx();
+
+        // Poll background fetch results
+        poll_fetch(&mut app);
+        // Poll background metrics results
+        poll_metrics(&mut app);
+
+        // Render
+        terminal.draw(|f| ui::render(f, &app))?;
+
+        // Tick
+        let elapsed = last_tick.elapsed();
+        if elapsed >= TICK_RATE {
+            app.tick = app.tick.wrapping_add(1);
+            on_tick(&mut app);
+            last_tick = Instant::now();
+        }
+
+        // Poll events with timeout
+        let timeout = TICK_RATE.saturating_sub(elapsed);
+        if event::poll(timeout)? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    handle_key(&mut app, key);
+                }
+                Event::Paste(text) => handle_paste(&mut app, &text),
+                Event::Mouse(mouse) => handle_mouse(&mut app, mouse),
+                _ => {}
+            }
+        }
+
+        if app.should_quit {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn on_tick(app: &mut App) {
+    // Expire toast
+    if let Some(ref mut toast) = app.toast {
+        if toast.remaining_ticks > 0 {
+            toast.remaining_ticks -= 1;
+        }
+        if toast.remaining_ticks == 0 {
+            app.toast = None;
+        }
+    }
+    // Advance loading spinner
+    if let Some(Overlay::Loading(ref mut loading)) = app.overlay {
+        loading.spinner_tick = app.tick;
+    }
+    // Advance OAuth spinner
+    if let Some(Overlay::OAuth(ref mut oauth)) = app.overlay {
+        oauth.spinner_tick = app.tick;
+    }
+    // Periodically fetch metrics from the running server.
+    fetch_live_metrics(app, Instant::now());
+    // Poll OAuth results
+    poll_oauth(app);
+    // Poll provider connectivity/auth checks
+    poll_provider_check(app);
+}
+
+fn handle_key(app: &mut App, key: event::KeyEvent) {
+    // Ctrl+C always quits immediately
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        app.should_quit = true;
+        return;
+    }
+
+    // Ctrl+S saves anywhere
+    if is_ctrl_key(key, 's') {
+        if apply_pending_input(app) {
+            save_settings_with_message(app, "Saved");
+        }
+        return;
+    }
+
+    // Overlay mode — handle overlay keys first
+    if app.overlay.is_some() {
+        handle_overlay_key(app, key);
+        return;
+    }
+
+    // Vim-style hjkl remapping (not in all contexts to avoid breaking input)
+    let code = match key.code {
+        KeyCode::Char('h') if key.modifiers.is_empty() => KeyCode::Left,
+        KeyCode::Char('j') if key.modifiers.is_empty() => KeyCode::Down,
+        KeyCode::Char('k') if key.modifiers.is_empty() => KeyCode::Up,
+        KeyCode::Char('l') if key.modifiers.is_empty() => KeyCode::Right,
+        _ => key.code,
+    };
+
+    // Normalize Ctrl+H → Backspace
+    let code = if key.modifiers.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('h') {
+        KeyCode::Backspace
+    } else {
+        code
+    };
+
+    match app.focus {
+        Focus::Nav => handle_nav_key(app, code),
+        Focus::Content => handle_content_key(app, code, key),
+        Focus::Overlay => {} // handled above
+    }
+}
+
+fn is_ctrl_key(key: event::KeyEvent, c: char) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(c)
+}
+
+fn is_paste_shortcut(key: event::KeyEvent) -> bool {
+    let ctrl_v = key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'v'));
+    let shift_insert = key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Insert;
+    ctrl_v || shift_insert
+}
+
+fn is_right_click_paste(mouse: MouseEvent) -> bool {
+    matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+}
+
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    if matches!(app.overlay, Some(Overlay::Input(_))) && is_right_click_paste(mouse) {
+        paste_from_system_clipboard(app);
+    }
+}
+
+fn paste_from_system_clipboard(app: &mut App) {
+    match read_system_clipboard() {
+        Ok(text) => handle_paste(app, &text),
+        Err(e) => app.show_toast(Toast::warning(format!("Clipboard paste failed: {e}"))),
+    }
+}
+
+#[cfg(windows)]
+fn read_system_clipboard() -> Result<String, String> {
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; Get-Clipboard -Raw",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("failed to run PowerShell: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("PowerShell exited with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(not(windows))]
+fn read_system_clipboard() -> Result<String, String> {
+    Err("system clipboard shortcut is only implemented on Windows".into())
+}
+
+fn handle_paste(app: &mut App, text: &str) {
+    let Some(Overlay::Input(input)) = app.overlay.as_mut() else {
+        return;
+    };
+
+    let pasted: String = text.chars().filter(|c| !c.is_control()).collect();
+    if pasted.is_empty() {
+        return;
+    }
+
+    input.value.insert_str(input.cursor, &pasted);
+    input.cursor += pasted.len();
+}
+
+fn apply_pending_input(app: &mut App) -> bool {
+    let Some(Overlay::Input(input)) = app.overlay.as_ref() else {
+        return true;
+    };
+
+    let value = input.value.clone();
+    let action = input.action.clone();
+    app.overlay = None;
+    app.focus = Focus::Content;
+    apply_input_action(app, &action, &value)
+}
+
+fn handle_nav_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Up => {
+            app.nav_idx = app.nav_idx.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            let max = NavItem::ALL.len().saturating_sub(1);
+            if app.nav_idx < max {
+                app.nav_idx += 1;
+            }
+        }
+        KeyCode::Enter => {
+            app.nav = NavItem::ALL[app.nav_idx];
+            app.focus = Focus::Content;
+            app.content_idx = 0;
+        }
+        KeyCode::Right => {
+            app.focus = Focus::Content;
+            app.content_idx = 0;
+        }
+        KeyCode::Char(' ') => {
+            app.nav = NavItem::ALL[app.nav_idx];
+            app.focus = Focus::Content;
+            app.content_idx = 0;
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            if app.nav == NavItem::Dashboard {
+                request_quit(app);
+            } else {
+                app.nav = NavItem::Dashboard;
+                app.nav_idx = 0;
+            }
+        }
+        KeyCode::Char('?') => {
+            app.overlay = Some(Overlay::Help);
+            app.focus = Focus::Overlay;
+        }
+        _ => {}
+    }
+}
+
+fn handle_content_key(app: &mut App, code: KeyCode, _key: event::KeyEvent) {
+    // Providers page has two-level navigation: List ↔ Detail
+    if app.nav == NavItem::Providers {
+        handle_providers_key(app, code);
+        return;
+    }
+
+    match code {
+        KeyCode::Up => {
+            app.content_idx = app.content_idx.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            let max = app.item_count().saturating_sub(1);
+            if app.content_idx < max {
+                app.content_idx += 1;
+            }
+        }
+        KeyCode::Left => {
+            if app.nav == NavItem::Model && app.detail_idx > 0 {
+                app.detail_idx -= 1;
+            } else {
+                app.focus = Focus::Nav;
+            }
+        }
+        KeyCode::Right if app.nav == NavItem::Model && app.detail_idx < 1 => {
+            app.detail_idx += 1;
+        }
+        KeyCode::Enter | KeyCode::Char('e')
+            if app.item_count() > 0 && app.content_idx < app.item_count() =>
+        {
+            start_editing(app);
+        }
+        KeyCode::Char(' ') => {
+            handle_toggle(app);
+        }
+        // Navigation
+        KeyCode::Esc => {
+            if app.nav == NavItem::Dashboard {
+                request_quit(app);
+            } else {
+                app.nav = NavItem::Dashboard;
+                app.nav_idx = 0;
+                app.focus = Focus::Nav;
+            }
+        }
+        KeyCode::Char('q') => {
+            request_quit(app);
+        }
+        KeyCode::Char('?') => {
+            app.overlay = Some(Overlay::Help);
+            app.focus = Focus::Overlay;
+        }
+        _ => {}
+    }
+}
+
+fn handle_providers_key(app: &mut App, code: KeyCode) {
+    match app.provider_focus {
+        ProviderFocus::List => match code {
+            KeyCode::Up => {
+                app.content_idx = app.content_idx.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let max = app.item_count().saturating_sub(1);
+                if app.content_idx < max {
+                    app.content_idx += 1;
+                }
+            }
+            KeyCode::Right | KeyCode::Enter if !app.settings.providers.is_empty() => {
+                app.provider_focus = ProviderFocus::Detail;
+                app.detail_idx = 0;
+            }
+            KeyCode::Left => {
+                app.focus = Focus::Nav;
+            }
+            KeyCode::Char('a') => {
+                add_provider(app);
+            }
+            KeyCode::Char('d') => {
+                delete_provider(app);
+            }
+            KeyCode::Char('o') => {
+                oauth_provider(app);
+            }
+            KeyCode::Char('t') => {
+                check_selected_provider(app);
+            }
+            KeyCode::Esc => {
+                app.focus = Focus::Nav;
+            }
+            KeyCode::Char('q') => {
+                request_quit(app);
+            }
+            KeyCode::Char('?') => {
+                app.overlay = Some(Overlay::Help);
+                app.focus = Focus::Overlay;
+            }
+            _ => {}
+        },
+        ProviderFocus::Detail => match code {
+            KeyCode::Up => {
+                app.detail_idx = app.detail_idx.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let max = app.provider_detail_field_count().saturating_sub(1);
+                if app.detail_idx < max {
+                    app.detail_idx += 1;
+                }
+            }
+            KeyCode::Left | KeyCode::Esc => {
+                app.provider_focus = ProviderFocus::List;
+            }
+            KeyCode::Enter | KeyCode::Char('e') => {
+                start_editing(app);
+            }
+            KeyCode::Char(' ') => {
+                toggle_selected_chatgpt_setting(app);
+            }
+            KeyCode::Char('a') => {
+                add_provider(app);
+            }
+            KeyCode::Char('d') => {
+                delete_provider(app);
+            }
+            KeyCode::Char('o') => {
+                oauth_provider(app);
+            }
+            KeyCode::Char('t') => {
+                check_selected_provider(app);
+            }
+            KeyCode::Char('q') => {
+                request_quit(app);
+            }
+            KeyCode::Char('?') => {
+                app.overlay = Some(Overlay::Help);
+                app.focus = Focus::Overlay;
+            }
+            _ => {}
+        },
+    }
+}
+
+fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
+    if matches!(app.overlay, Some(Overlay::OAuth(_))) {
+        handle_oauth_overlay_key(app, key);
+        return;
+    }
+
+    if matches!(app.overlay, Some(Overlay::Input(_))) && is_paste_shortcut(key) {
+        paste_from_system_clipboard(app);
+        return;
+    }
+
+    match app.overlay.as_mut().unwrap() {
+        Overlay::Confirm(overlay) => {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    let kind = overlay.kind.clone();
+                    app.overlay = None;
+                    app.focus = Focus::Nav;
+                    match kind {
+                        ConfirmKind::YesNo { on_yes } => match on_yes {
+                            ConfirmAction::Quit => app.should_quit = true,
+                            ConfirmAction::DeleteProvider(id) => {
+                                app.settings.providers.remove(&id);
+                                app.provider_statuses.remove(&id);
+                                app.mark_dirty();
+                                app.clamp_content_idx();
+                                app.show_toast(Toast::success(format!(
+                                    "Provider \"{id}\" deleted"
+                                )));
+                            }
+                            ConfirmAction::SaveAndQuit => {
+                                if save_settings_with_feedback(app) {
+                                    app.should_quit = true;
+                                }
+                            }
+                        },
+                        ConfirmKind::DirtyQuit => {
+                            // Enter = Save & Quit
+                            if save_settings_with_feedback(app) {
+                                app.should_quit = true;
+                            }
+                        }
+                        ConfirmKind::Info => {}
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    let kind = &overlay.kind;
+                    match kind {
+                        ConfirmKind::DirtyQuit => {
+                            // Discard and quit
+                            app.overlay = None;
+                            app.focus = Focus::Nav;
+                            app.should_quit = true;
+                        }
+                        _ => {
+                            app.overlay = None;
+                            app.focus = Focus::Nav;
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    app.overlay = None;
+                    app.focus = Focus::Nav;
+                }
+                _ => {}
+            }
+        }
+        Overlay::Input(input) => match key.code {
+            KeyCode::Enter => {
+                apply_pending_input(app);
+            }
+            KeyCode::Esc => {
+                app.overlay = None;
+                app.focus = Focus::Content;
+            }
+            KeyCode::Backspace => {
+                input.backspace();
+            }
+            KeyCode::Char(c) => {
+                input.insert(c);
+            }
+            _ => {}
+        },
+        Overlay::Picker(picker) => {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    picker.selected = picker.selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let max = picker.items.len().saturating_sub(1);
+                    if picker.selected < max {
+                        picker.selected += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let selected = picker
+                        .items
+                        .get(picker.selected)
+                        .cloned()
+                        .unwrap_or_default();
+                    let action = picker.action.clone();
+                    match action {
+                        PickerAction::SetModelDefault { provider_id } => {
+                            if selected == CUSTOM_MODEL_ITEM {
+                                show_manual_default_model_input(app, &provider_id, "");
+                                return;
+                            }
+                            app.overlay = None;
+                            app.focus = Focus::Content;
+                            let value = provider_model_ref(&provider_id, &selected);
+                            app.settings.model.default.name = value.clone();
+                            app.mark_dirty();
+                            app.show_toast(Toast::success(format!("Default model: {value}")));
+                        }
+                        PickerAction::PickProviderForModel { section } => {
+                            // Step 1 complete: fetch models for the selected provider
+                            app.pending_model_section = Some(section);
+                            app.overlay = Some(Overlay::Loading(LoadingOverlay {
+                                title: format!("Fetching models from {selected}"),
+                                message: "Please wait...".into(),
+                                spinner_tick: app.tick,
+                            }));
+                            start_model_fetch(app, selected);
+                        }
+                        PickerAction::SetModelField {
+                            provider_id,
+                            section,
+                        } => {
+                            if selected == CUSTOM_MODEL_ITEM {
+                                show_manual_model_input(app, &provider_id, section, "");
+                                return;
+                            }
+                            app.overlay = None;
+                            app.focus = Focus::Content;
+                            let value = provider_model_ref(&provider_id, &selected);
+                            set_model_field(app, &section, &value);
+                            app.mark_dirty();
+                            app.show_toast(Toast::success(format!(
+                                "{} = {}",
+                                get_section_label(&section),
+                                value
+                            )));
+                        }
+                        PickerAction::SetModelReasoningEffort { section } => {
+                            app.overlay = None;
+                            app.focus = Focus::Content;
+                            set_model_reasoning_effort(app, &section, &selected);
+                            app.mark_dirty();
+                            app.show_toast(Toast::success(format!(
+                                "{} = {}",
+                                get_section_label(&section),
+                                display_reasoning_effort_value(&selected)
+                            )));
+                        }
+                        PickerAction::SetLogLevel => {
+                            app.overlay = None;
+                            app.focus = Focus::Content;
+                            app.settings.log.level = selected.clone();
+                            app.mark_dirty();
+                            app.show_toast(Toast::success(format!("Log level: {selected}")));
+                        }
+                        PickerAction::SetProviderCompatibility { provider_id } => {
+                            app.overlay = None;
+                            app.focus = Focus::Content;
+                            set_provider_compatibility(app, &provider_id, &selected);
+                        }
+                        PickerAction::AddProvider => {
+                            let idx = picker.selected;
+                            let types = app.pending_provider_types.take().unwrap_or_default();
+                            let mut provider_type = types
+                                .into_iter()
+                                .nth(idx)
+                                .unwrap_or(ProviderType::Custom(String::new()));
+
+                            let id = if matches!(provider_type, ProviderType::Custom(_)) {
+                                next_custom_provider_id(app)
+                            } else {
+                                default_provider_id(&provider_type).to_string()
+                            };
+                            provider_type = provider_type_with_id(provider_type, &id);
+
+                            let copilot = if provider_type == ProviderType::Copilot {
+                                Some(CopilotProviderConfig::default())
+                            } else {
+                                None
+                            };
+                            let chatgpt = if provider_type == ProviderType::ChatGPT {
+                                Some(ChatGptProviderConfig::default())
+                            } else {
+                                None
+                            };
+
+                            let is_oauth = !provider_type.needs_api_key();
+                            let is_chatgpt = provider_type == ProviderType::ChatGPT;
+
+                            let replaced = app.settings.providers.contains_key(&id);
+                            app.settings.providers.insert(
+                                id.clone(),
+                                ProviderConfig {
+                                    api_key: String::new(),
+                                    base_url: provider_type.default_base_url().to_string(),
+                                    proxy: String::new(),
+                                    provider_type: Some(provider_type),
+                                    copilot,
+                                    chatgpt,
+                                    runtime: Default::default(),
+                                    reasoning_markers: Default::default(),
+                                },
+                            );
+                            if !replaced && is_chatgpt {
+                                app.settings.model.apply_chatgpt_56_defaults(&id);
+                            }
+                            app.mark_dirty();
+                            app.content_idx = app
+                                .settings
+                                .providers
+                                .keys()
+                                .position(|provider_id| provider_id == &id)
+                                .unwrap_or_else(|| app.settings.providers.len().saturating_sub(1));
+                            app.overlay = None;
+                            app.focus = Focus::Content;
+                            let action = if replaced { "Updated" } else { "Added" };
+                            app.show_toast(Toast::success(format!(
+                                "{action} \"{id}\". Edit name/type/fields, Ctrl+S to save."
+                            )));
+
+                            // Start OAuth flow for providers that need it
+                            if is_oauth {
+                                start_oauth_flow(app, &id);
+                            }
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    app.overlay = None;
+                    app.focus = Focus::Content;
+                }
+                _ => {}
+            }
+        }
+        Overlay::Loading(_) => {
+            if key.code == KeyCode::Esc {
+                app.overlay = None;
+                app.focus = Focus::Content;
+                app.fetch_rx = None;
+                app.pending_model_section = None;
+                app.pending_reasoning_section = None;
+                app.show_toast(Toast::info("Cancelled"));
+            }
+        }
+        Overlay::OAuth(_) => {}
+        Overlay::Help => {
+            if key.code == KeyCode::Esc || key.code == KeyCode::Char('?') {
+                app.overlay = None;
+                app.focus = Focus::Nav;
+            }
+        }
+    }
+}
+
+fn handle_oauth_overlay_key(app: &mut App, key: event::KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.overlay = None;
+            app.focus = Focus::Content;
+            app.oauth_rx = None;
+            app.oauth_pending_id = None;
+            app.oauth_device_info = None;
+            app.show_toast(Toast::info("OAuth cancelled"));
+        }
+        KeyCode::Char('c') => copy_oauth_value(app, OAuthCopyTarget::Code),
+        KeyCode::Char('u') => copy_oauth_value(app, OAuthCopyTarget::Url),
+        _ => {}
+    }
+}
+
+enum OAuthCopyTarget {
+    Code,
+    Url,
+}
+
+fn copy_oauth_value(app: &mut App, target: OAuthCopyTarget) {
+    let Some(Overlay::OAuth(oauth)) = app.overlay.as_ref() else {
+        return;
+    };
+
+    let OAuthStep::ShowCode { url, code } = &oauth.step else {
+        app.show_toast(Toast::info("Device code not ready yet"));
+        return;
+    };
+
+    let (label, value) = match target {
+        OAuthCopyTarget::Code => ("Device code", code.as_str()),
+        OAuthCopyTarget::Url => ("Verification URL", url.as_str()),
+    };
+
+    match copy_to_clipboard(value) {
+        Ok(()) => app.show_toast(Toast::success(format!("{label} copied"))),
+        Err(err) => app.show_toast(Toast::error(format!("Copy failed: {err}"))),
+    }
+}
+
+fn copy_to_clipboard(value: &str) -> io::Result<()> {
+    let encoded = general_purpose::STANDARD.encode(value.as_bytes());
+    let mut stdout = io::stdout();
+    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+    stdout.flush()
+}
+
+// ── Actions ──
+
+fn request_quit(app: &mut App) {
+    if app.dirty {
+        app.overlay = Some(Overlay::Confirm(ConfirmOverlay {
+            title: "Unsaved Changes".into(),
+            message: "You have unsaved changes. What would you like to do?".into(),
+            kind: ConfirmKind::DirtyQuit,
+        }));
+    } else {
+        app.overlay = Some(Overlay::Confirm(ConfirmOverlay {
+            title: "Quit".into(),
+            message: "Quit aisub2api configuration?".into(),
+            kind: ConfirmKind::YesNo {
+                on_yes: ConfirmAction::Quit,
+            },
+        }));
+    }
+    app.focus = Focus::Overlay;
+}
+
+fn start_editing(app: &mut App) {
+    // For provider page: edit the selected provider's field based on detail_idx
+    if app.nav == NavItem::Providers {
+        if toggle_selected_chatgpt_setting(app) {
+            return;
+        }
+
+        if let Some((id, cfg)) = app.settings.providers.iter().nth(app.content_idx) {
+            let id = id.clone();
+            let pt = cfg.resolve_type(&id);
+            if app.detail_idx == 1 {
+                if !is_custom_provider_type(&pt) {
+                    app.show_toast(Toast::info(
+                        "Only custom providers can change compatibility",
+                    ));
+                    return;
+                }
+                let items = vec![
+                    "OpenAI-compatible".to_string(),
+                    "Anthropic-compatible".to_string(),
+                ];
+                let selected = items
+                    .iter()
+                    .position(|item| item == provider_compatibility_label(&pt))
+                    .unwrap_or(0);
+                app.overlay = Some(Overlay::Picker(PickerOverlay {
+                    title: format!("Set {id} Compatibility"),
+                    items,
+                    selected,
+                    action: PickerAction::SetProviderCompatibility { provider_id: id },
+                }));
+                app.focus = Focus::Overlay;
+                return;
+            }
+
+            let (field, prompt, value) = match app.detail_idx {
+                0 => (ProviderField::Name, "Name", id.clone()),
+                2 => {
+                    if !pt.needs_api_key() {
+                        app.show_toast(Toast::info(format!(
+                            "{} uses OAuth (API key not editable)",
+                            pt.display_name()
+                        )));
+                        return;
+                    }
+                    (ProviderField::ApiKey, "API Key", cfg.api_key.clone())
+                }
+                3 => (ProviderField::BaseUrl, "Base URL", cfg.base_url.clone()),
+                4 => (ProviderField::Proxy, "Proxy", cfg.proxy.clone()),
+                _ => return,
+            };
+            let cursor = value.len();
+            app.overlay = Some(Overlay::Input(InputOverlay {
+                title: format!("Edit {id}"),
+                prompt: prompt.into(),
+                value,
+                cursor,
+                action: InputAction::EditProviderField {
+                    provider_id: id,
+                    field,
+                    field_index: app.detail_idx,
+                },
+            }));
+            app.focus = Focus::Overlay;
+        }
+        return;
+    }
+
+    if app.nav == NavItem::Model {
+        let Some(section) = model_section_for_cell(app.content_idx, app.detail_idx) else {
+            return;
+        };
+        if app.detail_idx == 1 {
+            let provider_to_fetch = model_ref_for_reasoning_section(&app.settings.model, &section)
+                .and_then(|model_ref| {
+                    let (provider_id, _) = model_ref.split_once('/')?;
+                    (advertised_reasoning_effort_levels(app, model_ref).is_none()
+                        && !app.model_capabilities_loaded.contains(provider_id)
+                        && app.settings.providers.contains_key(provider_id))
+                    .then(|| provider_id.to_string())
+                });
+
+            if let Some(provider_id) = provider_to_fetch {
+                app.pending_reasoning_section = Some(section);
+                app.overlay = Some(Overlay::Loading(LoadingOverlay {
+                    title: format!("Fetching capabilities from {provider_id}"),
+                    message: "Please wait...".into(),
+                    spinner_tick: app.tick,
+                }));
+                app.focus = Focus::Overlay;
+                start_model_fetch(app, provider_id);
+            } else {
+                show_reasoning_effort_picker(app, section);
+            }
+            return;
+        }
+        let providers: Vec<String> = app.settings.providers.keys().cloned().collect();
+        if providers.is_empty() {
+            app.show_toast(Toast::warning(
+                "No providers configured. Add a provider first.",
+            ));
+            return;
+        }
+        app.overlay = Some(Overlay::Picker(PickerOverlay {
+            title: "Select Provider".into(),
+            items: providers,
+            selected: 0,
+            action: PickerAction::PickProviderForModel { section },
+        }));
+        app.focus = Focus::Overlay;
+        return;
+    }
+
+    // For other pages: show text input overlay
+    // Special case: Log level uses a picker
+    if app.nav == NavItem::Log && app.content_idx == 0 {
+        let levels = vec![
+            "trace".to_string(),
+            "debug".to_string(),
+            "info".to_string(),
+            "warn".to_string(),
+            "error".to_string(),
+        ];
+        let current_idx = levels
+            .iter()
+            .position(|l| l == &app.settings.log.level)
+            .unwrap_or(2);
+        app.overlay = Some(Overlay::Picker(PickerOverlay {
+            title: "Select Log Level".into(),
+            items: levels,
+            selected: current_idx,
+            action: PickerAction::SetLogLevel,
+        }));
+        app.focus = Focus::Overlay;
+        return;
+    }
+
+    let (section, value) = get_editable_section(app);
+    if let Some(section) = section {
+        let cursor = value.len();
+        app.overlay = Some(Overlay::Input(InputOverlay {
+            title: format!("Edit {}", app.nav.name()),
+            prompt: get_section_label(&section).into(),
+            value,
+            cursor,
+            action: InputAction::EditSetting { section },
+        }));
+        app.focus = Focus::Overlay;
+    }
+}
+
+fn get_editable_section(app: &App) -> (Option<EditableSection>, String) {
+    match app.nav {
+        NavItem::Server => match app.content_idx {
+            0 => (
+                Some(EditableSection::ServerHost),
+                app.settings.server.host.clone(),
+            ),
+            1 => (
+                Some(EditableSection::ServerPort),
+                app.settings.server.port.to_string(),
+            ),
+            2 => (
+                Some(EditableSection::ServerAuthToken),
+                app.settings.server.auth_token.clone(),
+            ),
+            3 => (
+                Some(EditableSection::AdminAuthToken),
+                app.settings.admin.auth_token.clone().unwrap_or_default(),
+            ),
+            _ => (None, String::new()),
+        },
+        NavItem::Limits => match app.content_idx {
+            0 => (
+                Some(EditableSection::RateLimit),
+                app.settings.limits.rate_limit.to_string(),
+            ),
+            1 => (
+                Some(EditableSection::RateWindow),
+                app.settings.limits.rate_window.to_string(),
+            ),
+            2 => (
+                Some(EditableSection::MaxConcurrency),
+                app.settings.limits.max_concurrency.to_string(),
+            ),
+            3 => (
+                Some(EditableSection::ModelCacheTtlSeconds),
+                app.settings.limits.model_cache_ttl_seconds.to_string(),
+            ),
+            _ => (None, String::new()),
+        },
+        NavItem::Http => match app.content_idx {
+            0 => (
+                Some(EditableSection::HttpReadTimeout),
+                app.settings.http.read_timeout.to_string(),
+            ),
+            1 => (
+                Some(EditableSection::HttpWriteTimeout),
+                app.settings.http.write_timeout.to_string(),
+            ),
+            2 => (
+                Some(EditableSection::HttpConnectTimeout),
+                app.settings.http.connect_timeout.to_string(),
+            ),
+            _ => (None, String::new()),
+        },
+        NavItem::Log => match app.content_idx {
+            0 => (
+                Some(EditableSection::LogLevel),
+                app.settings.log.level.clone(),
+            ),
+            _ => (None, String::new()),
+        },
+        NavItem::Model => {
+            let Some(section) = model_section_for_cell(app.content_idx, app.detail_idx) else {
+                return (None, String::new());
+            };
+            let value = if app.detail_idx == 0 {
+                model_name_value(&app.settings.model, &section)
+            } else {
+                model_reasoning_effort_value(&app.settings.model, &section)
+            };
+            (Some(section), value)
+        }
+        _ => (None, String::new()),
+    }
+}
+
+fn model_section_for_cell(row: usize, column: usize) -> Option<EditableSection> {
+    match (row, column) {
+        (0, 0) => Some(EditableSection::ModelDefault),
+        (0, 1) => Some(EditableSection::ModelDefaultReasoningEffort),
+        (1, 0) => Some(EditableSection::ModelReasoning),
+        (1, 1) => Some(EditableSection::ModelReasoningReasoningEffort),
+        (2, 0) => Some(EditableSection::ModelOpus),
+        (2, 1) => Some(EditableSection::ModelOpusReasoningEffort),
+        (3, 0) => Some(EditableSection::ModelSonnet),
+        (3, 1) => Some(EditableSection::ModelSonnetReasoningEffort),
+        (4, 0) => Some(EditableSection::ModelHaiku),
+        (4, 1) => Some(EditableSection::ModelHaikuReasoningEffort),
+        _ => None,
+    }
+}
+
+fn model_name_value(model: &ModelConfig, section: &EditableSection) -> String {
+    match section {
+        EditableSection::ModelDefault => model.default.name.clone(),
+        EditableSection::ModelReasoning => model.reasoning_name().unwrap_or_default().to_string(),
+        EditableSection::ModelOpus => model.opus_name().unwrap_or_default().to_string(),
+        EditableSection::ModelSonnet => model.sonnet_name().unwrap_or_default().to_string(),
+        EditableSection::ModelHaiku => model.haiku_name().unwrap_or_default().to_string(),
+        _ => String::new(),
+    }
+}
+
+fn model_reasoning_effort_value(model: &ModelConfig, section: &EditableSection) -> String {
+    let effort = match section {
+        EditableSection::ModelDefaultReasoningEffort => model.default.reasoning_effort,
+        EditableSection::ModelReasoningReasoningEffort => model
+            .reasoning
+            .as_ref()
+            .and_then(|alias| alias.reasoning_effort),
+        EditableSection::ModelOpusReasoningEffort => {
+            model.opus.as_ref().and_then(|alias| alias.reasoning_effort)
+        }
+        EditableSection::ModelSonnetReasoningEffort => model
+            .sonnet
+            .as_ref()
+            .and_then(|alias| alias.reasoning_effort),
+        EditableSection::ModelHaikuReasoningEffort => model
+            .haiku
+            .as_ref()
+            .and_then(|alias| alias.reasoning_effort),
+        _ => None,
+    };
+    effort
+        .map(ModelReasoningEffort::as_config_value)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn reasoning_effort_picker_items(app: &App, section: &EditableSection) -> Vec<String> {
+    let mut items = vec![String::new()];
+    let levels = model_ref_for_reasoning_section(&app.settings.model, section)
+        .and_then(|model_ref| advertised_reasoning_effort_levels(app, model_ref))
+        .unwrap_or_else(|| {
+            [
+                "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+        });
+
+    for level in levels {
+        let level = level.trim().to_ascii_lowercase();
+        if !level.is_empty()
+            && parse_model_reasoning_effort(&level).is_some()
+            && !items.contains(&level)
+        {
+            items.push(level);
+        }
+    }
+    items
+}
+
+fn show_reasoning_effort_picker(app: &mut App, section: EditableSection) {
+    let model_ref =
+        model_ref_for_reasoning_section(&app.settings.model, &section).map(str::to_string);
+    let items = reasoning_effort_picker_items(app, &section);
+    let current = model_reasoning_effort_value(&app.settings.model, &section);
+    let selected = items.iter().position(|item| item == &current).unwrap_or(0);
+    app.overlay = Some(Overlay::Picker(PickerOverlay {
+        title: model_ref.as_deref().map_or_else(
+            || "Select Reasoning Effort".to_string(),
+            |model_ref| format!("Select Reasoning Effort — {model_ref}"),
+        ),
+        items,
+        selected,
+        action: PickerAction::SetModelReasoningEffort { section },
+    }));
+    app.focus = Focus::Overlay;
+}
+
+fn model_ref_for_reasoning_section<'a>(
+    model: &'a ModelConfig,
+    section: &EditableSection,
+) -> Option<&'a str> {
+    match section {
+        EditableSection::ModelDefaultReasoningEffort => Some(model.default.name.as_str()),
+        EditableSection::ModelReasoningReasoningEffort => {
+            model.reasoning.as_ref().map(|alias| alias.name.as_str())
+        }
+        EditableSection::ModelOpusReasoningEffort => {
+            model.opus.as_ref().map(|alias| alias.name.as_str())
+        }
+        EditableSection::ModelSonnetReasoningEffort => {
+            model.sonnet.as_ref().map(|alias| alias.name.as_str())
+        }
+        EditableSection::ModelHaikuReasoningEffort => {
+            model.haiku.as_ref().map(|alias| alias.name.as_str())
+        }
+        _ => None,
+    }
+}
+
+fn advertised_reasoning_effort_levels(app: &App, model_ref: &str) -> Option<Vec<String>> {
+    let provider_and_model = model_ref.split_once('/');
+    let chatgpt_provider = provider_and_model.and_then(|(provider_id, model_id)| {
+        let provider = app.settings.providers.get(provider_id)?;
+        (provider.resolve_type(provider_id) == ProviderType::ChatGPT)
+            .then_some((provider, model_id))
+    });
+
+    if let Some(levels) = chatgpt_provider
+        .and_then(|(provider, model_id)| {
+            provider
+                .chatgpt
+                .as_ref()
+                .and_then(|config| config.model_capabilities.get(model_id))
+        })
+        .and_then(|capability| capability.reasoning_effort_levels.clone())
+    {
+        return Some(levels);
+    }
+
+    if let Some(levels) = app.model_reasoning_efforts.get(model_ref) {
+        return Some(levels.clone());
+    }
+
+    if let Some(capability) = app.live_metrics.as_ref().and_then(|metrics| {
+        metrics
+            .model_capabilities
+            .iter()
+            .find(|(name, _)| name == model_ref)
+            .map(|(_, capability)| capability)
+    }) {
+        return Some(capability.reasoning_effort_levels.clone());
+    }
+
+    let (_, model_id) = chatgpt_provider?;
+
+    match model_id {
+        "gpt-5.6-sol" | "gpt-5.6-terra" => Some(
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        ),
+        "gpt-5.6-luna" => Some(
+            ["low", "medium", "high", "xhigh", "max"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+fn display_reasoning_effort_value(value: &str) -> &str {
+    if value.is_empty() { "unset" } else { value }
+}
+
+fn parse_model_reasoning_effort(value: &str) -> Option<ModelReasoningEffort> {
+    match value.trim() {
+        "" => None,
+        "default" => Some(ModelReasoningEffort::Auto),
+        "none" => Some(ModelReasoningEffort::Disabled),
+        "minimal" => Some(ModelReasoningEffort::Minimal),
+        "low" => Some(ModelReasoningEffort::Low),
+        "medium" => Some(ModelReasoningEffort::Medium),
+        "high" => Some(ModelReasoningEffort::High),
+        "xhigh" => Some(ModelReasoningEffort::XHigh),
+        "max" => Some(ModelReasoningEffort::Max),
+        "ultra" => Some(ModelReasoningEffort::Ultra),
+        _ => None,
+    }
+}
+
+fn get_section_label(section: &EditableSection) -> &'static str {
+    match section {
+        EditableSection::ServerHost => "Host",
+        EditableSection::ServerPort => "Port",
+        EditableSection::ServerAuthToken => "Auth Token",
+        EditableSection::AdminAuthToken => "Admin Auth Token",
+        EditableSection::RateLimit => "Rate Limit (requests)",
+        EditableSection::RateWindow => "Window (seconds)",
+        EditableSection::MaxConcurrency => "Max Concurrency",
+        EditableSection::ModelCacheTtlSeconds => "Model Cache TTL (seconds)",
+        EditableSection::HttpReadTimeout => "Read Timeout (seconds)",
+        EditableSection::HttpWriteTimeout => "Write Timeout (seconds)",
+        EditableSection::HttpConnectTimeout => "Connect Timeout (seconds)",
+        EditableSection::LogLevel => "Log Level",
+        EditableSection::ModelDefault => "Default Model",
+        EditableSection::ModelDefaultReasoningEffort => "Default Reasoning Effort",
+        EditableSection::ModelReasoning => "Reasoning Model",
+        EditableSection::ModelReasoningReasoningEffort => "Reasoning Effort",
+        EditableSection::ModelOpus => "Opus Alias",
+        EditableSection::ModelOpusReasoningEffort => "Opus Reasoning Effort",
+        EditableSection::ModelSonnet => "Sonnet Alias",
+        EditableSection::ModelSonnetReasoningEffort => "Sonnet Reasoning Effort",
+        EditableSection::ModelHaiku => "Haiku Alias",
+        EditableSection::ModelHaikuReasoningEffort => "Haiku Reasoning Effort",
+    }
+}
+
+fn apply_input_action(app: &mut App, action: &InputAction, value: &str) -> bool {
+    match action {
+        InputAction::EditSetting { section } => {
+            let v = value.to_string();
+            match section {
+                EditableSection::ServerHost => app.settings.server.host = v,
+                EditableSection::ServerPort => {
+                    if let Ok(p) = v.parse() {
+                        app.settings.server.port = p;
+                    } else {
+                        app.show_toast(Toast::error("Invalid port"));
+                        return false;
+                    }
+                }
+                EditableSection::ServerAuthToken => app.settings.server.auth_token = v,
+                EditableSection::AdminAuthToken => {
+                    app.settings.admin.auth_token = if v.is_empty() { None } else { Some(v) };
+                }
+                EditableSection::RateLimit => {
+                    if let Ok(n) = v.parse() {
+                        app.settings.limits.rate_limit = n;
+                    } else {
+                        app.show_toast(Toast::error("Invalid number"));
+                        return false;
+                    }
+                }
+                EditableSection::RateWindow => {
+                    if let Ok(n) = v.parse() {
+                        app.settings.limits.rate_window = n;
+                    } else {
+                        app.show_toast(Toast::error("Invalid number"));
+                        return false;
+                    }
+                }
+                EditableSection::MaxConcurrency => {
+                    if let Ok(n) = v.parse() {
+                        app.settings.limits.max_concurrency = n;
+                    } else {
+                        app.show_toast(Toast::error("Invalid number"));
+                        return false;
+                    }
+                }
+                EditableSection::ModelCacheTtlSeconds => {
+                    if let Ok(n) = v.parse() {
+                        app.settings.limits.model_cache_ttl_seconds = n;
+                    } else {
+                        app.show_toast(Toast::error("Invalid number"));
+                        return false;
+                    }
+                }
+                EditableSection::HttpReadTimeout => {
+                    if let Ok(n) = v.parse() {
+                        app.settings.http.read_timeout = n;
+                    } else {
+                        app.show_toast(Toast::error("Invalid number"));
+                        return false;
+                    }
+                }
+                EditableSection::HttpWriteTimeout => {
+                    if let Ok(n) = v.parse() {
+                        app.settings.http.write_timeout = n;
+                    } else {
+                        app.show_toast(Toast::error("Invalid number"));
+                        return false;
+                    }
+                }
+                EditableSection::HttpConnectTimeout => {
+                    if let Ok(n) = v.parse() {
+                        app.settings.http.connect_timeout = n;
+                    } else {
+                        app.show_toast(Toast::error("Invalid number"));
+                        return false;
+                    }
+                }
+                EditableSection::LogLevel => app.settings.log.level = v,
+                EditableSection::ModelDefault => app.settings.model.default.name = v,
+                EditableSection::ModelReasoning => set_model_field(app, section, &v),
+                EditableSection::ModelOpus => set_model_field(app, section, &v),
+                EditableSection::ModelSonnet => set_model_field(app, section, &v),
+                EditableSection::ModelHaiku => set_model_field(app, section, &v),
+                EditableSection::ModelDefaultReasoningEffort
+                | EditableSection::ModelReasoningReasoningEffort
+                | EditableSection::ModelOpusReasoningEffort
+                | EditableSection::ModelSonnetReasoningEffort
+                | EditableSection::ModelHaikuReasoningEffort => {
+                    set_model_reasoning_effort(app, section, &v)
+                }
+            }
+            app.mark_dirty();
+            app.show_toast(Toast::success("Updated"));
+            true
+        }
+        InputAction::SetModelDefault { provider_id } => {
+            let value = provider_model_ref(provider_id, value);
+            app.settings.model.default.name = value.clone();
+            app.mark_dirty();
+            app.show_toast(Toast::success(format!("Default model: {value}")));
+            true
+        }
+        InputAction::SetProviderModelField {
+            provider_id,
+            section,
+        } => {
+            let value = provider_model_ref(provider_id, value);
+            set_model_field(app, section, &value);
+            app.mark_dirty();
+            app.show_toast(Toast::success(format!(
+                "{} = {}",
+                get_section_label(section),
+                value
+            )));
+            true
+        }
+        InputAction::EditProviderField {
+            provider_id, field, ..
+        } => {
+            if matches!(field, ProviderField::Name) {
+                return rename_provider(app, provider_id, value);
+            }
+
+            if let Some(cfg) = app.settings.providers.get_mut(provider_id) {
+                match field {
+                    ProviderField::Name => unreachable!(),
+                    ProviderField::ApiKey => cfg.api_key = value.to_string(),
+                    ProviderField::BaseUrl => cfg.base_url = value.to_string(),
+                    ProviderField::Proxy => cfg.proxy = value.to_string(),
+                }
+                app.provider_statuses.remove(provider_id);
+                app.mark_dirty();
+                app.show_toast(Toast::success("Updated"));
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn toggle_selected_provider_fast_mode(app: &mut App) -> bool {
+    let Some(id) = selected_chatgpt_provider_id(app) else {
+        return false;
+    };
+    toggle_chatgpt_fast_mode(app, &id)
+}
+
+fn toggle_selected_chatgpt_setting(app: &mut App) -> bool {
+    match app.detail_idx {
+        5 => toggle_selected_provider_fast_mode(app),
+        6 => toggle_selected_provider_context_mode(app),
+        _ => false,
+    }
+}
+
+fn toggle_selected_provider_context_mode(app: &mut App) -> bool {
+    let Some(id) = selected_chatgpt_provider_id(app) else {
+        return false;
+    };
+    let Some(cfg) = app.settings.providers.get_mut(&id) else {
+        return false;
+    };
+    let chatgpt = cfg
+        .chatgpt
+        .get_or_insert_with(ChatGptProviderConfig::default);
+    chatgpt.claude_code_context = match chatgpt.claude_code_context {
+        ClaudeCodeContextMode::Auto => ClaudeCodeContextMode::Standard,
+        ClaudeCodeContextMode::Standard => ClaudeCodeContextMode::Auto,
+    };
+    let mode = chatgpt.claude_code_context;
+
+    app.provider_statuses.remove(&id);
+    app.mark_dirty();
+    app.show_toast(Toast::success(format!(
+        "Claude Code context projection: {}",
+        match mode {
+            ClaudeCodeContextMode::Auto => "AUTO",
+            ClaudeCodeContextMode::Standard => "OFF",
+        }
+    )));
+    true
+}
+
+fn selected_chatgpt_provider_id(app: &App) -> Option<String> {
+    let (id, cfg) = app.settings.providers.iter().nth(app.content_idx)?;
+    (cfg.resolve_type(id) == ProviderType::ChatGPT).then(|| id.clone())
+}
+
+fn toggle_chatgpt_fast_mode(app: &mut App, provider_id: &str) -> bool {
+    let Some(cfg) = app.settings.providers.get_mut(provider_id) else {
+        return false;
+    };
+    if cfg.resolve_type(provider_id) != ProviderType::ChatGPT {
+        return false;
+    }
+
+    let chatgpt = cfg
+        .chatgpt
+        .get_or_insert_with(ChatGptProviderConfig::default);
+    chatgpt.fast_mode = !chatgpt.fast_mode;
+    let enabled = chatgpt.fast_mode;
+
+    app.provider_statuses.remove(provider_id);
+    app.mark_dirty();
+    app.show_toast(Toast::success(format!(
+        "Codex fast mode: {}",
+        if enabled { "ON" } else { "OFF" }
+    )));
+    true
+}
+
+fn handle_toggle(app: &mut App) {
+    if app.nav == NavItem::Log {
+        match app.content_idx {
+            1 => {
+                app.settings.log.raw_api_payloads = !app.settings.log.raw_api_payloads;
+                app.mark_dirty();
+                app.show_toast(Toast::info(format!(
+                    "Raw API payloads: {}",
+                    if app.settings.log.raw_api_payloads {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
+                )));
+            }
+            2 => {
+                app.settings.log.raw_sse_events = !app.settings.log.raw_sse_events;
+                app.mark_dirty();
+                app.show_toast(Toast::info(format!(
+                    "Raw SSE events: {}",
+                    if app.settings.log.raw_sse_events {
+                        "ON"
+                    } else {
+                        "OFF"
+                    }
+                )));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn add_provider(app: &mut App) {
+    let types = vec![
+        ProviderType::OpenAI,
+        ProviderType::Anthropic,
+        ProviderType::Copilot,
+        ProviderType::ChatGPT,
+        ProviderType::OpenRouter,
+        ProviderType::Google,
+        ProviderType::Custom(String::new()),
+    ];
+    let items: Vec<String> = types
+        .iter()
+        .map(|t| match t {
+            ProviderType::Copilot => format!("{} — OAuth, no API key needed", t.display_name()),
+            ProviderType::ChatGPT => format!("{} — ChatGPT OAuth", t.display_name()),
+            ProviderType::OpenAI => format!("{} — API key", t.display_name()),
+            ProviderType::Anthropic => format!("{} — API key", t.display_name()),
+            ProviderType::OpenRouter => {
+                format!("{} — API key, OpenAI-compatible", t.display_name())
+            }
+            ProviderType::Google => format!("{} — API key, OpenAI-compatible", t.display_name()),
+            ProviderType::Custom(_) => "Custom — choose compatibility after adding".to_string(),
+            ProviderType::CustomAnthropic(_) => unreachable!(),
+        })
+        .collect();
+    app.pending_provider_types = Some(types);
+    app.overlay = Some(Overlay::Picker(PickerOverlay {
+        title: "Add Provider — Select Type".into(),
+        items,
+        selected: 0,
+        action: PickerAction::AddProvider,
+    }));
+    app.focus = Focus::Overlay;
+}
+
+fn default_provider_id(provider_type: &ProviderType) -> &str {
+    match provider_type {
+        ProviderType::Custom(_) | ProviderType::CustomAnthropic(_) => "custom",
+        _ => provider_type.as_str(),
+    }
+}
+
+fn next_custom_provider_id(app: &App) -> String {
+    let base = "custom";
+    if !app.settings.providers.contains_key(base) {
+        return base.to_string();
+    }
+
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|id| !app.settings.providers.contains_key(id))
+        .unwrap()
+}
+
+fn provider_type_with_id(provider_type: ProviderType, id: &str) -> ProviderType {
+    match provider_type {
+        ProviderType::Custom(_) => ProviderType::Custom(id.to_string()),
+        ProviderType::CustomAnthropic(_) => ProviderType::CustomAnthropic(id.to_string()),
+        other => other,
+    }
+}
+
+fn is_custom_provider_type(provider_type: &ProviderType) -> bool {
+    matches!(
+        provider_type,
+        ProviderType::Custom(_) | ProviderType::CustomAnthropic(_)
+    )
+}
+
+fn provider_compatibility_label(provider_type: &ProviderType) -> &'static str {
+    match provider_type {
+        ProviderType::CustomAnthropic(_) => "Anthropic-compatible",
+        ProviderType::Custom(_) => "OpenAI-compatible",
+        ProviderType::OpenAI | ProviderType::OpenRouter | ProviderType::Google => {
+            "OpenAI-compatible"
+        }
+        ProviderType::Anthropic => "Anthropic-compatible",
+        ProviderType::Copilot => "Copilot OAuth",
+        ProviderType::ChatGPT => "ChatGPT OAuth",
+    }
+}
+
+fn set_provider_compatibility(app: &mut App, provider_id: &str, selected: &str) -> bool {
+    let Some(cfg) = app.settings.providers.get_mut(provider_id) else {
+        return false;
+    };
+
+    let current_type = cfg.resolve_type(provider_id);
+    if !is_custom_provider_type(&current_type) {
+        app.show_toast(Toast::info(
+            "Only custom providers can change compatibility",
+        ));
+        return false;
+    }
+
+    cfg.provider_type = Some(match selected {
+        "Anthropic-compatible" => ProviderType::CustomAnthropic(provider_id.to_string()),
+        _ => ProviderType::Custom(provider_id.to_string()),
+    });
+    app.provider_statuses.remove(provider_id);
+    app.mark_dirty();
+    app.show_toast(Toast::success(format!("Compatibility: {selected}")));
+    true
+}
+
+fn rename_provider(app: &mut App, old_id: &str, new_id: &str) -> bool {
+    let new_id = new_id.trim();
+    if new_id.is_empty() {
+        app.show_toast(Toast::error("Provider name cannot be empty"));
+        return false;
+    }
+    if new_id.contains('/') || new_id.chars().any(char::is_whitespace) {
+        app.show_toast(Toast::error("Provider name cannot contain spaces or '/'"));
+        return false;
+    }
+    if old_id == new_id {
+        return true;
+    }
+    if app.settings.providers.contains_key(new_id) {
+        app.show_toast(Toast::error(format!(
+            "Provider \"{new_id}\" already exists"
+        )));
+        return false;
+    }
+
+    let Some(mut cfg) = app.settings.providers.remove(old_id) else {
+        return false;
+    };
+
+    let provider_type = cfg.resolve_type(old_id);
+    if is_custom_provider_type(&provider_type) {
+        cfg.provider_type = Some(provider_type_with_id(provider_type, new_id));
+    }
+
+    app.settings.providers.insert(new_id.to_string(), cfg);
+    if let Some(status) = app.provider_statuses.remove(old_id) {
+        app.provider_statuses.insert(new_id.to_string(), status);
+    }
+    rewrite_model_provider_prefixes(&mut app.settings.model, old_id, new_id);
+    app.content_idx = app
+        .settings
+        .providers
+        .keys()
+        .position(|provider_id| provider_id == new_id)
+        .unwrap_or_else(|| app.settings.providers.len().saturating_sub(1));
+    app.mark_dirty();
+    app.show_toast(Toast::success(format!(
+        "Renamed provider \"{old_id}\" to \"{new_id}\""
+    )));
+    true
+}
+
+fn rewrite_model_provider_prefixes(model: &mut ModelConfig, old_id: &str, new_id: &str) {
+    rewrite_model_alias_provider_prefix(&mut model.default, old_id, new_id);
+    for alias in [
+        &mut model.reasoning,
+        &mut model.opus,
+        &mut model.sonnet,
+        &mut model.haiku,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        rewrite_model_alias_provider_prefix(alias, old_id, new_id);
+    }
+}
+
+fn rewrite_model_alias_provider_prefix(alias: &mut ModelAliasConfig, old_id: &str, new_id: &str) {
+    if let Some(model_name) = alias.name.strip_prefix(&format!("{old_id}/")) {
+        alias.name = format!("{new_id}/{model_name}");
+    }
+}
+
+fn check_selected_provider(app: &mut App) {
+    let Some((id, cfg)) = app.settings.providers.iter().nth(app.content_idx) else {
+        app.show_toast(Toast::info("No provider selected"));
+        return;
+    };
+
+    if app.provider_check_rx.is_some() {
+        app.show_toast(Toast::info("Provider check already running"));
+        return;
+    }
+
+    let id = id.clone();
+    let provider_type = cfg.resolve_type(&id);
+
+    if provider_type.needs_api_key() && cfg.api_key.trim().is_empty() {
+        app.provider_statuses.insert(
+            id.clone(),
+            ProviderCheckStatus::Failed("Missing API key".into()),
+        );
+        app.show_toast(Toast::error(format!("{id}: missing API key")));
+        return;
+    }
+
+    let settings = app.settings.clone();
+    let handle = app.tokio_handle.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    app.provider_statuses
+        .insert(id.clone(), ProviderCheckStatus::Checking);
+    app.provider_check_rx = Some(rx);
+    app.show_toast(Toast::info(format!("Checking {id}...")));
+
+    std::thread::spawn(move || {
+        let result = if matches!(
+            provider_type,
+            ProviderType::Anthropic | ProviderType::CustomAnthropic(_)
+        ) {
+            check_anthropic_provider_via_chat(&id, &settings, handle.as_ref())
+        } else {
+            fetch_models_via_provider(&id, &settings, handle.as_ref()).map(|models| {
+                ProviderCheckOk {
+                    message: format!("OK, {} models available", models.len()),
+                }
+            })
+        };
+        let _ = tx.send(ProviderCheckResult {
+            provider_id: id,
+            result,
+        });
+    });
+}
+
+/// Fetch models using the provider trait (handles OAuth, API keys, etc. correctly).
+fn fetch_models_via_provider(
+    provider_id: &str,
+    settings: &aisub2api_config::Settings,
+    handle: Option<&tokio::runtime::Handle>,
+) -> Result<Vec<ModelInfo>, String> {
+    let Some(cfg) = settings.providers.get(provider_id) else {
+        return Err("Provider not found in config".into());
+    };
+
+    let handle = handle.ok_or_else(|| {
+        error!("No tokio runtime handle available");
+        "No async runtime".to_string()
+    })?;
+
+    info!("Fetching models for provider={provider_id}");
+
+    let pid = provider_id.to_string();
+    let settings_clone = settings.clone();
+    let result: Result<Vec<ModelInfo>, String> = handle.block_on(async {
+        let provider = aisub2api_providers::create_provider(&pid, cfg, &settings_clone)
+            .await
+            .map_err(|e| {
+                error!("Failed to create provider for provider={pid}: {e}");
+                format!("Provider init failed: {e}")
+            })?;
+
+        let models = provider.list_models().await.map_err(|e| {
+            error!("list_models failed for provider={pid}: {e}");
+            format!("list_models failed: {e}")
+        })?;
+
+        Ok(models)
+    });
+
+    match &result {
+        Ok(models) => info!("Fetched {} models for provider={provider_id}", models.len()),
+        Err(e) => error!("Model fetch failed for provider={provider_id}: {e}"),
+    }
+
+    result
+}
+
+fn start_model_fetch(app: &mut App, provider_id: String) {
+    let settings = app.settings.clone();
+    let handle = app.tokio_handle.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.fetch_rx = Some(rx);
+    std::thread::spawn(move || {
+        let models = fetch_models_via_provider(&provider_id, &settings, handle.as_ref());
+        let _ = tx.send(FetchResult {
+            provider_id,
+            models,
+        });
+    });
+}
+
+fn check_anthropic_provider_via_chat(
+    provider_id: &str,
+    settings: &aisub2api_config::Settings,
+    handle: Option<&tokio::runtime::Handle>,
+) -> Result<ProviderCheckOk, String> {
+    let Some(cfg) = settings.providers.get(provider_id) else {
+        return Err("Provider not found in config".into());
+    };
+    let handle = handle.ok_or_else(|| {
+        error!("No tokio runtime handle available");
+        "No async runtime".to_string()
+    })?;
+    let model = provider_probe_model(settings, provider_id).ok_or_else(|| {
+        format!("Set a {provider_id}/... model before testing Anthropic-compatible auth")
+    })?;
+
+    let pid = provider_id.to_string();
+    let settings_clone = settings.clone();
+    let model_for_request = model.clone();
+    handle.block_on(async {
+        let provider = aisub2api_providers::create_provider(&pid, cfg, &settings_clone)
+            .await
+            .map_err(|e| format!("Provider init failed: {e}"))?;
+        let _stream = provider
+            .chat(MessagesRequest {
+                model: model_for_request,
+                system: None,
+                messages: vec![Message {
+                    role: Role::User,
+                    content: MessageContent::Text("ping".into()),
+                }],
+                max_tokens: Some(1),
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                stop_sequences: None,
+                stream: false,
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                metadata: None,
+                extra: Default::default(),
+            })
+            .await
+            .map_err(provider_check_error)?;
+        Ok(ProviderCheckOk {
+            message: format!("OK, auth verified with model {model}"),
+        })
+    })
+}
+
+fn provider_check_error(error: ProviderError) -> String {
+    let status = error.upstream_metadata().map(|metadata| metadata.status);
+    if error.is_authentication() || matches!(status, Some(401 | 403)) {
+        format!("authentication failed: {error}")
+    } else if matches!(
+        error.without_upstream_metadata(),
+        ProviderError::ModelNotFound(_)
+    ) {
+        format!("model not found during auth probe: {error}")
+    } else {
+        format!("chat probe failed: {error}")
+    }
+}
+
+fn provider_probe_model(
+    settings: &aisub2api_config::Settings,
+    provider_id: &str,
+) -> Option<String> {
+    let prefix = format!("{provider_id}/");
+    let aliases = [
+        Some(&settings.model.default),
+        settings.model.reasoning.as_ref(),
+        settings.model.opus.as_ref(),
+        settings.model.sonnet.as_ref(),
+        settings.model.haiku.as_ref(),
+    ];
+    aliases
+        .into_iter()
+        .flatten()
+        .find_map(|alias| alias.name.strip_prefix(&prefix).map(str::to_string))
+        .or_else(|| {
+            settings.providers.get(provider_id).and_then(|cfg| {
+                (cfg.resolve_type(provider_id) == ProviderType::Anthropic)
+                    .then(|| "claude-3-5-haiku-20241022".to_string())
+            })
+        })
+}
+
+/// Start the GitHub OAuth device flow for a Copilot provider in the background.
+fn start_oauth_flow(app: &mut App, provider_id: &str) {
+    let pid = provider_id.to_string();
+    let settings = app.settings.clone();
+    let provider_type = settings
+        .providers
+        .get(&pid)
+        .map(|cfg| cfg.resolve_type(&pid))
+        .unwrap_or_else(|| ProviderType::parse(&pid));
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.oauth_rx = Some(rx);
+    app.oauth_pending_id = Some(pid.clone());
+    app.overlay = Some(Overlay::OAuth(OAuthOverlay {
+        provider_id: pid.clone(),
+        step: OAuthStep::Requesting,
+        spinner_tick: app.tick,
+    }));
+    app.focus = Focus::Overlay;
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("oauth runtime");
+        rt.block_on(async {
+            let client = match build_tui_oauth_http_client(&settings, &pid) {
+                Ok(client) => client,
+                Err(e) => {
+                    let _ = tx.send(OAuthResult::Error(e));
+                    return;
+                }
+            };
+
+            match provider_type {
+                ProviderType::Copilot => {
+                    match aisub2api_providers::copilot::auth::CopilotAuth::new(
+                        client,
+                        "vscode",
+                        settings.http.max_response_body_bytes,
+                    )
+                    .await
+                    {
+                        Ok(auth) => match auth.start_device_code().await {
+                            Ok(info) => {
+                                let _ = tx.send(OAuthResult::CodeInfo {
+                                    url: info.verification_uri.clone(),
+                                    code: info.user_code.clone(),
+                                    device_code: info.device_code.clone(),
+                                    interval: info.interval,
+                                });
+                                match auth.complete_device_code(&info).await {
+                                    Ok(token) => {
+                                        let _ = auth.refresh_copilot_token().await;
+                                        let _ = tx.send(OAuthResult::Token(token));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(OAuthResult::Error(e.to_string()));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(OAuthResult::Error(e.to_string()));
+                            }
+                        },
+                        Err(e) => {
+                            let _ = tx.send(OAuthResult::Error(e.to_string()));
+                        }
+                    }
+                }
+                ProviderType::ChatGPT => {
+                    match aisub2api_providers::chatgpt::ChatGptAuth::new(
+                        client,
+                        settings.http.max_response_body_bytes,
+                    )
+                    .await
+                    {
+                        Ok(auth) => match auth.start_device_code().await {
+                            Ok(info) => {
+                                let _ = tx.send(OAuthResult::CodeInfo {
+                                    url: info.verification_uri.clone(),
+                                    code: info.user_code.clone(),
+                                    device_code: info.device_auth_id.clone(),
+                                    interval: info.interval,
+                                });
+                                match auth.complete_device_code(&info).await {
+                                    Ok(token) => {
+                                        let _ = tx.send(OAuthResult::Token(token));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(OAuthResult::Error(e.to_string()));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(OAuthResult::Error(e.to_string()));
+                            }
+                        },
+                        Err(e) => {
+                            let _ = tx.send(OAuthResult::Error(e.to_string()));
+                        }
+                    }
+                }
+                _ => {
+                    let _ = tx.send(OAuthResult::Error(
+                        "selected provider does not support OAuth".to_string(),
+                    ));
+                }
+            }
+        });
+    });
+}
+
+fn build_tui_oauth_http_client(
+    settings: &Settings,
+    provider_id: &str,
+) -> Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .hickory_dns(true)
+        .connect_timeout(Duration::from_secs(settings.http.connect_timeout))
+        .read_timeout(Duration::from_secs(settings.http.read_timeout));
+
+    if let Some(proxy) = settings
+        .providers
+        .get(provider_id)
+        .map(|cfg| cfg.proxy.trim())
+        && !proxy.is_empty()
+    {
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy).map_err(|e| format!("invalid proxy \"{proxy}\": {e}"))?,
+        );
+    }
+
+    builder = aisub2api_providers::apply_extra_ca_certs(builder, &settings.http.extra_ca_certs)
+        .map_err(|e| e.to_string())?;
+
+    builder
+        .build()
+        .map_err(|e| aisub2api_providers::fmt_reqwest_err(&e))
+}
+
+/// Poll OAuth background thread results and update overlay state.
+fn poll_oauth(app: &mut App) {
+    if let Some(ref rx) = app.oauth_rx {
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                OAuthResult::Error("OAuth worker exited before returning a device code".into())
+            }
+        };
+
+        match result {
+            OAuthResult::CodeInfo {
+                url,
+                code,
+                device_code,
+                interval,
+            } => {
+                // Stash device_code + interval for the polling phase
+                app.oauth_device_info = Some((device_code, interval));
+                // Update the overlay to show URL + code
+                if let Some(Overlay::OAuth(ref mut oa)) = app.overlay {
+                    oa.step = OAuthStep::ShowCode { url, code };
+                }
+            }
+            OAuthResult::Token(_) => {
+                let provider_id = app
+                    .oauth_pending_id
+                    .clone()
+                    .unwrap_or_else(|| "Provider".to_string());
+                app.oauth_rx = None;
+                if let Some(Overlay::OAuth(ref mut oa)) = app.overlay {
+                    oa.step = OAuthStep::Success;
+                }
+                // Auto-dismiss after brief delay (handled via tick counter in overlay)
+                app.overlay = None;
+                app.focus = Focus::Content;
+                app.oauth_pending_id = None;
+                app.oauth_device_info = None;
+                app.show_toast(Toast::success(format!(
+                    "{provider_id} authenticated successfully"
+                )));
+            }
+            OAuthResult::Error(err) => {
+                app.oauth_rx = None;
+                if let Some(Overlay::OAuth(ref mut oa)) = app.overlay {
+                    oa.step = OAuthStep::Failed(err);
+                }
+                // Keep overlay open so user can see the error; Esc to dismiss
+            }
+        }
+    }
+}
+
+fn poll_provider_check(app: &mut App) {
+    let Some(ref rx) = app.provider_check_rx else {
+        return;
+    };
+
+    let result = match rx.try_recv() {
+        Ok(result) => result,
+        Err(TryRecvError::Empty) => return,
+        Err(TryRecvError::Disconnected) => {
+            app.provider_check_rx = None;
+            app.show_toast(Toast::error("Provider check worker exited"));
+            return;
+        }
+    };
+
+    app.provider_check_rx = None;
+    match result.result {
+        Ok(ok) => {
+            app.provider_statuses.insert(
+                result.provider_id.clone(),
+                ProviderCheckStatus::Ok(ok.message.clone()),
+            );
+            app.show_toast(Toast::success(format!(
+                "{}: {}",
+                result.provider_id, ok.message
+            )));
+        }
+        Err(err) => {
+            app.provider_statuses.insert(
+                result.provider_id.clone(),
+                ProviderCheckStatus::Failed(err.clone()),
+            );
+            app.show_toast(Toast::error(format!(
+                "{} check failed: {}",
+                result.provider_id, err
+            )));
+        }
+    }
+}
+
+fn poll_fetch(app: &mut App) {
+    if let Some(ref rx) = app.fetch_rx
+        && let Ok(result) = rx.try_recv()
+    {
+        app.fetch_rx = None;
+        let pending_section = app.pending_model_section.take();
+        let pending_reasoning_section = app.pending_reasoning_section.take();
+        let provider_name = result.provider_id.clone();
+        match result.models {
+            Ok(models) => {
+                app.model_capabilities_loaded
+                    .insert(result.provider_id.clone());
+                for model in &models {
+                    app.model_reasoning_efforts.insert(
+                        provider_model_ref(&result.provider_id, &model.model_id),
+                        model.capabilities.limits.reasoning_effort_levels.clone(),
+                    );
+                }
+
+                if let Some(section) = pending_reasoning_section {
+                    show_reasoning_effort_picker(app, section);
+                    return;
+                }
+
+                let action = match pending_section {
+                    Some(section) => PickerAction::SetModelField {
+                        provider_id: result.provider_id,
+                        section,
+                    },
+                    None => PickerAction::SetModelDefault {
+                        provider_id: result.provider_id,
+                    },
+                };
+                app.overlay = Some(Overlay::Picker(PickerOverlay {
+                    title: format!("Select model for {}", provider_name),
+                    items: model_picker_items(
+                        models.into_iter().map(|model| model.model_id).collect(),
+                    ),
+                    selected: 0,
+                    action,
+                }));
+                app.focus = Focus::Overlay;
+            }
+            Err(err) => {
+                error!("Model fetch failed for provider={provider_name}: {err}");
+                if let Some(section) = pending_reasoning_section {
+                    show_reasoning_effort_picker(app, section);
+                    app.show_toast(Toast::warning(format!(
+                        "Failed to fetch model capabilities; showing compatible values: {err}"
+                    )));
+                    return;
+                } else {
+                    match pending_section {
+                        Some(section) => show_manual_model_input(app, &provider_name, section, ""),
+                        None => show_manual_default_model_input(app, &provider_name, ""),
+                    }
+                }
+                app.show_toast(Toast::warning(format!(
+                    "Failed to fetch models; enter model manually: {err}"
+                )));
+            }
+        }
+    }
+}
+
+fn delete_provider(app: &mut App) {
+    if let Some((id, _)) = app.settings.providers.iter().nth(app.content_idx) {
+        let id = id.clone();
+        app.overlay = Some(Overlay::Confirm(ConfirmOverlay {
+            title: "Delete Provider".into(),
+            message: format!("Delete provider \"{id}\"?"),
+            kind: ConfirmKind::YesNo {
+                on_yes: ConfirmAction::DeleteProvider(id),
+            },
+        }));
+        app.focus = Focus::Overlay;
+    }
+}
+
+fn oauth_provider(app: &mut App) {
+    if let Some((id, cfg)) = app.settings.providers.iter().nth(app.content_idx) {
+        let id = id.clone();
+        if cfg.resolve_type(&id).needs_api_key() {
+            app.show_toast(Toast::info(
+                "This provider uses API key authentication, not OAuth",
+            ));
+            return;
+        }
+        if cfg.resolve_type(&id) == ProviderType::Copilot
+            && cfg
+                .copilot
+                .as_ref()
+                .is_some_and(|c| c.oauth_app == "opencode")
+        {
+            app.show_toast(Toast::info(
+                "OpenCode Zen uses direct GitHub token authentication",
+            ));
+            return;
+        }
+        start_oauth_flow(app, &id);
+    }
+}
+
+fn save_settings_with_feedback(app: &mut App) -> bool {
+    save_settings_with_message(app, "Configuration saved")
+}
+
+fn save_settings_with_message(app: &mut App, success_message: &str) -> bool {
+    match save_settings(app) {
+        Ok(SaveOutcome::Synced(_path)) => {
+            app.dirty = false;
+            app.show_toast(Toast::success(success_message));
+            true
+        }
+        Ok(SaveOutcome::ConfigSavedSyncFailed(err)) => {
+            app.dirty = false;
+            app.show_toast(Toast::warning(format!(
+                "Config saved; Claude Code sync failed: {err}"
+            )));
+            false
+        }
+        Err(err) => {
+            app.show_toast(Toast::error(format!("Save failed: {err}")));
+            false
+        }
+    }
+}
+
+enum SaveOutcome {
+    Synced(PathBuf),
+    ConfigSavedSyncFailed(String),
+}
+
+fn save_settings(app: &App) -> Result<SaveOutcome, String> {
+    let path = Settings::config_file_path().unwrap_or_else(|| PathBuf::from("config.toml"));
+    let mark_onboarding_complete = should_mark_claude_onboarding_complete_on_save(app, &path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create config directory: {e}"))?;
+    }
+    std::fs::write(&path, app.settings.to_toml())
+        .map_err(|e| format!("failed to save config: {e}"))?;
+    match sync_claude_code_settings(&app.settings, mark_onboarding_complete) {
+        Ok(path) => Ok(SaveOutcome::Synced(path)),
+        Err(err) => Ok(SaveOutcome::ConfigSavedSyncFailed(err)),
+    }
+}
+
+pub(crate) fn sync_claude_code_settings(
+    settings: &Settings,
+    mark_onboarding_complete: bool,
+) -> Result<PathBuf, String> {
+    let path = claude_code_settings_path()?;
+    let mut value = if path.exists() {
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read Claude Code settings: {e}"))?;
+        if content.trim().is_empty() {
+            Value::Object(Map::new())
+        } else {
+            serde_json::from_str(&content)
+                .map_err(|e| format!("failed to parse Claude Code settings JSON: {e}"))?
+        }
+    } else {
+        Value::Object(Map::new())
+    };
+
+    apply_claude_code_env(&mut value, settings);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create Claude Code config directory: {e}"))?;
+    }
+    let content = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("failed to serialize Claude Code settings: {e}"))?;
+    std::fs::write(&path, format!("{content}\n"))
+        .map_err(|e| format!("failed to write Claude Code settings: {e}"))?;
+    sync_claude_user_config(&settings.server.auth_token, mark_onboarding_complete)?;
+    Ok(path)
+}
+
+fn should_mark_claude_onboarding_complete_on_save(app: &App, config_path: &Path) -> bool {
+    if app.nav == NavItem::Model {
+        return true;
+    }
+
+    if config_path.exists() {
+        return Settings::load(config_path)
+            .map(|existing| !same_model_config(&existing, &app.settings))
+            .unwrap_or(false);
+    }
+
+    !same_model_config(&Settings::default(), &app.settings)
+}
+
+fn same_model_config(left: &Settings, right: &Settings) -> bool {
+    left.model.default == right.model.default
+        && left.model.reasoning == right.model.reasoning
+        && left.model.opus == right.model.opus
+        && left.model.sonnet == right.model.sonnet
+        && left.model.haiku == right.model.haiku
+}
+
+#[cfg(test)]
+fn mark_claude_onboarding_complete_at(path: &Path) -> Result<(), String> {
+    sync_claude_user_config_at(path, "", true)
+}
+
+fn sync_claude_user_config(
+    auth_token: &str,
+    mark_onboarding_complete: bool,
+) -> Result<Option<PathBuf>, String> {
+    if auth_token.trim().is_empty() && !mark_onboarding_complete {
+        return Ok(None);
+    }
+
+    let path = claude_code_user_config_path()?;
+    sync_claude_user_config_at(&path, auth_token, mark_onboarding_complete)?;
+    Ok(Some(path))
+}
+
+fn sync_claude_user_config_at(
+    path: &Path,
+    auth_token: &str,
+    mark_onboarding_complete: bool,
+) -> Result<(), String> {
+    let mut value = if path.exists() {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read Claude user config: {e}"))?;
+        if content.trim().is_empty() {
+            Value::Object(Map::new())
+        } else {
+            serde_json::from_str(&content)
+                .map_err(|e| format!("failed to parse Claude user config JSON: {e}"))?
+        }
+    } else {
+        Value::Object(Map::new())
+    };
+
+    if !value.is_object() {
+        return Err("Claude user config root must be a JSON object".to_string());
+    }
+    let root = value.as_object_mut().expect("value is an object");
+    if mark_onboarding_complete {
+        root.insert("hasCompletedOnboarding".to_string(), Value::Bool(true));
+    }
+    approve_claude_code_api_key(root, auth_token);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create Claude user config directory: {e}"))?;
+    }
+    let content = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("failed to serialize Claude user config: {e}"))?;
+    std::fs::write(path, format!("{content}\n"))
+        .map_err(|e| format!("failed to write Claude user config: {e}"))?;
+    Ok(())
+}
+
+fn approve_claude_code_api_key(root: &mut Map<String, Value>, auth_token: &str) {
+    let auth_token = auth_token.trim();
+    if auth_token.is_empty() {
+        return;
+    }
+
+    let responses = root
+        .entry("customApiKeyResponses".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !responses.is_object() {
+        *responses = Value::Object(Map::new());
+    }
+    let responses = responses
+        .as_object_mut()
+        .expect("customApiKeyResponses is an object");
+
+    responses.insert(
+        "rejected".to_string(),
+        Value::Array(
+            responses
+                .get("rejected")
+                .and_then(|value| value.as_array())
+                .into_iter()
+                .flatten()
+                .filter(|value| value.as_str() != Some(auth_token))
+                .cloned()
+                .collect(),
+        ),
+    );
+
+    let mut approved = responses
+        .get("approved")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if !approved
+        .iter()
+        .any(|value| value.as_str() == Some(auth_token))
+    {
+        approved.push(Value::String(auth_token.to_string()));
+    }
+    responses.insert("approved".to_string(), Value::Array(approved));
+}
+
+fn claude_code_user_config_path() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        let dir = PathBuf::from(dir);
+        if !dir.as_os_str().is_empty() && !dir.to_string_lossy().trim().is_empty() {
+            return claude_user_config_path_for_dir(&dir);
+        }
+    }
+
+    home_dir()
+        .map(|home| home.join(".claude.json"))
+        .ok_or_else(|| "could not determine home directory for Claude user config".to_string())
+}
+
+fn claude_user_config_path_for_dir(dir: &Path) -> Result<PathBuf, String> {
+    let file_name = dir
+        .file_name()
+        .ok_or_else(|| "CLAUDE_CONFIG_DIR must point to a named directory".to_string())?;
+    let parent = dir.parent().unwrap_or_else(|| Path::new(""));
+    Ok(parent.join(format!("{}.json", file_name.to_string_lossy())))
+}
+
+fn claude_code_settings_path() -> Result<PathBuf, String> {
+    let dir = claude_code_config_dir()?;
+    let settings = dir.join("settings.json");
+    if settings.exists() {
+        return Ok(settings);
+    }
+    let legacy = dir.join("claude.json");
+    if legacy.exists() {
+        return Ok(legacy);
+    }
+    Ok(settings)
+}
+
+fn claude_code_config_dir() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        let dir = PathBuf::from(dir);
+        if !dir.as_os_str().is_empty() && !dir.to_string_lossy().trim().is_empty() {
+            return Ok(dir);
+        }
+    }
+    home_dir()
+        .map(|home| home.join(".claude"))
+        .ok_or_else(|| "could not determine home directory for Claude Code settings".to_string())
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+fn apply_claude_code_env(value: &mut Value, settings: &Settings) {
+    if !value.is_object() {
+        *value = Value::Object(Map::new());
+    }
+    let root = value.as_object_mut().expect("value is an object");
+    let env_value = root
+        .entry("env".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !env_value.is_object() {
+        *env_value = Value::Object(Map::new());
+    }
+    let env = env_value.as_object_mut().expect("env is an object");
+
+    set_env(env, "ANTHROPIC_BASE_URL", &claude_code_base_url(settings));
+    set_env(env, "ANTHROPIC_API_KEY", &settings.server.auth_token);
+    set_env(env, "CLAUDE_CODE_ATTRIBUTION_HEADER", "0");
+    set_env(env, "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "128000");
+    set_default_env(env, "ENABLE_TOOL_SEARCH", "true");
+    env.remove("ANTHROPIC_AUTH_TOKEN");
+    let default_model = aisub2api_providers::chatgpt::claude_code_projected_model(
+        settings,
+        &settings.model.default.name,
+    );
+    let reasoning_model = settings
+        .model
+        .reasoning_name()
+        .map(|model| aisub2api_providers::chatgpt::claude_code_projected_model(settings, model));
+    let haiku_model = settings
+        .model
+        .haiku_name()
+        .map(|model| aisub2api_providers::chatgpt::claude_code_projected_model(settings, model));
+    let sonnet_model = settings
+        .model
+        .sonnet_name()
+        .map(|model| aisub2api_providers::chatgpt::claude_code_projected_model(settings, model));
+    let opus_model = settings
+        .model
+        .opus_name()
+        .map(|model| aisub2api_providers::chatgpt::claude_code_projected_model(settings, model));
+
+    set_env(env, "ANTHROPIC_MODEL", &default_model);
+    set_optional_env(env, "ANTHROPIC_REASONING_MODEL", reasoning_model.as_deref());
+    set_optional_env(env, "ANTHROPIC_DEFAULT_HAIKU_MODEL", haiku_model.as_deref());
+    set_optional_env(
+        env,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        sonnet_model.as_deref(),
+    );
+    set_optional_env(env, "ANTHROPIC_DEFAULT_OPUS_MODEL", opus_model.as_deref());
+    env.remove("ANTHROPIC_SMALL_FAST_MODEL");
+}
+
+fn claude_code_base_url(settings: &Settings) -> String {
+    let host = match settings.server.host.as_str() {
+        "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+        host if host.contains(':') && !host.starts_with('[') => format!("[{host}]"),
+        host => host.to_string(),
+    };
+    format!("http://{}:{}", host, settings.server.port)
+}
+
+fn openai_base_url(settings: &Settings) -> String {
+    format!("{}/v1", claude_code_base_url(settings))
+}
+
+fn set_optional_env(env: &mut Map<String, Value>, key: &str, value: Option<&str>) {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => {
+            env.insert(key.to_string(), Value::String(value.to_string()));
+        }
+        None => {
+            env.remove(key);
+        }
+    }
+}
+
+fn set_env(env: &mut Map<String, Value>, key: &str, value: &str) {
+    env.insert(key.to_string(), Value::String(value.trim().to_string()));
+}
+
+fn set_default_env(env: &mut Map<String, Value>, key: &str, value: &str) {
+    env.entry(key.to_string())
+        .or_insert_with(|| Value::String(value.trim().to_string()));
+}
+
+fn provider_model_ref(provider_id: &str, model: &str) -> String {
+    let model = model.trim();
+    let prefix = format!("{provider_id}/");
+    if model.starts_with(&prefix) {
+        model.to_string()
+    } else {
+        format!("{provider_id}/{model}")
+    }
+}
+
+fn model_picker_items(models: Vec<String>) -> Vec<String> {
+    let mut items: Vec<String> = models
+        .into_iter()
+        .filter(|model| !model.is_empty())
+        .collect();
+    if !items.iter().any(|item| item == CUSTOM_MODEL_ITEM) {
+        items.push(CUSTOM_MODEL_ITEM.to_string());
+    }
+    items
+}
+
+fn show_manual_model_input(
+    app: &mut App,
+    provider_id: &str,
+    section: EditableSection,
+    initial_model: &str,
+) {
+    app.overlay = Some(Overlay::Input(InputOverlay {
+        title: format!("Enter model for {provider_id}"),
+        prompt: "Model".into(),
+        value: initial_model.to_string(),
+        cursor: initial_model.len(),
+        action: InputAction::SetProviderModelField {
+            provider_id: provider_id.to_string(),
+            section,
+        },
+    }));
+    app.focus = Focus::Overlay;
+}
+
+fn show_manual_default_model_input(app: &mut App, provider_id: &str, initial_model: &str) {
+    app.overlay = Some(Overlay::Input(InputOverlay {
+        title: format!("Enter default model for {provider_id}"),
+        prompt: "Model".into(),
+        value: initial_model.to_string(),
+        cursor: initial_model.len(),
+        action: InputAction::SetModelDefault {
+            provider_id: provider_id.to_string(),
+        },
+    }));
+    app.focus = Focus::Overlay;
+}
+
+fn set_model_field(app: &mut App, section: &EditableSection, value: &str) {
+    let v = value.trim().to_string();
+    match section {
+        EditableSection::ModelDefault => app.settings.model.default.name = v,
+        EditableSection::ModelReasoning => {
+            set_optional_model_alias(&mut app.settings.model.reasoning, v)
+        }
+        EditableSection::ModelOpus => set_optional_model_alias(&mut app.settings.model.opus, v),
+        EditableSection::ModelSonnet => set_optional_model_alias(&mut app.settings.model.sonnet, v),
+        EditableSection::ModelHaiku => set_optional_model_alias(&mut app.settings.model.haiku, v),
+        _ => {}
+    }
+}
+
+fn set_optional_model_alias(alias: &mut Option<ModelAliasConfig>, name: String) {
+    if name.is_empty() {
+        *alias = None;
+    } else if let Some(existing) = alias {
+        existing.name = name;
+    } else {
+        *alias = Some(ModelAliasConfig::new(name));
+    }
+}
+
+fn set_model_reasoning_effort(app: &mut App, section: &EditableSection, value: &str) {
+    let effort = parse_model_reasoning_effort(value);
+    match section {
+        EditableSection::ModelDefaultReasoningEffort => {
+            app.settings.model.default.reasoning_effort = effort;
+        }
+        EditableSection::ModelReasoningReasoningEffort => {
+            if let Some(alias) = app.settings.model.reasoning.as_mut() {
+                alias.reasoning_effort = effort;
+            }
+        }
+        EditableSection::ModelOpusReasoningEffort => {
+            if let Some(alias) = app.settings.model.opus.as_mut() {
+                alias.reasoning_effort = effort;
+            }
+        }
+        EditableSection::ModelSonnetReasoningEffort => {
+            if let Some(alias) = app.settings.model.sonnet.as_mut() {
+                alias.reasoning_effort = effort;
+            }
+        }
+        EditableSection::ModelHaikuReasoningEffort => {
+            if let Some(alias) = app.settings.model.haiku.as_mut() {
+                alias.reasoning_effort = effort;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn live_metrics_fetch_due(last_fetch_at: Option<Instant>, now: Instant) -> bool {
+    last_fetch_at
+        .map(|last| now.saturating_duration_since(last) >= METRICS_FETCH_INTERVAL)
+        .unwrap_or(true)
+}
+
+/// Kick off a throttled background thread to fetch live metrics (non-blocking).
+fn fetch_live_metrics(app: &mut App, now: Instant) {
+    // Don't spawn a new fetch if one is already in-flight
+    if app.metrics_rx.is_some() {
+        return;
+    }
+    if !live_metrics_fetch_due(app.last_metrics_fetch_at, now) {
+        return;
+    }
+    app.last_metrics_fetch_at = Some(now);
+
+    let host = app.settings.server.host.clone();
+    let port = app.settings.server.port;
+    let admin_token = app.settings.admin_auth_token().to_string();
+    let url = format!("http://{host}:{port}/admin/metrics");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.metrics_rx = Some(rx);
+
+    std::thread::spawn(move || {
+        let client = reqwest::blocking::Client::new();
+        let mut req = client.get(&url).timeout(Duration::from_secs(2));
+        if !admin_token.is_empty() {
+            req = req.header("Authorization", format!("Bearer {admin_token}"));
+        }
+        let result = req
+            .send()
+            .ok()
+            .and_then(|r| r.json::<serde_json::Value>().ok());
+        let _ = tx.send(result);
+    });
+}
+
+fn parse_usage_metrics(value: Option<&Value>) -> Vec<(String, LiveModelMetrics)> {
+    let Some(metrics) = value.and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+
+    let mut items: Vec<(String, LiveModelMetrics)> = metrics
+        .iter()
+        .map(|(name, v)| {
+            let m = LiveModelMetrics {
+                requests: v.get("requests").and_then(|x| x.as_u64()).unwrap_or(0),
+                input_tokens: v.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                output_tokens: v.get("output_tokens").and_then(|x| x.as_u64()).unwrap_or(0),
+                cache_creation_input_tokens: v
+                    .get("cache_creation_input_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
+                cache_read_input_tokens: v
+                    .get("cache_read_input_tokens")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0),
+            };
+            (name.clone(), m)
+        })
+        .collect();
+    items.sort_by_key(|a| std::cmp::Reverse(a.1.total_tokens()));
+    items
+}
+
+fn parse_model_capabilities(value: Option<&Value>) -> Vec<(String, ModelCapability)> {
+    let Some(capabilities) = value.and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+
+    let mut items: Vec<(String, ModelCapability)> = capabilities
+        .iter()
+        .map(|(name, v)| {
+            let capability = v.get("capabilities");
+            let limits = capability.and_then(|c| c.get("limits"));
+            let features = capability.and_then(|c| c.get("features"));
+            let quality = capability.and_then(|c| c.get("quality"));
+            let endpoints = capability.and_then(|c| c.get("endpoints"));
+            let modalities = capability.and_then(|c| c.get("modalities"));
+            let input_modalities = modalities.and_then(|m| m.get("input"));
+            (
+                name.clone(),
+                ModelCapability {
+                    provider: v
+                        .get("provider")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    vendor: v.get("vendor").and_then(|x| x.as_str()).map(str::to_string),
+                    max_output_tokens: limits
+                        .and_then(|l| l.get("max_output_tokens"))
+                        .and_then(|x| x.as_u64()),
+                    context_window: limits
+                        .and_then(|l| l.get("context_window"))
+                        .and_then(|x| x.as_u64()),
+                    supported_endpoints: parse_supported_endpoint_paths(endpoints),
+                    supported_parameters: capability
+                        .and_then(|c| c.get("supported_parameters"))
+                        .and_then(|x| x.as_array())
+                        .map(|items| parse_string_array(items))
+                        .unwrap_or_default(),
+                    streaming: feature_supported(features, "streaming"),
+                    tools: feature_supported(features, "tools"),
+                    thinking: feature_supported(features, "thinking"),
+                    vision: feature_supported(input_modalities, "image"),
+                    adaptive_thinking: feature_supported(features, "adaptive_thinking"),
+                    prompt_cache: feature_supported(features, "prompt_cache")
+                        || nested_capability_supported(quality, "prompt_cache"),
+                    prompt_cache_scope: nested_capability_value(quality, "prompt_cache", "scope"),
+                    tool_search: nested_capability_supported(quality, "tool_search"),
+                    fine_grained_tool_streaming: feature_supported(
+                        quality,
+                        "fine_grained_tool_streaming",
+                    ),
+                    structured_outputs: feature_supported(quality, "structured_outputs"),
+                    strict_tools: feature_supported(quality, "strict_tools"),
+                    token_efficient_tools: feature_supported(quality, "token_efficient_tools"),
+                    fast_mode: feature_supported(quality, "fast_mode"),
+                    token_counting_mode: nested_capability_value(quality, "token_counting", "mode"),
+                    reasoning_effort_levels: limits
+                        .and_then(|l| l.get("reasoning_effort_levels"))
+                        .and_then(|x| x.as_array())
+                        .map(|items| parse_string_array(items))
+                        .unwrap_or_default(),
+                },
+            )
+        })
+        .collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
+}
+
+fn feature_supported(value: Option<&Value>, key: &str) -> bool {
+    value.and_then(|v| v.get(key)).and_then(Value::as_str) == Some("supported")
+}
+
+fn nested_capability_supported(value: Option<&Value>, key: &str) -> bool {
+    nested_capability_value(value, key, "state").as_deref() == Some("supported")
+}
+
+fn nested_capability_value(value: Option<&Value>, key: &str, field: &str) -> Option<String> {
+    value
+        .and_then(|v| v.get(key))
+        .and_then(|v| v.get(field))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn parse_string_array(items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| item.as_str().map(str::to_string))
+        .collect()
+}
+
+fn parse_supported_endpoint_paths(endpoints: Option<&Value>) -> Vec<String> {
+    let Some(endpoints) = endpoints.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    [
+        ("anthropic_messages", "/v1/messages"),
+        ("openai_chat_completions", "/chat/completions"),
+        ("openai_responses", "/responses"),
+    ]
+    .into_iter()
+    .filter(|(field, _)| endpoints.get(*field).and_then(Value::as_str) == Some("supported"))
+    .map(|(_, path)| path.to_string())
+    .collect()
+}
+
+fn parse_provider_rate_limits(
+    value: Option<&Value>,
+) -> Vec<(
+    String,
+    Vec<aisub2api_providers::provider::RateLimitSnapshot>,
+)> {
+    let Some(providers) = value.and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+
+    let mut items: Vec<_> = providers
+        .iter()
+        .filter_map(|(provider_id, value)| {
+            let snapshots = value
+                .as_array()?
+                .iter()
+                .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                .collect::<Vec<_>>();
+            (!snapshots.is_empty()).then_some((provider_id.clone(), snapshots))
+        })
+        .collect();
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
+}
+
+fn parse_count_map(value: Option<&Value>) -> std::collections::BTreeMap<String, u64> {
+    value
+        .and_then(|v| v.as_object())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|(key, value)| value.as_u64().map(|count| (key.clone(), count)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_error_diagnostics(value: Option<&Value>) -> ErrorDiagnostics {
+    let Some(value) = value else {
+        return ErrorDiagnostics::default();
+    };
+    ErrorDiagnostics {
+        errors: value.get("errors").and_then(|v| v.as_u64()).unwrap_or(0),
+        terminal_reasons: parse_count_map(value.get("terminal_reasons")),
+        error_kinds: parse_count_map(value.get("error_kinds")),
+    }
+}
+
+fn parse_observability_summary(value: Option<&Value>) -> ObservabilitySummary {
+    let Some(value) = value else {
+        return ObservabilitySummary::default();
+    };
+    ObservabilitySummary {
+        requests: value.get("requests").and_then(|v| v.as_u64()).unwrap_or(0),
+        errors: value.get("errors").and_then(|v| v.as_u64()).unwrap_or(0),
+        avg_total_latency_ms: value
+            .get("avg_total_latency_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        avg_upstream_connect_ms: value
+            .get("avg_upstream_connect_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        max_event_gap_ms: value
+            .get("max_event_gap_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        idle_gap_count: value
+            .get("idle_gap_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        prompt_too_long_retries: value
+            .get("prompt_too_long_retries")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        continuation_saved_bytes: value
+            .get("continuation_saved_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        responses_lite_requests: value
+            .get("responses_lite_requests")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        websocket_requests: value
+            .get("websocket_requests")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        continuation_used_requests: value
+            .get("continuation_used_requests")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        virtual_context_requests: value
+            .get("virtual_context_requests")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        context_local_blocks: value
+            .get("context_local_blocks")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        context_upstream_overflows: value
+            .get("context_upstream_overflows")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+    }
+}
+
+fn parse_observability(value: Option<&Value>) -> ObservabilityMetrics {
+    let Some(value) = value else {
+        return ObservabilityMetrics::default();
+    };
+    ObservabilityMetrics {
+        summary: parse_observability_summary(value.get("summary")),
+        stored_summary: value
+            .get("stored")
+            .and_then(|stored| stored.get("summary"))
+            .map(|summary| parse_observability_summary(Some(summary))),
+    }
+}
+
+/// Poll for completed metrics fetch results (called every tick).
+fn poll_metrics(app: &mut App) {
+    let data = if let Some(ref rx) = app.metrics_rx {
+        match rx.try_recv() {
+            Ok(data) => {
+                // Got result, clear the channel
+                Some(data)
+            }
+            Err(TryRecvError::Empty) => return, // still in-flight
+            Err(TryRecvError::Disconnected) => Some(None), // thread died
+        }
+    } else {
+        return;
+    };
+    app.metrics_rx = None;
+
+    let Some(Some(data)) = data else { return };
+
+    let mut live = LiveMetrics {
+        requests_total: data
+            .get("requests_total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        errors_total: data
+            .get("errors_total")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        avg_latency_ms: data
+            .get("avg_latency_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        models: parse_usage_metrics(data.get("models")),
+        providers: parse_usage_metrics(data.get("providers")),
+        initiators: parse_usage_metrics(data.get("initiators")),
+        model_capabilities: parse_model_capabilities(data.get("model_capabilities")),
+        provider_rate_limits: parse_provider_rate_limits(data.get("provider_rate_limits")),
+        diagnostics: parse_error_diagnostics(data.get("diagnostics")),
+        observability: parse_observability(data.get("observability")),
+        stored: None,
+    };
+
+    // Parse stored (all-time) metrics
+    if let Some(stored) = data.get("stored") {
+        let stored_metrics = StoredMetrics {
+            requests_total: stored
+                .get("requests_total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            errors_total: stored
+                .get("errors_total")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            avg_latency_ms: stored
+                .get("avg_latency_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            models: parse_usage_metrics(stored.get("models")),
+            providers: parse_usage_metrics(stored.get("providers")),
+            initiators: parse_usage_metrics(stored.get("initiators")),
+            diagnostics: parse_error_diagnostics(stored.get("diagnostics")),
+        };
+        live.stored = Some(stored_metrics);
+    }
+
+    app.live_metrics = Some(live);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aisub2api_config::settings::{
+        ChatGptModelCapabilityOverride, ModelAliasConfig, ModelConfig, ServerConfig,
+    };
+    use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time is after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("aisub2api-{name}-{}-{suffix}", std::process::id()))
+    }
+
+    #[test]
+    fn claude_code_env_sync_sets_proxy_and_model_keys() {
+        let mut settings = Settings {
+            model: ModelConfig {
+                default: ModelAliasConfig::new("copilot/claude-sonnet-4"),
+                reasoning: Some(ModelAliasConfig::new("copilot/deepseek-v4-flash")),
+                opus: Some(ModelAliasConfig::new("copilot/claude-opus-4")),
+                sonnet: Some(ModelAliasConfig::new("openai/gpt-5")),
+                haiku: Some(ModelAliasConfig::new("openai/gpt-5-mini")),
+            },
+            server: ServerConfig {
+                host: "0.0.0.0".to_string(),
+                port: 18082,
+                auth_token: "proxy-token".to_string(),
+                ..ServerConfig::default()
+            },
+            ..Settings::default()
+        };
+        settings.infer_provider_types();
+
+        let mut value = json!({
+            "theme": "dark",
+            "env": {
+                "KEEP_ME": "yes",
+                "ANTHROPIC_AUTH_TOKEN": "legacy-token",
+                "ANTHROPIC_SMALL_FAST_MODEL": "legacy"
+            }
+        });
+
+        apply_claude_code_env(&mut value, &settings);
+
+        let env = value["env"].as_object().expect("env object");
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:18082")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_API_KEY").and_then(|v| v.as_str()),
+            Some("proxy-token")
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_ATTRIBUTION_HEADER")
+                .and_then(|v| v.as_str()),
+            Some("0")
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+                .and_then(|v| v.as_str()),
+            Some("128000")
+        );
+        assert_eq!(
+            env.get("ENABLE_TOOL_SEARCH").and_then(|v| v.as_str()),
+            Some("true")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").and_then(|v| v.as_str()),
+            Some("copilot/claude-sonnet-4")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_REASONING_MODEL")
+                .and_then(|v| v.as_str()),
+            Some("copilot/deepseek-v4-flash")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_OPUS_MODEL")
+                .and_then(|v| v.as_str()),
+            Some("copilot/claude-opus-4")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_SONNET_MODEL")
+                .and_then(|v| v.as_str()),
+            Some("openai/gpt-5")
+        );
+        assert_eq!(
+            env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+                .and_then(|v| v.as_str()),
+            Some("openai/gpt-5-mini")
+        );
+        assert_eq!(env.get("KEEP_ME").and_then(|v| v.as_str()), Some("yes"));
+        assert!(!env.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!env.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
+        assert_eq!(value["theme"].as_str(), Some("dark"));
+    }
+
+    #[test]
+    fn openai_base_url_is_client_ready_for_wildcard_and_ipv6_hosts() {
+        let wildcard = Settings {
+            server: ServerConfig {
+                host: "0.0.0.0".to_string(),
+                port: 8082,
+                ..ServerConfig::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(openai_base_url(&wildcard), "http://127.0.0.1:8082/v1");
+
+        let ipv6 = Settings {
+            server: ServerConfig {
+                host: "::1".to_string(),
+                port: 8082,
+                ..ServerConfig::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(openai_base_url(&ipv6), "http://[::1]:8082/v1");
+    }
+
+    #[test]
+    fn claude_code_env_sync_projects_each_eligible_chatgpt_alias_to_one_million() {
+        let mut settings = Settings {
+            model: ModelConfig {
+                default: ModelAliasConfig::new("chatgpt/gpt-5.6-sol"),
+                reasoning: Some(ModelAliasConfig::new("chatgpt/gpt-5.6-terra")),
+                opus: Some(ModelAliasConfig::new("chatgpt/gpt-5.6-luna")),
+                sonnet: Some(ModelAliasConfig::new("chatgpt/custom-large")),
+                haiku: Some(ModelAliasConfig::new("chatgpt/custom-standard")),
+            },
+            ..Settings::default()
+        };
+        settings.providers.insert(
+            "chatgpt".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                base_url: ProviderType::ChatGPT.default_base_url().to_string(),
+                proxy: String::new(),
+                provider_type: Some(ProviderType::ChatGPT),
+                copilot: None,
+                chatgpt: Some(ChatGptProviderConfig {
+                    model_capabilities: [
+                        (
+                            "custom-large".to_string(),
+                            ChatGptModelCapabilityOverride {
+                                context_window: Some(272_000),
+                                ..Default::default()
+                            },
+                        ),
+                        (
+                            "custom-standard".to_string(),
+                            ChatGptModelCapabilityOverride {
+                                context_window: Some(200_000),
+                                ..Default::default()
+                            },
+                        ),
+                    ]
+                    .into(),
+                    ..Default::default()
+                }),
+                runtime: Default::default(),
+                reasoning_markers: Default::default(),
+            },
+        );
+        let mut value = json!({});
+
+        apply_claude_code_env(&mut value, &settings);
+
+        let env = value["env"].as_object().unwrap();
+        assert_eq!(env["ANTHROPIC_MODEL"], "chatgpt/gpt-5.6-sol[1m]");
+        assert_eq!(
+            env["ANTHROPIC_REASONING_MODEL"],
+            "chatgpt/gpt-5.6-terra[1m]"
+        );
+        assert_eq!(
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+            "chatgpt/gpt-5.6-luna[1m]"
+        );
+        assert_eq!(
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+            "chatgpt/custom-large[1m]"
+        );
+        assert_eq!(
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+            "chatgpt/custom-standard"
+        );
+
+        settings.providers.get_mut("chatgpt").unwrap().chatgpt = Some(ChatGptProviderConfig {
+            claude_code_context: ClaudeCodeContextMode::Standard,
+            ..ChatGptProviderConfig::default()
+        });
+        apply_claude_code_env(&mut value, &settings);
+        assert_eq!(value["env"]["ANTHROPIC_MODEL"], "chatgpt/gpt-5.6-sol");
+    }
+
+    #[test]
+    fn live_metrics_fetch_due_respects_interval() {
+        let now = Instant::now();
+
+        assert!(live_metrics_fetch_due(None, now));
+        assert!(!live_metrics_fetch_due(
+            Some(now - METRICS_FETCH_INTERVAL + Duration::from_millis(1)),
+            now
+        ));
+        assert!(live_metrics_fetch_due(
+            Some(now - METRICS_FETCH_INTERVAL),
+            now
+        ));
+    }
+
+    #[test]
+    fn claude_code_env_sync_removes_empty_optional_model_keys() {
+        let settings = Settings {
+            model: ModelConfig {
+                default: ModelAliasConfig::new("openai/gpt-5"),
+                reasoning: Some(ModelAliasConfig::new("   ")),
+                opus: None,
+                sonnet: Some(ModelAliasConfig::new("   ")),
+                haiku: None,
+            },
+            ..Settings::default()
+        };
+        let mut value = json!({
+            "env": {
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "old-opus",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "old-sonnet",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "old-haiku",
+                "ANTHROPIC_REASONING_MODEL": "old-reasoning",
+                "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000",
+                "ENABLE_TOOL_SEARCH": "false"
+            }
+        });
+
+        apply_claude_code_env(&mut value, &settings);
+
+        let env = value["env"].as_object().expect("env object");
+        assert_eq!(
+            env.get("ANTHROPIC_MODEL").and_then(|v| v.as_str()),
+            Some("openai/gpt-5")
+        );
+        assert_eq!(
+            env.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS")
+                .and_then(|v| v.as_str()),
+            Some("128000")
+        );
+        assert_eq!(
+            env.get("ENABLE_TOOL_SEARCH").and_then(|v| v.as_str()),
+            Some("false")
+        );
+        assert!(!env.contains_key("ANTHROPIC_REASONING_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_DEFAULT_SONNET_MODEL"));
+        assert!(!env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
+    }
+
+    #[test]
+    fn onboarding_skip_preserves_existing_user_config_fields() {
+        let dir = temp_path("onboarding-preserve");
+        let path = dir.join(".claude.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+  "mcpServers": { "existing": { "command": "echo" } },
+  "theme": "dark",
+  "hasCompletedOnboarding": false
+}"#,
+        )
+        .unwrap();
+
+        mark_claude_onboarding_complete_at(&path).unwrap();
+
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["hasCompletedOnboarding"], json!(true));
+        assert_eq!(value["theme"].as_str(), Some("dark"));
+        assert_eq!(
+            value["mcpServers"]["existing"]["command"].as_str(),
+            Some("echo")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn onboarding_skip_creates_user_config_when_missing() {
+        let dir = temp_path("onboarding-create");
+        let path = dir.join(".claude.json");
+
+        mark_claude_onboarding_complete_at(&path).unwrap();
+
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["hasCompletedOnboarding"], json!(true));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_user_config_sync_approves_proxy_api_key() {
+        let dir = temp_path("claude-api-key-approval");
+        let path = dir.join(".claude.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+  "customApiKeyResponses": {
+    "approved": ["existing-key"],
+    "rejected": ["proxy-token", "other-rejected"]
+  },
+  "theme": "dark"
+}"#,
+        )
+        .unwrap();
+
+        sync_claude_user_config_at(&path, "proxy-token", false).unwrap();
+
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["theme"].as_str(), Some("dark"));
+        assert_eq!(value.get("hasCompletedOnboarding"), None);
+        assert_eq!(
+            value["customApiKeyResponses"]["approved"],
+            json!(["existing-key", "proxy-token"])
+        );
+        assert_eq!(
+            value["customApiKeyResponses"]["rejected"],
+            json!(["other-rejected"])
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_user_config_sync_creates_api_key_responses() {
+        let dir = temp_path("claude-api-key-create");
+        let path = dir.join(".claude.json");
+
+        sync_claude_user_config_at(&path, "proxy-token", true).unwrap();
+
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["hasCompletedOnboarding"], json!(true));
+        assert_eq!(
+            value["customApiKeyResponses"]["approved"],
+            json!(["proxy-token"])
+        );
+        assert_eq!(value["customApiKeyResponses"]["rejected"], json!([]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn onboarding_skip_rejects_non_object_user_config() {
+        let dir = temp_path("onboarding-non-object");
+        let path = dir.join(".claude.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "[]").unwrap();
+
+        let err = mark_claude_onboarding_complete_at(&path).unwrap_err();
+
+        assert!(err.contains("root must be a JSON object"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_user_config_path_derives_from_config_dir() {
+        assert_eq!(
+            claude_user_config_path_for_dir(Path::new("/tmp/custom/.claude")).unwrap(),
+            PathBuf::from("/tmp/custom/.claude.json")
+        );
+        assert_eq!(
+            claude_user_config_path_for_dir(Path::new("/tmp/claude-config")).unwrap(),
+            PathBuf::from("/tmp/claude-config.json")
+        );
+    }
+
+    #[test]
+    fn onboarding_skip_triggers_on_model_page_or_changed_model() {
+        let dir = temp_path("onboarding-trigger");
+        let config_path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut model_page_app = App::new(Settings::default());
+        model_page_app.nav = NavItem::Model;
+        assert!(should_mark_claude_onboarding_complete_on_save(
+            &model_page_app,
+            &config_path
+        ));
+
+        let existing = Settings::default();
+        std::fs::write(&config_path, existing.to_toml()).unwrap();
+        let mut unchanged_app = App::new(existing.clone());
+        unchanged_app.nav = NavItem::Providers;
+        assert!(!should_mark_claude_onboarding_complete_on_save(
+            &unchanged_app,
+            &config_path
+        ));
+
+        let mut changed_app = App::new(existing);
+        changed_app.nav = NavItem::Providers;
+        changed_app.settings.model.default.name = "openai/gpt-5".to_string();
+        assert!(should_mark_claude_onboarding_complete_on_save(
+            &changed_app,
+            &config_path
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_metrics_contract_reads_new_usage_dimensions() {
+        let metrics = parse_usage_metrics(Some(&json!({
+            "chatgpt": {
+                "requests": 2,
+                "input_tokens": 100,
+                "output_tokens": 25,
+                "cache_creation_input_tokens": 10,
+                "cache_read_input_tokens": 20
+            },
+            "openai": {
+                "requests": 1,
+                "input_tokens": 3,
+                "output_tokens": 4
+            }
+        })));
+
+        assert_eq!(metrics[0].0, "chatgpt");
+        assert_eq!(metrics[0].1.requests, 2);
+        assert_eq!(metrics[0].1.cache_read_input_tokens, 20);
+        assert_eq!(metrics[0].1.total_tokens(), 155);
+        assert_eq!(metrics[1].0, "openai");
+        assert_eq!(metrics[1].1.total_tokens(), 7);
+    }
+
+    #[test]
+    fn parse_provider_rate_limits_reads_quota_snapshots() {
+        let limits = parse_provider_rate_limits(Some(&json!({
+            "chatgpt": [{
+                "provider_id": "chatgpt",
+                "feature": "codex",
+                "limit_name": null,
+                "primary": {
+                    "used_percent": 20.0,
+                    "window_minutes": 300,
+                    "reset_at_unix_secs": 1800000000
+                },
+                "secondary": {
+                    "used_percent": 60.0,
+                    "window_minutes": 10080,
+                    "reset_at_unix_secs": null
+                },
+                "credits": {
+                    "has_credits": true,
+                    "unlimited": false,
+                    "balance": 5
+                },
+                "plan_type": "plus",
+                "rate_limit_reached_type": null,
+                "source": "usage_endpoint",
+                "updated_at_unix_secs": 123
+            }]
+        })));
+
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].0, "chatgpt");
+        assert_eq!(limits[0].1[0].feature.as_deref(), Some("codex"));
+        assert_eq!(limits[0].1[0].primary.as_ref().unwrap().used_percent, 20.0);
+        assert_eq!(
+            limits[0].1[0].credits.as_ref().unwrap().balance.as_deref(),
+            Some("5")
+        );
+    }
+
+    #[test]
+    fn parse_metrics_contract_reads_error_diagnostics_and_observability() {
+        let diagnostics = parse_error_diagnostics(Some(&json!({
+            "errors": 3,
+            "terminal_reasons": {
+                "provider_error": 2,
+                "stream_error": 1
+            },
+            "error_kinds": {
+                "rate_limited": 2,
+                "stream": 1
+            }
+        })));
+        let observability = parse_observability(Some(&json!({
+            "summary": {
+                "requests": 10,
+                "errors": 1,
+                "avg_total_latency_ms": 1234,
+                "avg_upstream_connect_ms": 456,
+                "max_event_gap_ms": 789,
+                "idle_gap_count": 2,
+                "prompt_too_long_retries": 1,
+                "continuation_saved_bytes": 1536,
+                "responses_lite_requests": 7,
+                "websocket_requests": 6,
+                "continuation_used_requests": 5,
+                "virtual_context_requests": 4,
+                "context_local_blocks": 3,
+                "context_upstream_overflows": 2
+            },
+            "stored": {
+                "summary": {
+                    "requests": 100,
+                    "errors": 4,
+                    "avg_total_latency_ms": 2345,
+                    "avg_upstream_connect_ms": 567,
+                    "max_event_gap_ms": 890,
+                    "idle_gap_count": 3,
+                    "prompt_too_long_retries": 2,
+                    "continuation_saved_bytes": 4096,
+                    "responses_lite_requests": 70,
+                    "websocket_requests": 60,
+                    "continuation_used_requests": 50,
+                    "virtual_context_requests": 40,
+                    "context_local_blocks": 30,
+                    "context_upstream_overflows": 20
+                }
+            }
+        })));
+
+        assert_eq!(diagnostics.errors, 3);
+        assert_eq!(diagnostics.terminal_reasons["provider_error"], 2);
+        assert_eq!(diagnostics.error_kinds["rate_limited"], 2);
+        assert_eq!(observability.summary.avg_total_latency_ms, 1234);
+        assert_eq!(observability.summary.avg_upstream_connect_ms, 456);
+        assert_eq!(observability.summary.max_event_gap_ms, 789);
+        assert_eq!(observability.summary.idle_gap_count, 2);
+        assert_eq!(observability.summary.prompt_too_long_retries, 1);
+        assert_eq!(observability.summary.continuation_saved_bytes, 1536);
+        assert_eq!(observability.summary.responses_lite_requests, 7);
+        assert_eq!(observability.summary.websocket_requests, 6);
+        assert_eq!(observability.summary.continuation_used_requests, 5);
+        assert_eq!(observability.summary.virtual_context_requests, 4);
+        assert_eq!(observability.summary.context_local_blocks, 3);
+        assert_eq!(observability.summary.context_upstream_overflows, 2);
+        let stored = observability.stored_summary.expect("stored summary");
+        assert_eq!(stored.requests, 100);
+        assert_eq!(stored.avg_total_latency_ms, 2345);
+        assert_eq!(stored.continuation_saved_bytes, 4096);
+        assert_eq!(stored.responses_lite_requests, 70);
+        assert_eq!(stored.websocket_requests, 60);
+        assert_eq!(stored.continuation_used_requests, 50);
+        assert_eq!(stored.virtual_context_requests, 40);
+        assert_eq!(stored.context_local_blocks, 30);
+        assert_eq!(stored.context_upstream_overflows, 20);
+    }
+
+    #[test]
+    fn parse_metrics_contract_defaults_new_observability_fields_to_zero() {
+        let observability = parse_observability(Some(&json!({
+            "summary": {
+                "requests": 1
+            },
+            "stored": {
+                "summary": {
+                    "requests": 2
+                }
+            }
+        })));
+
+        assert_eq!(observability.summary.continuation_saved_bytes, 0);
+        assert_eq!(observability.summary.responses_lite_requests, 0);
+        assert_eq!(observability.summary.websocket_requests, 0);
+        assert_eq!(observability.summary.continuation_used_requests, 0);
+        assert_eq!(observability.summary.virtual_context_requests, 0);
+        assert_eq!(observability.summary.context_local_blocks, 0);
+        assert_eq!(observability.summary.context_upstream_overflows, 0);
+        let stored = observability.stored_summary.expect("stored summary");
+        assert_eq!(stored.continuation_saved_bytes, 0);
+        assert_eq!(stored.responses_lite_requests, 0);
+        assert_eq!(stored.websocket_requests, 0);
+        assert_eq!(stored.continuation_used_requests, 0);
+        assert_eq!(stored.virtual_context_requests, 0);
+        assert_eq!(stored.context_local_blocks, 0);
+        assert_eq!(stored.context_upstream_overflows, 0);
+    }
+
+    #[test]
+    fn parse_model_capabilities_reads_canonical_fields() {
+        let capabilities = parse_model_capabilities(Some(&json!({
+            "chatgpt/gpt-5.5": {
+                "provider": "chatgpt",
+                "vendor": "openai",
+                "capabilities": {
+                    "endpoints": {
+                        "anthropic_messages": "unsupported",
+                        "openai_chat_completions": "unsupported",
+                        "openai_responses": "supported"
+                    },
+                    "modalities": {
+                        "input": {"text": "supported", "image": "supported"},
+                        "output": {"text": "supported"}
+                    },
+                    "features": {
+                        "streaming": "supported",
+                        "tools": "supported",
+                        "thinking": "supported",
+                        "adaptive_thinking": "unsupported",
+                        "prompt_cache": "unknown"
+                    },
+                    "limits": {
+                        "max_output_tokens": 128000,
+                        "context_window": 400000,
+                        "reasoning_effort_levels": ["low", "high"]
+                    },
+                    "quality": {
+                        "tool_search": {
+                            "state": "supported",
+                            "header_kind": "anthropic_1p",
+                            "beta_location": "header"
+                        },
+                        "prompt_cache": {
+                            "state": "supported",
+                            "scope": "basic"
+                        },
+                        "structured_outputs": "supported",
+                        "fast_mode": "supported",
+                        "token_counting": {"mode": "rough"}
+                    },
+                    "supported_parameters": ["messages", "tools", "thinking"]
+                }
+            }
+        })));
+
+        assert_eq!(capabilities[0].0, "chatgpt/gpt-5.5");
+        assert_eq!(capabilities[0].1.provider, "chatgpt");
+        assert_eq!(capabilities[0].1.vendor.as_deref(), Some("openai"));
+        assert_eq!(capabilities[0].1.max_output_tokens, Some(128000));
+        assert_eq!(capabilities[0].1.context_window, Some(400000));
+        assert_eq!(capabilities[0].1.supported_endpoints[0], "/responses");
+        assert!(capabilities[0].1.streaming);
+        assert!(capabilities[0].1.tools);
+        assert!(capabilities[0].1.thinking);
+        assert!(capabilities[0].1.vision);
+        assert!(!capabilities[0].1.adaptive_thinking);
+        assert!(capabilities[0].1.prompt_cache);
+        assert_eq!(
+            capabilities[0].1.prompt_cache_scope.as_deref(),
+            Some("basic")
+        );
+        assert!(capabilities[0].1.tool_search);
+        assert!(capabilities[0].1.structured_outputs);
+        assert!(capabilities[0].1.fast_mode);
+        assert_eq!(
+            capabilities[0].1.token_counting_mode.as_deref(),
+            Some("rough")
+        );
+        assert_eq!(capabilities[0].1.reasoning_effort_levels[1], "high");
+        assert_eq!(capabilities[0].1.supported_parameters[1], "tools");
+    }
+
+    #[test]
+    fn model_reasoning_effort_picker_parses_new_effort_levels() {
+        assert_eq!(
+            parse_model_reasoning_effort("minimal"),
+            Some(ModelReasoningEffort::Minimal)
+        );
+        assert_eq!(
+            parse_model_reasoning_effort("max"),
+            Some(ModelReasoningEffort::Max)
+        );
+        assert_eq!(
+            parse_model_reasoning_effort("ultra"),
+            Some(ModelReasoningEffort::Ultra)
+        );
+    }
+
+    fn app_with_chatgpt_default(model_id: &str) -> App {
+        let mut settings = Settings::default();
+        settings.providers.clear();
+        settings.providers.insert(
+            "chatgpt".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                base_url: ProviderType::ChatGPT.default_base_url().to_string(),
+                proxy: String::new(),
+                provider_type: Some(ProviderType::ChatGPT),
+                copilot: None,
+                chatgpt: Some(ChatGptProviderConfig::default()),
+                runtime: Default::default(),
+                reasoning_markers: Default::default(),
+            },
+        );
+        settings.model.default = ModelAliasConfig::new(format!("chatgpt/{model_id}"));
+        App::new(settings)
+    }
+
+    #[test]
+    fn reasoning_effort_picker_filters_chatgpt_56_by_model() {
+        let mut app = app_with_chatgpt_default("gpt-5.6-luna");
+        app.settings.model.default.reasoning_effort = Some(ModelReasoningEffort::Minimal);
+
+        let luna =
+            reasoning_effort_picker_items(&app, &EditableSection::ModelDefaultReasoningEffort);
+        assert_eq!(luna, vec!["", "low", "medium", "high", "xhigh", "max"]);
+        assert!(!luna.contains(&"none".to_string()));
+        assert!(!luna.contains(&"minimal".to_string()));
+        assert!(!luna.contains(&"ultra".to_string()));
+
+        app.settings.model.default.name = "chatgpt/gpt-5.6-sol".to_string();
+        let sol =
+            reasoning_effort_picker_items(&app, &EditableSection::ModelDefaultReasoningEffort);
+        assert_eq!(sol.last().map(String::as_str), Some("ultra"));
+        assert!(!sol.contains(&"none".to_string()));
+        assert!(!sol.contains(&"minimal".to_string()));
+    }
+
+    #[test]
+    fn reasoning_effort_picker_prefers_config_then_live_capabilities() {
+        let mut app = app_with_chatgpt_default("gpt-5.6-luna");
+        app.live_metrics = Some(LiveMetrics {
+            model_capabilities: vec![(
+                "chatgpt/gpt-5.6-luna".to_string(),
+                ModelCapability {
+                    reasoning_effort_levels: vec!["medium".to_string(), "high".to_string()],
+                    ..Default::default()
+                },
+            )],
+            ..Default::default()
+        });
+
+        let live =
+            reasoning_effort_picker_items(&app, &EditableSection::ModelDefaultReasoningEffort);
+        assert_eq!(live, vec!["", "medium", "high"]);
+
+        app.settings
+            .providers
+            .get_mut("chatgpt")
+            .and_then(|provider| provider.chatgpt.as_mut())
+            .unwrap()
+            .model_capabilities
+            .insert(
+                "gpt-5.6-luna".to_string(),
+                aisub2api_config::settings::ChatGptModelCapabilityOverride {
+                    reasoning_effort_levels: Some(vec!["low".to_string(), "high".to_string()]),
+                    ..Default::default()
+                },
+            );
+        let configured =
+            reasoning_effort_picker_items(&app, &EditableSection::ModelDefaultReasoningEffort);
+        assert_eq!(configured, vec!["", "low", "high"]);
+    }
+
+    #[test]
+    fn reasoning_effort_picker_uses_cached_capabilities_for_any_provider() {
+        let mut app = App::new(Settings::default());
+        app.settings.model.default.name = "copilot/model-x".to_string();
+        app.model_reasoning_efforts.insert(
+            "copilot/model-x".to_string(),
+            vec!["medium".to_string(), "high".to_string()],
+        );
+
+        let supported =
+            reasoning_effort_picker_items(&app, &EditableSection::ModelDefaultReasoningEffort);
+        assert_eq!(supported, vec!["", "medium", "high"]);
+
+        app.model_reasoning_efforts
+            .insert("copilot/model-x".to_string(), Vec::new());
+        let unsupported =
+            reasoning_effort_picker_items(&app, &EditableSection::ModelDefaultReasoningEffort);
+        assert_eq!(unsupported, vec![""]);
+    }
+
+    #[test]
+    fn fetched_model_catalog_populates_generic_reasoning_capabilities() {
+        let mut app = App::new(Settings::default());
+        app.settings.model.default.name = "copilot/model-x".to_string();
+        app.pending_reasoning_section = Some(EditableSection::ModelDefaultReasoningEffort);
+
+        let mut model = ModelInfo {
+            model_id: "model-x".to_string(),
+            vendor: None,
+            is_chat_default: None,
+            capabilities: Default::default(),
+        };
+        model.capabilities.limits.reasoning_effort_levels =
+            vec!["low".to_string(), "medium".to_string()];
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(FetchResult {
+            provider_id: "copilot".to_string(),
+            models: Ok(vec![model]),
+        })
+        .unwrap();
+        app.fetch_rx = Some(rx);
+
+        poll_fetch(&mut app);
+
+        assert!(app.model_capabilities_loaded.contains("copilot"));
+        assert_eq!(
+            app.model_reasoning_efforts.get("copilot/model-x"),
+            Some(&vec!["low".to_string(), "medium".to_string()])
+        );
+        let Overlay::Picker(picker) = app.overlay.as_ref().expect("reasoning picker") else {
+            panic!("expected reasoning picker");
+        };
+        assert_eq!(picker.items, vec!["", "low", "medium"]);
+    }
+
+    #[test]
+    fn ctrl_s_applies_pending_model_input_before_save() {
+        let mut app = App::new(Settings::default());
+        app.overlay = Some(Overlay::Input(
+            InputOverlay::new(
+                "Default Model",
+                "Model",
+                InputAction::EditSetting {
+                    section: EditableSection::ModelDefault,
+                },
+            )
+            .with_value("openai/gpt-5"),
+        ));
+        app.focus = Focus::Overlay;
+
+        assert!(apply_pending_input(&mut app));
+
+        assert_eq!(app.settings.model.default.name, "openai/gpt-5");
+        assert!(app.overlay.is_none());
+        assert_eq!(app.focus, Focus::Content);
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn custom_provider_add_generates_unique_ids() {
+        let mut settings = Settings::default();
+        settings.providers.clear();
+        let mut app = App::new(settings);
+
+        add_provider(&mut app);
+        if let Some(Overlay::Picker(picker)) = app.overlay.as_mut() {
+            assert!(
+                picker
+                    .items
+                    .contains(&"Custom — choose compatibility after adding".to_string())
+            );
+            assert!(!picker.items.iter().any(|item| item.starts_with("Custom (")));
+            picker.selected = picker
+                .items
+                .iter()
+                .position(|item| item.starts_with("Custom"))
+                .expect("custom provider option");
+        }
+        handle_overlay_key(
+            &mut app,
+            event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        add_provider(&mut app);
+        if let Some(Overlay::Picker(picker)) = app.overlay.as_mut() {
+            picker.selected = picker
+                .items
+                .iter()
+                .position(|item| item.starts_with("Custom"))
+                .expect("custom provider option");
+        }
+        handle_overlay_key(
+            &mut app,
+            event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(matches!(
+            app.settings
+                .providers
+                .get("custom")
+                .and_then(|cfg| cfg.provider_type.as_ref()),
+            Some(ProviderType::Custom(id)) if id == "custom"
+        ));
+        assert!(matches!(
+            app.settings
+                .providers
+                .get("custom-2")
+                .and_then(|cfg| cfg.provider_type.as_ref()),
+            Some(ProviderType::Custom(id)) if id == "custom-2"
+        ));
+    }
+
+    #[test]
+    fn chatgpt_provider_add_includes_default_chatgpt_config() {
+        let mut settings = Settings::default();
+        settings.providers.clear();
+        let mut app = App::new(settings);
+
+        add_provider(&mut app);
+        if let Some(Overlay::Picker(picker)) = app.overlay.as_mut() {
+            picker.selected = picker
+                .items
+                .iter()
+                .position(|item| item.starts_with("ChatGPT"))
+                .expect("chatgpt provider option");
+        }
+        handle_overlay_key(
+            &mut app,
+            event::KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        let chatgpt = app
+            .settings
+            .providers
+            .get("chatgpt")
+            .and_then(|cfg| cfg.chatgpt.as_ref())
+            .expect("chatgpt config");
+        assert!(!chatgpt.fast_mode);
+        assert_eq!(app.settings.model.default.name, "chatgpt/gpt-5.6-sol");
+        assert_eq!(
+            app.settings.model.default.reasoning_effort,
+            Some(ModelReasoningEffort::High)
+        );
+        assert_eq!(
+            app.settings.model.sonnet_name(),
+            Some("chatgpt/gpt-5.6-terra")
+        );
+        assert_eq!(
+            app.settings.model.haiku_name(),
+            Some("chatgpt/gpt-5.6-luna")
+        );
+    }
+
+    #[test]
+    fn chatgpt_provider_fast_mode_toggles_from_detail_row() {
+        let mut settings = Settings::default();
+        settings.providers.clear();
+        settings.providers.insert(
+            "chatgpt".into(),
+            ProviderConfig {
+                api_key: String::new(),
+                base_url: ProviderType::ChatGPT.default_base_url().to_string(),
+                proxy: String::new(),
+                provider_type: Some(ProviderType::ChatGPT),
+                copilot: None,
+                chatgpt: None,
+                runtime: Default::default(),
+                reasoning_markers: Default::default(),
+            },
+        );
+        let mut app = App::new(settings);
+        app.nav = NavItem::Providers;
+        app.focus = Focus::Content;
+        app.provider_focus = ProviderFocus::Detail;
+        app.detail_idx = 5;
+
+        assert_eq!(app.provider_detail_field_count(), 7);
+
+        handle_providers_key(&mut app, KeyCode::Char(' '));
+        assert!(
+            app.settings
+                .providers
+                .get("chatgpt")
+                .and_then(|cfg| cfg.chatgpt.as_ref())
+                .is_some_and(|cfg| cfg.fast_mode)
+        );
+        assert!(app.dirty);
+
+        handle_providers_key(&mut app, KeyCode::Enter);
+        assert!(
+            !app.settings
+                .providers
+                .get("chatgpt")
+                .and_then(|cfg| cfg.chatgpt.as_ref())
+                .is_some_and(|cfg| cfg.fast_mode)
+        );
+    }
+
+    #[test]
+    fn chatgpt_provider_context_projection_toggles_from_detail_row() {
+        let mut settings = Settings::default();
+        settings.providers.clear();
+        settings.providers.insert(
+            "chatgpt".into(),
+            ProviderConfig {
+                api_key: String::new(),
+                base_url: ProviderType::ChatGPT.default_base_url().to_string(),
+                proxy: String::new(),
+                provider_type: Some(ProviderType::ChatGPT),
+                copilot: None,
+                chatgpt: None,
+                runtime: Default::default(),
+                reasoning_markers: Default::default(),
+            },
+        );
+        let mut app = App::new(settings);
+        app.nav = NavItem::Providers;
+        app.focus = Focus::Content;
+        app.provider_focus = ProviderFocus::Detail;
+        app.detail_idx = 6;
+
+        handle_providers_key(&mut app, KeyCode::Char(' '));
+        assert_eq!(
+            app.settings.providers["chatgpt"]
+                .chatgpt
+                .as_ref()
+                .unwrap()
+                .claude_code_context,
+            ClaudeCodeContextMode::Standard
+        );
+
+        handle_providers_key(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.settings.providers["chatgpt"]
+                .chatgpt
+                .as_ref()
+                .unwrap()
+                .claude_code_context,
+            ClaudeCodeContextMode::Auto
+        );
+    }
+
+    #[test]
+    fn custom_provider_compatibility_and_rename_update_config_and_models() {
+        let mut settings = Settings::default();
+        settings.providers.clear();
+        settings.providers.insert(
+            "custom".into(),
+            ProviderConfig {
+                api_key: "sk-test".into(),
+                base_url: "https://api.deepseek.com/v1".into(),
+                proxy: String::new(),
+                provider_type: Some(ProviderType::Custom("custom".into())),
+                copilot: None,
+                chatgpt: None,
+                runtime: Default::default(),
+                reasoning_markers: Default::default(),
+            },
+        );
+        settings.model.default = ModelAliasConfig::new("custom/deepseek-chat");
+        settings.model.reasoning = Some(ModelAliasConfig::new("custom/deepseek-reasoner"));
+        let mut app = App::new(settings);
+
+        assert!(set_provider_compatibility(
+            &mut app,
+            "custom",
+            "Anthropic-compatible"
+        ));
+        assert!(rename_provider(&mut app, "custom", "deepseek"));
+
+        assert!(!app.settings.providers.contains_key("custom"));
+        assert!(matches!(
+            app.settings
+                .providers
+                .get("deepseek")
+                .and_then(|cfg| cfg.provider_type.as_ref()),
+            Some(ProviderType::CustomAnthropic(id)) if id == "deepseek"
+        ));
+        assert_eq!(app.settings.model.default.name, "deepseek/deepseek-chat");
+        assert_eq!(
+            app.settings.model.reasoning.as_ref().unwrap().name,
+            "deepseek/deepseek-reasoner"
+        );
+    }
+
+    #[test]
+    fn model_picker_always_allows_manual_entry() {
+        let items = model_picker_items(vec!["claude-sonnet-4-20250514".into()]);
+        assert_eq!(items.last().map(String::as_str), Some(CUSTOM_MODEL_ITEM));
+
+        let existing = model_picker_items(vec![CUSTOM_MODEL_ITEM.into()]);
+        assert_eq!(
+            existing
+                .iter()
+                .filter(|item| item.as_str() == CUSTOM_MODEL_ITEM)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn provider_model_ref_preserves_provider_prefix_only() {
+        assert_eq!(
+            provider_model_ref("deepseek", "deepseek/deepseek-chat"),
+            "deepseek/deepseek-chat"
+        );
+        assert_eq!(
+            provider_model_ref("openrouter", "anthropic/claude-3.5-sonnet"),
+            "openrouter/anthropic/claude-3.5-sonnet"
+        );
+    }
+
+    #[test]
+    fn provider_probe_model_prefers_configured_provider_alias() {
+        let mut settings = Settings::default();
+        settings.providers.clear();
+        settings.providers.insert(
+            "custom".into(),
+            ProviderConfig {
+                api_key: "sk-test".into(),
+                base_url: "https://example.com".into(),
+                proxy: String::new(),
+                provider_type: Some(ProviderType::CustomAnthropic("custom".into())),
+                copilot: None,
+                chatgpt: None,
+                runtime: Default::default(),
+                reasoning_markers: Default::default(),
+            },
+        );
+        settings.model.default = ModelAliasConfig::new("openai/gpt-4.1");
+        settings.model.sonnet = Some(ModelAliasConfig::new("custom/claude-custom"));
+
+        assert_eq!(
+            provider_probe_model(&settings, "custom").as_deref(),
+            Some("claude-custom")
+        );
+    }
+
+    #[test]
+    fn paste_shortcuts_are_recognized() {
+        assert!(is_paste_shortcut(event::KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_paste_shortcut(event::KeyEvent::new(
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_paste_shortcut(event::KeyEvent::new(
+            KeyCode::Insert,
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_paste_shortcut(event::KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
+    #[test]
+    fn right_click_paste_is_recognized() {
+        assert!(is_right_click_paste(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(!is_right_click_paste(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }));
+    }
+
+    #[test]
+    fn paste_inserts_into_input_overlay_at_cursor() {
+        let mut app = App::new(Settings::default());
+        app.overlay = Some(Overlay::Input(
+            InputOverlay::new(
+                "API Key",
+                "API Key",
+                InputAction::EditProviderField {
+                    provider_id: "anthropic".into(),
+                    field: ProviderField::ApiKey,
+                    field_index: 0,
+                },
+            )
+            .with_value("sk--suffix"),
+        ));
+
+        if let Some(Overlay::Input(input)) = app.overlay.as_mut() {
+            input.cursor = 3;
+        }
+        handle_paste(&mut app, "pasted\r\n");
+
+        let Some(Overlay::Input(input)) = app.overlay else {
+            panic!("expected input overlay");
+        };
+        assert_eq!(input.value, "sk-pasted-suffix");
+        assert_eq!(input.cursor, "sk-pasted".len());
+    }
+
+    #[test]
+    fn pending_input_failure_keeps_settings_unsaved() {
+        let mut app = App::new(Settings::default());
+        let original_port = app.settings.server.port;
+        app.overlay = Some(Overlay::Input(
+            InputOverlay::new(
+                "Port",
+                "Port",
+                InputAction::EditSetting {
+                    section: EditableSection::ServerPort,
+                },
+            )
+            .with_value("not-a-port"),
+        ));
+
+        assert!(!apply_pending_input(&mut app));
+
+        assert_eq!(app.settings.server.port, original_port);
+        assert!(!app.dirty);
+    }
+}

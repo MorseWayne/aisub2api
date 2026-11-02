@@ -2,13 +2,13 @@
 
 Date: 2026-05-28
 Status: Research notes for provider design
-Scope: `claude-proxy` provider compatibility and Claude Code parity
+Scope: `aisub2api` provider compatibility and Claude Code parity
 
 ## Goal
 
 When adding or modernizing a third-party API provider, avoid the trap where the provider can answer requests but silently misses Claude Code optimizations that affect conversation quality, latency, token cost, long-session stability, and tool-use reliability.
 
-These notes summarize provider-specific gates observed in Claude Code. They are intended as a design checklist for `claude-proxy` provider work, especially OpenAI/ChatGPT/Codex-style providers that proxy Anthropic Messages API traffic.
+These notes summarize provider-specific gates observed in Claude Code. They are intended as a design checklist for `aisub2api` provider work, especially OpenAI/ChatGPT/Codex-style providers that proxy Anthropic Messages API traffic.
 
 ## Provider classification model
 
@@ -19,7 +19,7 @@ Claude Code makes two related but distinct decisions:
 
 A custom gateway using the Anthropic SDK path may still be `firstParty`, but many official-source optimizations are disabled when `isFirstPartyAnthropicBaseUrl()` is false.
 
-For `claude-proxy`, provider work should avoid a single binary `is_third_party` decision. Prefer explicit capability flags per upstream.
+For `aisub2api`, provider work should avoid a single binary `is_third_party` decision. Prefer explicit capability flags per upstream.
 
 ## High-priority gates that affect quality or efficiency
 
@@ -44,7 +44,7 @@ Provider requirements:
 - Accepts the correct beta/header/body placement for the upstream.
 - Preserves discovered tool references across turns and compact boundaries.
 
-`claude-proxy` design implication:
+`aisub2api` design implication:
 
 - Add a provider capability like `tool_search = { supported, header_kind, beta_location }` rather than assuming all non-official providers are unsafe.
 
@@ -65,7 +65,7 @@ Provider requirements:
 - Upstream accepts the per-tool `eager_input_streaming` field.
 - Upstream streams partial tool input JSON safely.
 
-`claude-proxy` design implication:
+`aisub2api` design implication:
 
 - Treat this as an explicit provider capability. If supported, forward or synthesize the Anthropic-compatible field; otherwise omit it deliberately.
 
@@ -88,7 +88,7 @@ Provider requirements:
 - Supports `prompt-caching-scope` semantics if global cache is desired.
 - Has stable cache-key isolation so one user/session cannot poison another.
 
-`claude-proxy` design implication:
+`aisub2api` design implication:
 
 - Separate `prompt_cache = basic` from `prompt_cache_scope = global`.
 - Do not use provider-instance-global cache keys. Prefer explicit client conversation/session keys, or no reusable key.
@@ -112,7 +112,7 @@ Provider requirements:
 - Supports required beta/header shape.
 - Has equivalent behavior for thinking preservation and tool-result clearing.
 
-`claude-proxy` design implication:
+`aisub2api` design implication:
 
 - Capability should distinguish `thinking_preservation` from `tool_result_clearing`.
 
@@ -136,7 +136,7 @@ Provider requirements:
   - `adaptive_thinking`
   - `interleaved_thinking`
 
-`claude-proxy` design implication:
+`aisub2api` design implication:
 
 - Avoid inferring capabilities only from string contains checks such as `sonnet-4` or `opus-4`.
 - Add explicit model metadata or provider config overrides.
@@ -159,7 +159,7 @@ Provider requirements:
 - Per-model support for `effort` and `max_effort`.
 - Mapping from Claude Code effort levels to upstream-native reasoning controls when upstream is not Anthropic-compatible.
 
-`claude-proxy` design implication:
+`aisub2api` design implication:
 
 - Include effort support in `ModelInfo`, not only in provider-level config.
 
@@ -181,7 +181,7 @@ Provider requirements:
 - Supports Anthropic `output_config.format` or an equivalent that can be converted safely.
 - Supports strict tool schemas without rejecting the request.
 
-`claude-proxy` design implication:
+`aisub2api` design implication:
 
 - Model metadata should say whether structured outputs and strict tools are supported independently.
 
@@ -202,7 +202,7 @@ Provider requirements:
 
 - Supports the token-efficient tool-use beta/header or an equivalent upstream format.
 
-`claude-proxy` design implication:
+`aisub2api` design implication:
 
 - Keep this opt-in per provider/model until proven compatible.
 
@@ -223,7 +223,7 @@ Provider requirements:
 - Upstream supports an equivalent service tier or speed mode.
 - Clear fallback behavior when upstream rejects the option.
 
-`claude-proxy` design implication:
+`aisub2api` design implication:
 
 - If mapping to OpenAI service tier or Codex priority tier, expose it as provider-specific capability instead of pretending it is Anthropic fast mode.
 
@@ -246,7 +246,7 @@ Provider requirements:
 - Explicit model matrix with canonical display name, upstream model id, context window, reasoning support, output support, and fallback.
 - No blind reuse of Anthropic first-party aliases for third-party upstreams.
 
-`claude-proxy` design implication:
+`aisub2api` design implication:
 
 - Keep provider-specific `ModelInfo` complete and conservative by default.
 
@@ -264,7 +264,7 @@ Observed Claude Code behavior:
 - Vertex filters unsupported beta headers for token counting.
 - Failure falls back to rough estimates, which can undercount or overcount.
 
-`claude-proxy` design implication:
+`aisub2api` design implication:
 
 - Implement token counting per provider where possible.
 - If only rough estimates are available, bias toward safety for large tool results and compaction thresholds.
@@ -280,7 +280,7 @@ Observed Claude Code behavior:
 - Some first-party experiments cap default output then retry with a larger cap when needed.
 - Third-party default is disabled because it was not validated on Bedrock/Vertex.
 
-`claude-proxy` design implication:
+`aisub2api` design implication:
 
 - Do not assume Anthropic first-party max-token heuristics apply to every provider.
 - Make default max output and escalation behavior provider/model-specific.
@@ -295,7 +295,7 @@ Observed Claude Code behavior:
 
 - Model capability fetching is limited to Anthropic-internal first-party official base URL paths.
 
-`claude-proxy` design implication:
+`aisub2api` design implication:
 
 - Prefer explicit static model metadata plus optional provider-native discovery.
 
@@ -309,7 +309,7 @@ These do not usually affect core model quality, but they change UX or orchestrat
 - Voice mode and Remote Control require Claude.ai OAuth/subscription and are not relevant to most third-party providers.
 - First-party analytics/bootstrap/settings-sync/policy endpoints are disabled for third-party providers.
 
-## Recommended `claude-proxy` provider capability shape
+## Recommended `aisub2api` provider capability shape
 
 Prefer explicit capability contracts over scattered provider-name checks:
 

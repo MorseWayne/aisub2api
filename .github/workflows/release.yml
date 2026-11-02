@@ -60,20 +60,20 @@ jobs:
         if: matrix.archive == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../claude-proxy-${{ matrix.target }}.tar.gz claude-proxy
+          tar czf ../../../aisub2api-${{ matrix.target }}.tar.gz aisub2api
           cd ../../..
 
       - name: Package (windows)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          Compress-Archive -Path target/${{ matrix.target }}/release/claude-proxy.exe -DestinationPath claude-proxy-${{ matrix.target }}.zip
+          Compress-Archive -Path target/${{ matrix.target }}/release/aisub2api.exe -DestinationPath aisub2api-${{ matrix.target }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: claude-proxy-${{ matrix.target }}
-          path: claude-proxy-${{ matrix.target }}.${{ matrix.archive }}
+          name: aisub2api-${{ matrix.target }}
+          path: aisub2api-${{ matrix.target }}.${{ matrix.archive }}
 
   release:
     name: Create Release

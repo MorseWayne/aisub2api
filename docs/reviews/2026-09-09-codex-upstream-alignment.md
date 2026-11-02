@@ -6,7 +6,7 @@
 
 | 项目 | 记录 |
 | --- | --- |
-| claude-proxy | `v4.0.2`，审阅起点为 `ce6ddef5f9a5b89daaf21ad53f4ff514dd2d92a9` |
+| aisub2api | `v4.0.2`，审阅起点为 `ce6ddef5f9a5b89daaf21ad53f4ff514dd2d92a9` |
 | 上次审阅 / Codex before_sha | `8e6a44b428e31f91b21edc97904fcdf4f0931ade` |
 | 本次获取并审阅的 origin/main | `0d46c252b3f29f10bacf0ef58a17a1aa5d17ead3` |
 | 精确审阅范围 | `8e6a44b428e31f91b21edc97904fcdf4f0931ade..0d46c252b3f29f10bacf0ef58a17a1aa5d17ead3` |
@@ -22,7 +22,7 @@
 ## 契约边界
 
 - **公开 OpenAI API**：支持普通响应和 SSE 流式响应；GPT-6 Astra 的模型页声明 Responses、Chat Completions 和推理能力。[流式指南](https://developers.openai.com/api/docs/guides/streaming-responses)、[GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra)。
-- **代理当前子集**：`/v1/responses` 仅接受 `stream=true`，强制 `store=false`，拒绝非空的 `previous_response_id` / `conversation`；只路由到 OpenAI、ChatGPT。GET WebSocket 探测返回 426。这是现有公开边界，不因本轮审阅扩大。依据：[入口校验](../../crates/claude-proxy-server/src/openai.rs)、[路由](../../crates/claude-proxy-server/src/routes.rs)。
+- **代理当前子集**：`/v1/responses` 仅接受 `stream=true`，强制 `store=false`，拒绝非空的 `previous_response_id` / `conversation`；只路由到 OpenAI、ChatGPT。GET WebSocket 探测返回 426。这是现有公开边界，不因本轮审阅扩大。依据：[入口校验](../../crates/aisub2api-server/src/openai.rs)、[路由](../../crates/aisub2api-server/src/routes.rs)。
 - **ChatGPT/Codex 后端**：字符串输入转为列表，去掉 `max_output_tokens`；Lite 模式强制 `reasoning.context=all_turns`、`parallel_tool_calls=false`。这些仍沿用 v4.0.1 的既有验证，本轮没有重新调用真实后端。公开参数限制不能用这些私有适配规则替代。
 
 ## 增量对齐矩阵
@@ -84,10 +84,10 @@ git diff --check
 
 主要代理证据：
 
-- [输入项校验](../../crates/claude-proxy-server/src/openai.rs)、[原生路由及 header 过滤](../../crates/claude-proxy-server/src/routes.rs)、[SSE 编码](../../crates/claude-proxy-server/src/downstream.rs)。
-- [共享 Responses 解码和后台任务](../../crates/claude-proxy-providers/src/responses.rs)、[上游超时](../../crates/claude-proxy-providers/src/http.rs)。
-- [OpenAI 能力与模型分支](../../crates/claude-proxy-providers/src/openai_compat.rs)、[OpenAI provider](../../crates/claude-proxy-providers/src/openai.rs)。
-- [ChatGPT 目录、请求规范化、HTTP client](../../crates/claude-proxy-providers/src/chatgpt.rs)、[持久化 context cache](../../crates/claude-proxy-providers/src/chatgpt/capability_cache.rs)、[服务端模型缓存](../../crates/claude-proxy-server/src/app.rs)。
-- [集成 fixture 与 Responses 断言](../../crates/claude-proxy-server/tests/integration.rs)。
+- [输入项校验](../../crates/aisub2api-server/src/openai.rs)、[原生路由及 header 过滤](../../crates/aisub2api-server/src/routes.rs)、[SSE 编码](../../crates/aisub2api-server/src/downstream.rs)。
+- [共享 Responses 解码和后台任务](../../crates/aisub2api-providers/src/responses.rs)、[上游超时](../../crates/aisub2api-providers/src/http.rs)。
+- [OpenAI 能力与模型分支](../../crates/aisub2api-providers/src/openai_compat.rs)、[OpenAI provider](../../crates/aisub2api-providers/src/openai.rs)。
+- [ChatGPT 目录、请求规范化、HTTP client](../../crates/aisub2api-providers/src/chatgpt.rs)、[持久化 context cache](../../crates/aisub2api-providers/src/chatgpt/capability_cache.rs)、[服务端模型缓存](../../crates/aisub2api-server/src/app.rs)。
+- [集成 fixture 与 Responses 断言](../../crates/aisub2api-server/tests/integration.rs)。
 
 本次已筛查全部提交标题和文件增量，深入审阅可能影响代理的 API、模型、请求构造、SSE、认证缓存和传输变化；TUI、沙箱、持久化、构建及本地工具执行变化按传输影响排除。Codex 审阅基线与上游工作区均为 `0d46c252b`；代理侧四项修改已实施，真实后端验证边界单独保留。

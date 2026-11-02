@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="720" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
-  <title id="title">claude-proxy TUI ChatGPT OAuth 设备码认证</title>
+  <title id="title">aisub2api TUI ChatGPT OAuth 设备码认证</title>
   <desc id="desc">终端 TUI 中 ChatGPT OAuth 设备码认证弹窗的示例截图。</desc>
   <defs>
     <style>
@@ -8,7 +8,7 @@
   </defs>
   <rect class="bg" width="1200" height="720"/>
   <rect class="panel" x="24" y="24" width="1152" height="60" rx="6"/>
-  <text class="mono title text" x="48" y="62">⬡ claude-proxy ●</text>
+  <text class="mono title text" x="48" y="62">⬡ aisub2api ●</text>
   <rect x="850" y="38" width="132" height="32" rx="5" fill="#1f2937"/>
   <text class="mono small text" x="869" y="61">1 providers</text>
   <rect x="996" y="38" width="152" height="32" rx="5" fill="#22d3ee"/>

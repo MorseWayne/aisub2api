@@ -5,7 +5,7 @@
 - Reviewed at: `2026-10-16` (`Asia/Shanghai`)
 - Previous reviewed commit: `0d46c252b3f29f10bacf0ef58a17a1aa5d17ead3`
 - Analyzed range: `0d46c252b3f29f10bacf0ef58a17a1aa5d17ead3..e790ce271749ce431e446a9e2cc66485fe60f931` (1,820 commits)
-- Reviewed for claude-proxy: `v4.0.3` (release date `2026-10-17`); review started from `c885f6d2063030ed6cbae033656615d756c634b9` (`v4.0.2`).
+- Reviewed for aisub2api: `v4.0.3` (release date `2026-10-17`); review started from `c885f6d2063030ed6cbae033656615d756c634b9` (`v4.0.2`).
 - Review scope: Responses HTTP/SSE/WebSocket requests and terminal states, incremental tools, numeric reasoning, image references and output replay, streamed compaction, retry advice, quota/Flex errors, ChatGPT model capabilities and explicit service tiers, shared routing cookies, auth ownership, model discovery, workspace routing, and exclusion of client-only runtime changes.
 - Review report: [2026-10-16 Codex upstream alignment](../../../../docs/reviews/2026-10-16-codex-upstream-alignment.md).
 

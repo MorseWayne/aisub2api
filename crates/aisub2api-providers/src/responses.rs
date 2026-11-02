@@ -1,0 +1,7074 @@
+use aisub2api_config::settings::ReasoningMarkerMode;
+use aisub2api_core::*;
+use futures::StreamExt;
+use futures::stream::BoxStream;
+use serde_json::{Value, json};
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+
+use crate::http::{fmt_reqwest_err, next_upstream_stream_item};
+use crate::openai_compat::{
+    default_adaptive_reasoning_effort, supports_reasoning_summary, supports_sampling_parameters,
+    thinking_budget_to_reasoning_effort,
+};
+use crate::provider::{
+    ProviderError, ProviderEvent, ProviderRequestObserver, ProviderRequestObserverEvent,
+    ProviderRequestObserverEventKind, ProviderStreamMetadata, ProviderUsageMetadata,
+};
+use crate::reasoning_markers::{ReasoningTextSplitter, TextSegment, split_text};
+use crate::sse::{SseDecoder, is_sse_done, parse_sse_json_value};
+use crate::tool_args::sanitize_tool_arguments;
+use crate::tool_choice::normalize_for_responses;
+
+mod correlation;
+mod errors;
+use errors::responses_error_event;
+mod signature;
+
+#[cfg(test)]
+use correlation::IDENTIFIER_MAX_BYTES as RESPONSES_IDENTIFIER_MAX_BYTES;
+pub use correlation::ResponsesCorrelation;
+use signature::is_gpt_signature;
+
+const RECENT_TOOL_OUTPUTS_TO_KEEP: usize = 12;
+const MAX_HISTORICAL_TOOL_OUTPUT_BYTES: usize = 4096;
+const MAX_CURRENT_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
+const RECENT_TEXT_ITEMS_TO_KEEP: usize = 12;
+const MAX_HISTORICAL_TEXT_BYTES: usize = 32 * 1024;
+const SMALL_HISTORY_PAYLOAD_BUDGET_BYTES: usize = 256 * 1024;
+const DEFAULT_HISTORY_PAYLOAD_BUDGET_BYTES: usize = 512 * 1024;
+const LARGE_HISTORY_PAYLOAD_BUDGET_BYTES: usize = 1024 * 1024;
+const MAX_MALFORMED_STREAM_PREVIEW_BYTES: usize = 1024;
+
+#[derive(Debug, Default)]
+struct HistoryCompressionStats {
+    text_items: usize,
+    text_bytes: usize,
+    tool_outputs: usize,
+    tool_output_bytes: usize,
+}
+
+#[derive(Debug)]
+struct HistoryCompressionState {
+    text_items_to_consider: usize,
+    tool_outputs_to_consider: usize,
+    excess_bytes: usize,
+}
+
+#[derive(Debug)]
+enum ResponsesMessagePart {
+    Text(String),
+    Input(Value),
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ToolConversionMode {
+    #[default]
+    Function,
+    CodexStandalone,
+}
+
+#[derive(Debug, Clone)]
+struct ToolConversionResult {
+    value: Value,
+    standalone: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConversionContext<'a> {
+    pub provider_id: Option<&'a str>,
+    pub model: Option<&'a ModelInfo>,
+    pub tool_conversion_mode: ToolConversionMode,
+    pub supports_reasoning_summary_parameter: Option<bool>,
+}
+
+pub fn convert_to_responses(req: &MessagesRequest) -> Result<Value, ProviderError> {
+    convert_to_responses_with_context(req, ConversionContext::default())
+}
+
+pub fn convert_to_responses_with_context(
+    req: &MessagesRequest,
+    context: ConversionContext<'_>,
+) -> Result<Value, ProviderError> {
+    let _ = context.provider_id;
+    convert_to_responses_inner(req, context)
+}
+
+fn convert_to_responses_inner(
+    req: &MessagesRequest,
+    context: ConversionContext<'_>,
+) -> Result<Value, ProviderError> {
+    let correlation = ResponsesCorrelation::from_request(req);
+    let mut input = Vec::new();
+    let current_message_index = req.messages.len().saturating_sub(1);
+    let historical_stats = req
+        .messages
+        .iter()
+        .take(current_message_index)
+        .map(message_compression_stats)
+        .fold(HistoryCompressionStats::default(), |mut total, stats| {
+            total.text_items += stats.text_items;
+            total.text_bytes += stats.text_bytes;
+            total.tool_outputs += stats.tool_outputs;
+            total.tool_output_bytes += stats.tool_output_bytes;
+            total
+        });
+    let historical_payload_bytes = historical_stats.text_bytes + historical_stats.tool_output_bytes;
+    let mut compression = HistoryCompressionState {
+        text_items_to_consider: historical_stats
+            .text_items
+            .saturating_sub(RECENT_TEXT_ITEMS_TO_KEEP),
+        tool_outputs_to_consider: historical_stats
+            .tool_outputs
+            .saturating_sub(RECENT_TOOL_OUTPUTS_TO_KEEP),
+        excess_bytes: historical_payload_bytes
+            .saturating_sub(history_payload_budget_bytes(&req.model)),
+    };
+
+    for (index, msg) in req.messages.iter().enumerate() {
+        append_message_items(
+            &mut input,
+            msg,
+            index == current_message_index,
+            &mut compression,
+            &correlation,
+        );
+    }
+
+    let mut body = json!({
+        "model": req.model,
+        "input": input,
+        "stream": req.stream,
+        "store": false,
+    });
+
+    let requested_parallel_tool_calls = req
+        .extra
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            req.tool_choice
+                .as_ref()
+                .and_then(|choice| choice.get("disable_parallel_tool_use"))
+                .and_then(Value::as_bool)
+                .map(|disabled| !disabled)
+        });
+    if req.tools.as_ref().is_some_and(|tools| !tools.is_empty())
+        || requested_parallel_tool_calls.is_some()
+    {
+        body["parallel_tool_calls"] = json!(requested_parallel_tool_calls.unwrap_or(true));
+    }
+
+    let mut include = Vec::new();
+    if should_include_encrypted_reasoning(req) {
+        include.push("reasoning.encrypted_content");
+    }
+
+    if let Some(instructions) = system_to_text(&req.system) {
+        body["instructions"] = json!(instructions);
+    }
+    if let Some(max_tokens) = req.max_tokens {
+        body["max_output_tokens"] = json!(max_tokens);
+    }
+    if supports_sampling_parameters(req) {
+        if let Some(temperature) = req.temperature {
+            body["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = req.top_p {
+            body["top_p"] = json!(top_p);
+        }
+    }
+    if let Some(stop) = &req.stop_sequences {
+        body["stop"] = json!(stop);
+    }
+    let mut standalone_tool_names = HashSet::new();
+    let mut native_tool_choices = HashMap::new();
+    if let Some(tools) = &req.tools {
+        let converted_tools = tools
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| {
+                let converted = convert_tool_with_mode(
+                    tool,
+                    index,
+                    context.tool_conversion_mode,
+                    &correlation,
+                )?;
+                if converted.standalone {
+                    standalone_tool_names.insert(tool.name.clone());
+                }
+                if converted.value["type"].as_str() == Some("web_search") {
+                    native_tool_choices.insert(tool.name.clone(), "web_search");
+                }
+                Ok(converted.value)
+            })
+            .collect::<Result<Vec<_>, ProviderError>>()?;
+        body["tools"] = json!(converted_tools);
+    }
+    if let Some(tool_choice) = &req.tool_choice {
+        body["tool_choice"] = normalize_responses_tool_choice(
+            tool_choice,
+            &standalone_tool_names,
+            &native_tool_choices,
+            &correlation,
+        );
+    }
+    if !native_tool_choices.is_empty() {
+        include.push("web_search_call.action.sources");
+        include.push("web_search_call.results");
+    }
+    if !include.is_empty() {
+        body["include"] = json!(include);
+    }
+    if let Some(reasoning) = convert_reasoning(req, context) {
+        body["reasoning"] = reasoning;
+    }
+    Ok(body)
+}
+
+fn system_to_text(system: &Option<SystemPrompt>) -> Option<String> {
+    match system {
+        Some(SystemPrompt::Text(text)) if !text.is_empty() => Some(text.clone()),
+        Some(SystemPrompt::Blocks(blocks)) => {
+            let text = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    Content::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn should_include_encrypted_reasoning(req: &MessagesRequest) -> bool {
+    if req.extra.contains_key("reasoning") {
+        return true;
+    }
+    if req
+        .extra
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .is_some_and(|effort| effort != "none")
+    {
+        return true;
+    }
+    if req
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.r#type.as_deref() != Some("disabled"))
+    {
+        return true;
+    }
+    req.messages.iter().any(|message| match &message.content {
+        MessageContent::Text(_) => false,
+        MessageContent::Blocks(blocks) => blocks
+            .iter()
+            .any(|block| matches!(block, Content::Thinking { .. })),
+    })
+}
+
+fn history_payload_budget_bytes(model: &str) -> usize {
+    let model = model.to_ascii_lowercase();
+    if model.contains("mini") || model.contains("small") || model.contains("flash") {
+        SMALL_HISTORY_PAYLOAD_BUDGET_BYTES
+    } else if model.contains("gpt-5")
+        || model.contains("o3")
+        || model.contains("o4")
+        || crate::openai_compat::is_gpt_6_astra(&model)
+    {
+        LARGE_HISTORY_PAYLOAD_BUDGET_BYTES
+    } else {
+        DEFAULT_HISTORY_PAYLOAD_BUDGET_BYTES
+    }
+}
+
+fn message_compression_stats(message: &Message) -> HistoryCompressionStats {
+    match &message.content {
+        MessageContent::Text(text) => HistoryCompressionStats {
+            text_items: 1,
+            text_bytes: text.len(),
+            ..Default::default()
+        },
+        MessageContent::Blocks(blocks) => block_compression_stats(blocks),
+    }
+}
+
+fn block_compression_stats(blocks: &[Content]) -> HistoryCompressionStats {
+    let mut stats = HistoryCompressionStats::default();
+    let mut text_bytes = 0;
+    let mut has_pending_text = false;
+    let mut has_pending_thinking = false;
+
+    for block in blocks {
+        match block {
+            Content::Text { text } => {
+                has_pending_text = true;
+                text_bytes += text.len();
+            }
+            Content::Thinking { .. } => {
+                has_pending_text = true;
+                has_pending_thinking = true;
+            }
+            Content::ToolUse { .. } | Content::ServerToolUse { .. } => {
+                add_pending_text_stats(
+                    &mut stats,
+                    &mut text_bytes,
+                    &mut has_pending_text,
+                    &mut has_pending_thinking,
+                );
+            }
+            Content::ToolResult { content, .. } => {
+                add_pending_text_stats(
+                    &mut stats,
+                    &mut text_bytes,
+                    &mut has_pending_text,
+                    &mut has_pending_thinking,
+                );
+                stats.tool_outputs += 1;
+                stats.tool_output_bytes += raw_tool_result_text_len(content);
+            }
+            Content::WebSearchToolResult { .. } => {
+                add_pending_text_stats(
+                    &mut stats,
+                    &mut text_bytes,
+                    &mut has_pending_text,
+                    &mut has_pending_thinking,
+                );
+            }
+            Content::Unknown(_) => {}
+        }
+    }
+
+    add_pending_text_stats(
+        &mut stats,
+        &mut text_bytes,
+        &mut has_pending_text,
+        &mut has_pending_thinking,
+    );
+    stats
+}
+
+fn add_pending_text_stats(
+    stats: &mut HistoryCompressionStats,
+    text_bytes: &mut usize,
+    has_pending_text: &mut bool,
+    has_pending_thinking: &mut bool,
+) {
+    if *has_pending_text && !*has_pending_thinking {
+        stats.text_items += 1;
+        stats.text_bytes += *text_bytes;
+    }
+    *text_bytes = 0;
+    *has_pending_text = false;
+    *has_pending_thinking = false;
+}
+
+fn raw_tool_result_text_len(content: &Option<Value>) -> usize {
+    match content {
+        Some(Value::String(text)) => text.len(),
+        Some(value) => value.to_string().len(),
+        None => 0,
+    }
+}
+
+fn append_message_items(
+    input: &mut Vec<Value>,
+    msg: &Message,
+    is_current_message: bool,
+    compression: &mut HistoryCompressionState,
+    correlation: &ResponsesCorrelation,
+) {
+    match &msg.content {
+        MessageContent::Text(text) => {
+            append_text_message_item(input, &msg.role, text, is_current_message, compression);
+        }
+        MessageContent::Blocks(blocks) => {
+            append_block_message_items(
+                input,
+                &msg.role,
+                blocks,
+                is_current_message,
+                compression,
+                correlation,
+            );
+        }
+    }
+}
+
+fn append_text_message_item(
+    input: &mut Vec<Value>,
+    role: &Role,
+    text: &str,
+    is_current_message: bool,
+    compression: &mut HistoryCompressionState,
+) {
+    input.push(message_item(
+        role,
+        compressed_text_item(text, is_current_message, compression),
+    ));
+}
+
+fn append_block_message_items(
+    input: &mut Vec<Value>,
+    role: &Role,
+    blocks: &[Content],
+    is_current_message: bool,
+    compression: &mut HistoryCompressionState,
+    correlation: &ResponsesCorrelation,
+) {
+    let mut parts = Vec::new();
+    let mut index = 0;
+    while index < blocks.len() {
+        if let Content::ServerToolUse {
+            id,
+            name,
+            input: args,
+        } = &blocks[index]
+            && name == "web_search"
+        {
+            flush_message_parts(input, role, &mut parts, is_current_message, compression);
+            let results = blocks.get(index + 1).and_then(|next| match next {
+                Content::WebSearchToolResult {
+                    tool_use_id,
+                    content,
+                } if tool_use_id == id => Some(content),
+                _ => None,
+            });
+            append_web_search_call(input, id, args, results);
+            index += 1 + usize::from(results.is_some());
+            continue;
+        }
+        let block = &blocks[index];
+        append_block_item(
+            input,
+            role,
+            &mut parts,
+            block,
+            is_current_message,
+            compression,
+            correlation,
+        );
+        index += 1;
+    }
+    flush_message_parts(input, role, &mut parts, is_current_message, compression);
+}
+
+fn append_block_item(
+    input: &mut Vec<Value>,
+    role: &Role,
+    parts: &mut Vec<ResponsesMessagePart>,
+    block: &Content,
+    is_current_message: bool,
+    compression: &mut HistoryCompressionState,
+    correlation: &ResponsesCorrelation,
+) {
+    match block {
+        Content::Text { text } => parts.push(ResponsesMessagePart::Text(text.clone())),
+        Content::Thinking { signature, .. } => {
+            if *role == Role::Assistant
+                && let Some(signature) =
+                    signature.as_deref().filter(|value| is_gpt_signature(value))
+            {
+                flush_message_parts(input, role, parts, is_current_message, compression);
+                input.push(json!({
+                    "type": "reasoning",
+                    "summary": [],
+                    "content": null,
+                    "encrypted_content": signature,
+                }));
+            }
+        }
+        Content::ToolUse {
+            id,
+            name,
+            input: args,
+        }
+        | Content::ServerToolUse {
+            id,
+            name,
+            input: args,
+        } => {
+            flush_message_parts(input, role, parts, is_current_message, compression);
+            append_function_call(input, id, name, args, correlation);
+        }
+        Content::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => {
+            flush_message_parts(input, role, parts, is_current_message, compression);
+            append_function_call_output(
+                input,
+                tool_use_id,
+                content,
+                *is_error,
+                is_current_message,
+                compression,
+                correlation,
+            );
+        }
+        Content::WebSearchToolResult { .. } => {}
+        Content::Unknown(value) => {
+            parts.push(content_part_from_unknown(value));
+        }
+    }
+}
+
+fn append_web_search_call(
+    input: &mut Vec<Value>,
+    id: &str,
+    arguments: &Value,
+    results: Option<&Value>,
+) {
+    let mut item = json!({
+        "type": "web_search_call",
+        "id": id,
+        "status": "completed",
+        "action": {
+            "type": "search",
+            "query": arguments.get("query").and_then(Value::as_str).unwrap_or_default(),
+        }
+    });
+    if let Some(results) = results {
+        item["results"] = results.clone();
+    }
+    input.push(item);
+}
+
+fn append_function_call(
+    input: &mut Vec<Value>,
+    id: &str,
+    name: &str,
+    args: &Value,
+    correlation: &ResponsesCorrelation,
+) {
+    input.push(json!({
+        "type": "function_call",
+        "call_id": correlation.upstream_call_id(id),
+        "name": correlation.upstream_tool_name(name),
+        "arguments": serde_json::to_string(args).unwrap_or_default(),
+    }));
+}
+
+fn append_function_call_output(
+    input: &mut Vec<Value>,
+    tool_use_id: &str,
+    content: &Option<Value>,
+    is_error: Option<bool>,
+    is_current_message: bool,
+    compression: &mut HistoryCompressionState,
+    correlation: &ResponsesCorrelation,
+) {
+    let output = tool_result_output(
+        content,
+        is_error,
+        should_truncate_tool_output(content, is_current_message, compression),
+    );
+    input.push(json!({
+        "type": "function_call_output",
+        "call_id": correlation.upstream_call_id(tool_use_id),
+        "output": output,
+    }));
+}
+
+fn flush_message_parts(
+    input: &mut Vec<Value>,
+    role: &Role,
+    parts: &mut Vec<ResponsesMessagePart>,
+    is_current_message: bool,
+    compression: &mut HistoryCompressionState,
+) {
+    if parts.is_empty() {
+        return;
+    }
+
+    let has_input = parts
+        .iter()
+        .any(|part| matches!(part, ResponsesMessagePart::Input(_)));
+
+    if !has_input {
+        let text = parts
+            .iter()
+            .filter_map(|part| match part {
+                ResponsesMessagePart::Text(text) => Some(text.as_str()),
+                ResponsesMessagePart::Input(_) => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        input.push(message_item(
+            role,
+            compressed_text_item(&text, is_current_message, compression),
+        ));
+        parts.clear();
+        return;
+    }
+
+    let content = parts
+        .iter()
+        .filter_map(|part| match part {
+            ResponsesMessagePart::Text(text) if text.is_empty() => None,
+            ResponsesMessagePart::Text(text) => Some(json!({
+                "type": "input_text",
+                "text": compressed_text_item(text, is_current_message, compression),
+            })),
+            ResponsesMessagePart::Input(value) => Some(value.clone()),
+        })
+        .collect::<Vec<_>>();
+
+    if !content.is_empty() {
+        input.push(message_content_item(role, content));
+    }
+    parts.clear();
+}
+
+fn compressed_text_item(
+    text: &str,
+    is_current_message: bool,
+    compression: &mut HistoryCompressionState,
+) -> String {
+    text_item_text(
+        text,
+        should_truncate_text_item(text, is_current_message, compression),
+    )
+}
+
+fn should_truncate_tool_output(
+    content: &Option<Value>,
+    is_current_message: bool,
+    compression: &mut HistoryCompressionState,
+) -> bool {
+    if is_current_message || compression.tool_outputs_to_consider == 0 {
+        return false;
+    }
+    compression.tool_outputs_to_consider -= 1;
+    if tool_result_has_encrypted_content(content) {
+        return false;
+    }
+    let original_bytes = raw_tool_result_text_len(content);
+    if compression.excess_bytes == 0 || original_bytes <= MAX_HISTORICAL_TOOL_OUTPUT_BYTES {
+        return false;
+    }
+    compression.excess_bytes = compression
+        .excess_bytes
+        .saturating_sub(truncated_tool_output_bytes_saved(original_bytes));
+    true
+}
+
+fn should_truncate_text_item(
+    text: &str,
+    is_current_message: bool,
+    compression: &mut HistoryCompressionState,
+) -> bool {
+    if is_current_message || compression.text_items_to_consider == 0 {
+        return false;
+    }
+    compression.text_items_to_consider -= 1;
+    if compression.excess_bytes == 0 || text.len() <= MAX_HISTORICAL_TEXT_BYTES {
+        return false;
+    }
+    compression.excess_bytes = compression
+        .excess_bytes
+        .saturating_sub(truncated_text_bytes_saved(text.len()));
+    true
+}
+
+fn truncated_tool_output_bytes_saved(original_bytes: usize) -> usize {
+    original_bytes.saturating_sub(
+        format!(
+            "[tool output truncated: original_bytes={original_bytes}, max_historical_tool_output_bytes={MAX_HISTORICAL_TOOL_OUTPUT_BYTES}]"
+        )
+        .len(),
+    )
+}
+
+fn truncated_text_bytes_saved(original_bytes: usize) -> usize {
+    original_bytes.saturating_sub(
+        format!(
+            "[text content truncated: original_bytes={original_bytes}, max_historical_text_bytes={MAX_HISTORICAL_TEXT_BYTES}]"
+        )
+        .len(),
+    )
+}
+
+fn text_item_text(text: &str, truncate_if_large: bool) -> String {
+    if truncate_if_large && text.len() > MAX_HISTORICAL_TEXT_BYTES {
+        format!(
+            "[text content truncated: original_bytes={}, max_historical_text_bytes={}]",
+            text.len(),
+            MAX_HISTORICAL_TEXT_BYTES
+        )
+    } else {
+        text.to_string()
+    }
+}
+
+fn message_item(role: &Role, text: String) -> Value {
+    let role = match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    };
+    json!({
+        "role": role,
+        "content": text,
+    })
+}
+
+fn message_content_item(role: &Role, content: Vec<Value>) -> Value {
+    let role = match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    };
+    json!({
+        "role": role,
+        "content": content,
+    })
+}
+
+fn content_part_from_unknown(value: &Value) -> ResponsesMessagePart {
+    if let Some(part) = content_part_from_value(value) {
+        return part;
+    }
+    ResponsesMessagePart::Text(value.to_string())
+}
+
+fn content_part_from_value(value: &Value) -> Option<ResponsesMessagePart> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("text") => value
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| ResponsesMessagePart::Text(text.to_string())),
+        Some("image") | Some("input_image") | Some("image_url") => {
+            unknown_image_url(value).map(input_image_part)
+        }
+        Some("document") | Some("input_file") | Some("file") => {
+            input_file_part(value).map(ResponsesMessagePart::Input)
+        }
+        _ => None,
+    }
+}
+
+fn input_image_part(image_url: String) -> ResponsesMessagePart {
+    ResponsesMessagePart::Input(json!({
+        "type": "input_image",
+        "image_url": image_url,
+    }))
+}
+
+fn unknown_image_url(value: &Value) -> Option<String> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("image") => image_source_url(value.get("source")?),
+        Some("input_image") => image_url_string(value.get("image_url")?),
+        Some("image_url") => image_url_string(value.get("image_url")?),
+        _ => None,
+    }
+}
+
+fn image_url_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(url) => Some(url.clone()),
+        Value::Object(image_url) => image_url
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+fn image_source_url(source: &Value) -> Option<String> {
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let media_type = string_field(source, &["media_type", "mediaType"])?;
+            let data = source.get("data").and_then(Value::as_str)?;
+            (!media_type.is_empty() && !data.is_empty())
+                .then(|| format!("data:{media_type};base64,{data}"))
+        }
+        Some("url") => source
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        _ => None,
+    }
+}
+
+fn input_file_part(value: &Value) -> Option<Value> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("input_file") => normalize_input_file_part(value),
+        Some("file") => value
+            .get("file")
+            .and_then(normalize_input_file_part)
+            .or_else(|| normalize_input_file_part(value)),
+        Some("document") => {
+            let source = value.get("source")?;
+            let mut part = match source.get("type").and_then(Value::as_str) {
+                Some("base64") => {
+                    let data = source.get("data").and_then(Value::as_str)?;
+                    (!data.is_empty()).then(|| {
+                        json!({
+                            "type": "input_file",
+                            "file_data": data,
+                        })
+                    })?
+                }
+                Some("url") => {
+                    let url = source.get("url").and_then(Value::as_str)?;
+                    (!url.is_empty()).then(|| {
+                        json!({
+                            "type": "input_file",
+                            "file_url": url,
+                        })
+                    })?
+                }
+                Some("file") => {
+                    let file_id = string_field(source, &["file_id", "fileId", "id"])?;
+                    (!file_id.is_empty()).then(|| {
+                        json!({
+                            "type": "input_file",
+                            "file_id": file_id,
+                        })
+                    })?
+                }
+                _ => return None,
+            };
+            if let Some(filename) = string_field(value, &["filename", "name", "title"])
+                .or_else(|| string_field(source, &["filename", "name", "title"]))
+            {
+                part["filename"] = json!(filename);
+            }
+            Some(part)
+        }
+        _ => None,
+    }
+}
+
+fn normalize_input_file_part(value: &Value) -> Option<Value> {
+    let mut part = json!({"type": "input_file"});
+    let mut has_payload = false;
+    for field in ["file_data", "file_id", "file_url", "filename"] {
+        if let Some(text) = value.get(field).and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            part[field] = json!(text);
+            if field != "filename" {
+                has_payload = true;
+            }
+        }
+    }
+    has_payload.then_some(part)
+}
+
+fn string_field<'a>(value: &'a Value, fields: &[&str]) -> Option<&'a str> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(Value::as_str))
+}
+
+fn tool_result_text(
+    content: &Option<Value>,
+    is_error: Option<bool>,
+    truncate_if_large: bool,
+) -> String {
+    let text = if is_error == Some(true) {
+        tool_result_error_text(content)
+    } else {
+        match content {
+            Some(Value::String(text)) => text.clone(),
+            Some(value) => value.to_string(),
+            None => String::new(),
+        }
+    };
+    let text = if truncate_if_large && text.len() > MAX_HISTORICAL_TOOL_OUTPUT_BYTES {
+        historical_tool_result_truncation_marker(text.len())
+    } else if text.len() > MAX_CURRENT_TOOL_OUTPUT_BYTES {
+        truncated_current_tool_result_text(&text)
+    } else {
+        text
+    };
+    if is_error == Some(true) {
+        format!("ERROR: {text}")
+    } else {
+        text
+    }
+}
+
+fn tool_result_error_text(content: &Option<Value>) -> String {
+    match content {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(tool_result_error_text_item)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(Value::String(text)) => text.clone(),
+        Some(value) => value.to_string(),
+        None => String::new(),
+    }
+}
+
+fn historical_tool_result_truncation_marker(original_bytes: usize) -> String {
+    format!(
+        "[tool output truncated: original_bytes={original_bytes}, max_historical_tool_output_bytes={MAX_HISTORICAL_TOOL_OUTPUT_BYTES}]"
+    )
+}
+
+fn truncated_current_tool_result_text(text: &str) -> String {
+    let marker = format!(
+        "[tool output truncated: original_bytes={}, max_current_tool_output_bytes={}]\n",
+        text.len(),
+        MAX_CURRENT_TOOL_OUTPUT_BYTES
+    );
+    let omitted_marker = "\n[... middle of tool output omitted ...]\n";
+    let visible_budget = MAX_CURRENT_TOOL_OUTPUT_BYTES
+        .saturating_sub(marker.len())
+        .saturating_sub(omitted_marker.len());
+    let head_budget = visible_budget * 3 / 4;
+    let tail_budget = visible_budget.saturating_sub(head_budget);
+    let head_end = floor_char_boundary(text, head_budget);
+    let tail_start = ceil_char_boundary(text, text.len().saturating_sub(tail_budget));
+
+    format!(
+        "{}{}{}{}",
+        marker,
+        &text[..head_end],
+        omitted_marker,
+        &text[tail_start..]
+    )
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+fn tool_result_error_text_item(value: &Value) -> Option<String> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("text") => value
+            .get("text")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        Some("image") | Some("input_image") | Some("image_url") => {
+            Some("[image omitted from error tool result]".to_string())
+        }
+        Some("document") | Some("input_file") | Some("file") => {
+            Some("[document omitted from error tool result]".to_string())
+        }
+        Some(_) => Some(value.to_string()),
+        None => None,
+    }
+}
+
+fn tool_result_output(
+    content: &Option<Value>,
+    is_error: Option<bool>,
+    truncate_if_large: bool,
+) -> Value {
+    let has_encrypted_content = tool_result_has_encrypted_content(content);
+    let should_truncate_current = !has_encrypted_content
+        && !truncate_if_large
+        && raw_tool_result_text_len(content) > MAX_CURRENT_TOOL_OUTPUT_BYTES;
+    if !has_encrypted_content
+        && (is_error == Some(true) || truncate_if_large || should_truncate_current)
+    {
+        return json!(tool_result_text(content, is_error, truncate_if_large));
+    }
+
+    match content {
+        Some(Value::Array(items)) => {
+            if !items
+                .iter()
+                .all(|item| item.get("type").and_then(Value::as_str).is_some())
+            {
+                return json!(tool_result_text(content, is_error, truncate_if_large));
+            }
+            let parts = items
+                .iter()
+                .map(tool_result_content_part)
+                .filter_map(responses_message_part_to_value)
+                .collect::<Vec<_>>();
+            if parts.is_empty() {
+                json!("")
+            } else {
+                json!(parts)
+            }
+        }
+        _ => json!(tool_result_text(content, is_error, truncate_if_large)),
+    }
+}
+
+fn tool_result_content_part(value: &Value) -> ResponsesMessagePart {
+    if let Some(encrypted_content) = encrypted_tool_result_text(value) {
+        return ResponsesMessagePart::Input(json!({
+            "type": "encrypted_content",
+            "encrypted_content": encrypted_content,
+        }));
+    }
+    content_part_from_value(value).unwrap_or_else(|| ResponsesMessagePart::Text(value.to_string()))
+}
+
+fn tool_result_has_encrypted_content(content: &Option<Value>) -> bool {
+    content
+        .as_ref()
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| encrypted_tool_result_text(item).is_some())
+        })
+}
+
+fn encrypted_tool_result_text(value: &Value) -> Option<&str> {
+    (value.get("type").and_then(Value::as_str) == Some("text")
+        && value
+            .get("_meta")
+            .and_then(|meta| meta.get("codex/encryptedContent"))
+            .and_then(Value::as_bool)
+            == Some(true))
+    .then(|| value.get("text").and_then(Value::as_str))
+    .flatten()
+}
+
+fn responses_message_part_to_value(part: ResponsesMessagePart) -> Option<Value> {
+    match part {
+        ResponsesMessagePart::Text(text) if text.is_empty() => None,
+        ResponsesMessagePart::Text(text) => Some(json!({
+            "type": "input_text",
+            "text": text,
+        })),
+        ResponsesMessagePart::Input(value) => Some(value),
+    }
+}
+
+fn convert_tool_with_mode(
+    tool: &Tool,
+    tool_index: usize,
+    mode: ToolConversionMode,
+    correlation: &ResponsesCorrelation,
+) -> Result<ToolConversionResult, ProviderError> {
+    if tool
+        .extra
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|tool_type| tool_type.starts_with("web_search"))
+    {
+        return Ok(ToolConversionResult {
+            value: convert_web_search_tool(tool, tool_index)?,
+            standalone: false,
+        });
+    }
+
+    if mode == ToolConversionMode::CodexStandalone
+        && tool.name == "Bash"
+        && tool_schema_has_string_property(&tool.input_schema, "command")
+    {
+        return Ok(ToolConversionResult {
+            value: convert_bash_freeform_tool(tool, correlation),
+            standalone: true,
+        });
+    }
+
+    Ok(ToolConversionResult {
+        value: convert_function_tool(tool, correlation),
+        standalone: false,
+    })
+}
+
+fn convert_function_tool(tool: &Tool, correlation: &ResponsesCorrelation) -> Value {
+    let mut value = json!({
+        "type": "function",
+        "name": correlation.upstream_tool_name(&tool.name),
+        "parameters": normalize_tool_schema(&tool.input_schema),
+    });
+
+    if let Some(description) = &tool.description {
+        value["description"] = json!(description);
+    }
+
+    value
+}
+
+fn convert_bash_freeform_tool(tool: &Tool, correlation: &ResponsesCorrelation) -> Value {
+    json!({
+        "type": "custom",
+        "name": correlation.upstream_tool_name(&tool.name),
+        "description": tool.description.as_deref().unwrap_or(
+            "Run a shell command. This is a FREEFORM tool, so provide the shell command text directly; do not wrap it in JSON."
+        ),
+        "format": {
+            "type": "grammar",
+            "syntax": "lark",
+            "definition": "start: command\ncommand: /[\\s\\S]+/"
+        }
+    })
+}
+
+fn convert_web_search_tool(tool: &Tool, tool_index: usize) -> Result<Value, ProviderError> {
+    let mut value = json!({"type": "web_search"});
+    let allowed_domains = normalize_web_search_domains(tool, tool_index, "allowed_domains")?;
+    let blocked_domains = normalize_web_search_domains(tool, tool_index, "blocked_domains")?;
+
+    if allowed_domains.is_some() && blocked_domains.is_some() {
+        return Err(ProviderError::InvalidRequest(format!(
+            "tools[{tool_index}] cannot specify both allowed_domains and blocked_domains"
+        )));
+    }
+
+    if allowed_domains.is_some() || blocked_domains.is_some() {
+        let mut filters = serde_json::Map::new();
+        if let Some(domains) = allowed_domains {
+            filters.insert("allowed_domains".to_string(), json!(domains));
+        }
+        if let Some(domains) = blocked_domains {
+            filters.insert("blocked_domains".to_string(), json!(domains));
+        }
+        value["filters"] = Value::Object(filters);
+    }
+    if let Some(location) = tool.extra.get("user_location") {
+        value["user_location"] = location.clone();
+    }
+    Ok(value)
+}
+
+fn normalize_web_search_domains(
+    tool: &Tool,
+    tool_index: usize,
+    field: &str,
+) -> Result<Option<Vec<String>>, ProviderError> {
+    let Some(value) = tool.extra.get(field).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let domains = value.as_array().ok_or_else(|| {
+        ProviderError::InvalidRequest(format!("tools[{tool_index}].{field} must be an array"))
+    })?;
+    let mut normalized = Vec::with_capacity(domains.len());
+    let mut seen = HashSet::with_capacity(domains.len());
+    for (domain_index, domain) in domains.iter().enumerate() {
+        let domain = domain.as_str().ok_or_else(|| {
+            ProviderError::InvalidRequest(format!(
+                "tools[{tool_index}].{field}[{domain_index}] must be a string"
+            ))
+        })?;
+        let domain = domain.trim();
+        if domain.is_empty() {
+            continue;
+        }
+        let domain = domain.to_ascii_lowercase();
+        if seen.insert(domain.clone()) {
+            normalized.push(domain);
+        }
+    }
+    Ok((!normalized.is_empty()).then_some(normalized))
+}
+
+fn tool_schema_has_string_property(schema: &Value, property: &str) -> bool {
+    schema
+        .get("properties")
+        .and_then(|properties| properties.get(property))
+        .and_then(|value| value.get("type"))
+        .and_then(Value::as_str)
+        == Some("string")
+}
+
+fn normalize_responses_tool_choice(
+    tool_choice: &Value,
+    standalone_tool_names: &HashSet<String>,
+    native_tool_choices: &HashMap<String, &str>,
+    correlation: &ResponsesCorrelation,
+) -> Value {
+    if tool_choice.get("type").and_then(Value::as_str) == Some("tool")
+        && let Some(name) = tool_choice.get("name").and_then(Value::as_str)
+        && let Some(native_type) = native_tool_choices.get(name)
+    {
+        return json!({"type": native_type});
+    }
+    if tool_choice.get("type").and_then(Value::as_str) == Some("tool")
+        && tool_choice
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| standalone_tool_names.contains(name))
+    {
+        return json!("auto");
+    }
+
+    let mut normalized = normalize_for_responses(tool_choice);
+    if let Some(name) = normalized.get("name").and_then(Value::as_str) {
+        normalized["name"] = json!(correlation.upstream_tool_name(name));
+    }
+    normalized
+}
+
+fn normalize_tool_schema(schema: &Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return json!({"type": "object", "properties": {}});
+    };
+
+    if object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|schema_type| schema_type != "object")
+    {
+        return json!({"type": "object", "properties": {}});
+    }
+
+    let mut normalized = object.clone();
+    remove_json_schema_keywords(&mut normalized);
+    normalized.insert("type".to_string(), json!("object"));
+    if !normalized
+        .get("properties")
+        .is_some_and(|properties| properties.is_object())
+    {
+        normalized.insert("properties".to_string(), json!({}));
+    }
+
+    if let Some(required) = normalized.get("required")
+        && !required
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_string))
+    {
+        normalized.remove("required");
+    }
+
+    Value::Object(normalized)
+}
+
+fn remove_json_schema_keywords(object: &mut serde_json::Map<String, Value>) {
+    object.remove("$schema");
+    for value in object.values_mut() {
+        remove_json_schema_keywords_from_value(value);
+    }
+}
+
+fn remove_json_schema_keywords_from_value(value: &mut Value) {
+    match value {
+        Value::Object(object) => remove_json_schema_keywords(object),
+        Value::Array(items) => {
+            for item in items {
+                remove_json_schema_keywords_from_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn convert_reasoning(req: &MessagesRequest, context: ConversionContext<'_>) -> Option<Value> {
+    if let Some(reasoning) = req.extra.get("reasoning") {
+        return Some(reasoning_for_model(req, context, reasoning.clone()));
+    }
+    if let Some(effort) = req.extra.get("reasoning_effort").and_then(Value::as_str) {
+        return Some(reasoning_effort_for_context(req, context, effort));
+    }
+    let thinking = req.thinking.as_ref()?;
+    if thinking.r#type.as_deref() == Some("disabled") {
+        return Some(json!({"effort": "none"}));
+    }
+    if let Some(budget_tokens) = thinking.budget_tokens {
+        let effort = thinking_budget_to_reasoning_effort(budget_tokens, &req.model);
+        return Some(reasoning_effort_for_context(req, context, effort));
+    }
+    if thinking.r#type.as_deref() == Some("adaptive") {
+        let effort = req
+            .extra
+            .get("output_config")
+            .and_then(|config| config.get("effort"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| default_adaptive_reasoning_effort(&req.model));
+        return Some(reasoning_effort_for_context(req, context, effort));
+    }
+    if thinking.r#type.as_deref() == Some("enabled") {
+        return Some(reasoning_effort_for_context(req, context, "medium"));
+    }
+    None
+}
+
+fn reasoning_effort_for_context(
+    req: &MessagesRequest,
+    context: ConversionContext<'_>,
+    effort: &str,
+) -> Value {
+    let effort = context
+        .model
+        .and_then(|model| {
+            clamp_reasoning_effort(effort, &model.capabilities.limits.reasoning_effort_levels)
+        })
+        .unwrap_or(effort);
+    reasoning_effort_for_model(req, context, effort)
+}
+
+fn clamp_reasoning_effort<'a>(effort: &'a str, supported: &'a [String]) -> Option<&'a str> {
+    if supported.is_empty() || supported.iter().any(|level| level == effort) {
+        Some(effort)
+    } else {
+        supported.last().map(String::as_str)
+    }
+}
+
+fn reasoning_effort_for_model(
+    req: &MessagesRequest,
+    context: ConversionContext<'_>,
+    effort: &str,
+) -> Value {
+    if effort == "none" {
+        return json!({"effort": "none"});
+    }
+
+    let reasoning = json!({"effort": effort, "summary": "detailed"});
+    reasoning_for_model(req, context, reasoning)
+}
+
+fn reasoning_for_model(
+    req: &MessagesRequest,
+    context: ConversionContext<'_>,
+    mut reasoning: Value,
+) -> Value {
+    let supports_reasoning_summary_parameter = context
+        .supports_reasoning_summary_parameter
+        .unwrap_or_else(|| supports_reasoning_summary(&req.model));
+    if !supports_reasoning_summary_parameter && let Some(object) = reasoning.as_object_mut() {
+        object.remove("summary");
+    }
+    reasoning
+}
+
+#[cfg(test)]
+pub fn stream_responses_response(
+    response: reqwest::Response,
+) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
+    Box::pin(
+        stream_responses_response_with_observer(response, |_| {}).flat_map(|result| {
+            let events = match result {
+                Ok(event) => event.into_normalized_events().into_iter().map(Ok).collect(),
+                Err(error) => vec![Err(error)],
+            };
+            futures::stream::iter(events)
+        }),
+    )
+}
+
+pub fn stream_responses_response_with_context(
+    response: reqwest::Response,
+    marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
+    max_sse_frame_bytes: u64,
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
+    stream_responses_response_with_context_and_observer(
+        response,
+        marker_mode,
+        correlation,
+        max_sse_frame_bytes,
+        |_| {},
+    )
+}
+
+pub fn stream_responses_response_with_context_and_provider_observer(
+    response: reqwest::Response,
+    marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
+    observer: Option<ProviderRequestObserver>,
+    max_sse_frame_bytes: u64,
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
+    stream_responses_response_with_context_and_observer(
+        response,
+        marker_mode,
+        correlation,
+        max_sse_frame_bytes,
+        move |event| notify_stream_metadata(observer.as_ref(), event),
+    )
+}
+
+#[cfg(test)]
+pub fn stream_responses_response_with_observer<F>(
+    response: reqwest::Response,
+    on_event: F,
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>
+where
+    F: Fn(&Value) + Send + Sync + 'static,
+{
+    stream_responses_response_with_marker_mode_and_observer(
+        response,
+        ReasoningMarkerMode::Strict,
+        on_event,
+    )
+}
+
+#[cfg(test)]
+pub fn stream_responses_response_with_marker_mode_and_observer<F>(
+    response: reqwest::Response,
+    marker_mode: ReasoningMarkerMode,
+    on_event: F,
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>
+where
+    F: Fn(&Value) + Send + Sync + 'static,
+{
+    stream_responses_response_with_context_and_observer(
+        response,
+        marker_mode,
+        ResponsesCorrelation::default(),
+        1024 * 1024,
+        on_event,
+    )
+}
+
+pub fn stream_responses_response_with_context_and_observer<F>(
+    response: reqwest::Response,
+    marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
+    max_sse_frame_bytes: u64,
+    on_event: F,
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>
+where
+    F: Fn(&Value) + Send + Sync + 'static,
+{
+    stream_responses_response_with_context_and_error_policy(
+        response,
+        marker_mode,
+        correlation,
+        max_sse_frame_bytes,
+        false,
+        on_event,
+    )
+}
+
+/// Preserve Responses terminal failure events for a matching downstream
+/// instead of reducing them to the provider-neutral error taxonomy.
+pub fn stream_native_responses_response_with_provider_observer(
+    response: reqwest::Response,
+    observer: Option<ProviderRequestObserver>,
+    max_sse_frame_bytes: u64,
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
+    stream_responses_response_with_context_and_error_policy(
+        response,
+        ReasoningMarkerMode::Strict,
+        ResponsesCorrelation::default(),
+        max_sse_frame_bytes,
+        true,
+        move |event| notify_stream_metadata(observer.as_ref(), event),
+    )
+}
+
+fn stream_responses_response_with_context_and_error_policy<F>(
+    response: reqwest::Response,
+    marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
+    max_sse_frame_bytes: u64,
+    preserve_failed_events: bool,
+    on_event: F,
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>
+where
+    F: Fn(&Value) + Send + Sync + 'static,
+{
+    let (tx, rx) = mpsc::channel::<Result<ProviderEvent, ProviderError>>(64);
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let on_event = Arc::new(on_event);
+
+    tokio::spawn(async move {
+        let native_correlation = correlation.clone();
+        let mut converter = ResponsesStreamConverter::with_context(marker_mode, correlation);
+        let mut decoder = SseDecoder::new(max_sse_frame_bytes);
+        let mut byte_stream = response.bytes_stream();
+        let mut preview = Vec::new();
+        let mut saw_done = false;
+
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                next = next_upstream_stream_item(byte_stream.next()) => next,
+            };
+            let chunk_result = match next {
+                Ok(Some(chunk_result)) => chunk_result,
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
+                    return;
+                }
+            };
+
+            match chunk_result {
+                Ok(chunk) => {
+                    append_stream_preview(&mut preview, &chunk);
+                    if let Err(error) = decoder.push(&chunk) {
+                        let _ = tx
+                            .send(Err(ProviderError::ResponseTooLarge(format!(
+                                "SSE frame exceeds configured limit of {} bytes",
+                                error.limit
+                            ))))
+                            .await;
+                        return;
+                    }
+                    while let Some(event) = decoder.next_frame() {
+                        if is_sse_done(&event) {
+                            saw_done = true;
+                            continue;
+                        }
+                        if let Some(value) = parse_sse_json(&event) {
+                            on_event(&value);
+                            if let Some(error) =
+                                responses_stream_error(&value, preserve_failed_events)
+                            {
+                                let _ = tx.send(Err(error)).await;
+                                return;
+                            }
+                            let normalized = converter.process_event(&value);
+                            let native = native_correlation.restore_response_event(&value);
+                            if tx
+                                .send(Ok(ProviderEvent::openai_responses(
+                                    response_sse_event(native),
+                                    normalized,
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if converter.stopped {
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if converter.stopped || saw_done {
+                        break;
+                    }
+                    match decoder.finish() {
+                        Ok(Some(event)) => {
+                            if is_sse_done(&event) {
+                                saw_done = true;
+                            } else if let Some(value) = parse_sse_json(&event) {
+                                on_event(&value);
+                                if let Some(error) =
+                                    responses_stream_error(&value, preserve_failed_events)
+                                {
+                                    let _ = tx.send(Err(error)).await;
+                                    return;
+                                }
+                                let normalized = converter.process_event(&value);
+                                let native = native_correlation.restore_response_event(&value);
+                                if tx
+                                    .send(Ok(ProviderEvent::openai_responses(
+                                        response_sse_event(native),
+                                        normalized,
+                                    )))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let _ = tx
+                                .send(Err(ProviderError::ResponseTooLarge(format!(
+                                    "SSE frame exceeds configured limit of {} bytes",
+                                    error.limit
+                                ))))
+                                .await;
+                            return;
+                        }
+                    }
+                    if converter.stopped || saw_done {
+                        break;
+                    }
+                    let _ = tx
+                        .send(Err(ProviderError::Network(fmt_reqwest_err(&e))))
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        match decoder.finish() {
+            Ok(Some(event)) if !is_sse_done(&event) => {
+                if let Some(value) = parse_sse_json(&event) {
+                    on_event(&value);
+                    if let Some(error) = responses_stream_error(&value, preserve_failed_events) {
+                        let _ = tx.send(Err(error)).await;
+                        return;
+                    }
+                    let normalized = converter.process_event(&value);
+                    let native = native_correlation.restore_response_event(&value);
+                    if tx
+                        .send(Ok(ProviderEvent::openai_responses(
+                            response_sse_event(native),
+                            normalized,
+                        )))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let _ = tx
+                    .send(Err(ProviderError::ResponseTooLarge(format!(
+                        "SSE frame exceeds configured limit of {} bytes",
+                        error.limit
+                    ))))
+                    .await;
+                return;
+            }
+        }
+
+        if converter.started && !converter.stopped && !saw_done {
+            let _ = tx
+                .send(Err(ProviderError::Network(
+                    "upstream Responses API stream ended before a terminal response event"
+                        .to_string(),
+                )))
+                .await;
+            return;
+        }
+
+        if !converter.started {
+            let _ = tx
+                .send(Err(malformed_responses_stream_error(
+                    status,
+                    &content_type,
+                    &preview,
+                )))
+                .await;
+            return;
+        }
+
+        for event in converter.finish() {
+            if tx.send(Ok(ProviderEvent::from(event))).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+#[cfg(test)]
+#[path = "responses/cancellation_tests.rs"]
+mod cancellation_tests;
+
+pub(crate) fn stream_responses_json_events_with_context_and_observer<F>(
+    mut events: mpsc::Receiver<Result<Value, ProviderError>>,
+    marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
+    on_event: F,
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>>
+where
+    F: Fn(&Value) + Send + Sync + 'static,
+{
+    let (tx, rx) = mpsc::channel::<Result<ProviderEvent, ProviderError>>(64);
+    let on_event = Arc::new(on_event);
+
+    tokio::spawn(async move {
+        let native_correlation = correlation.clone();
+        let mut converter = ResponsesStreamConverter::with_context(marker_mode, correlation);
+
+        while let Some(event) = events.recv().await {
+            let value = match event {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
+                    return;
+                }
+            };
+
+            on_event(&value);
+            if let Some(error) = responses_error_event(&value) {
+                let _ = tx.send(Err(error)).await;
+                return;
+            }
+            let normalized = converter.process_event(&value);
+            let native = native_correlation.restore_response_event(&value);
+            if tx
+                .send(Ok(ProviderEvent::openai_responses(
+                    response_sse_event(native),
+                    normalized,
+                )))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+
+        if !converter.started {
+            let _ = tx
+                .send(Err(malformed_responses_stream_error(200, "websocket", &[])))
+                .await;
+            return;
+        }
+
+        for event in converter.finish() {
+            if tx.send(Ok(ProviderEvent::from(event))).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+fn parse_sse_json(text: &str) -> Option<Value> {
+    parse_sse_json_value(text)
+}
+
+fn response_sse_event(data: Value) -> SseEvent {
+    let event = data["type"].as_str().unwrap_or_default().to_string();
+    SseEvent { event, data }
+}
+
+fn responses_stream_error(value: &Value, preserve_failed_events: bool) -> Option<ProviderError> {
+    if preserve_failed_events
+        && value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| matches!(kind, "response.failed" | "response.incomplete"))
+    {
+        None
+    } else {
+        responses_error_event(value)
+    }
+}
+
+pub(crate) fn notify_stream_metadata(observer: Option<&ProviderRequestObserver>, event: &Value) {
+    let Some(observer) = observer else {
+        return;
+    };
+    let response = event.get("response").unwrap_or(event);
+    let usage = provider_usage_from_responses_response(response);
+    let model = response
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
+    let request_id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    let stop_reason = response_stop_reason_metadata(response);
+    if usage.is_none() && model.is_none() && request_id.is_none() && stop_reason.is_none() {
+        return;
+    }
+
+    observer(ProviderRequestObserverEvent {
+        event: ProviderRequestObserverEventKind::StreamMetadata,
+        stream_metadata: Some(ProviderStreamMetadata {
+            usage,
+            model,
+            request_id,
+            stop_reason,
+        }),
+        ..ProviderRequestObserverEvent::default()
+    });
+}
+
+fn provider_usage_from_responses_response(response: &Value) -> Option<ProviderUsageMetadata> {
+    response
+        .get("usage")
+        .map(provider_usage_from_responses_usage)
+}
+
+fn provider_usage_from_responses_usage(usage: &Value) -> ProviderUsageMetadata {
+    let input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
+    let cached_input_tokens = responses_cached_input_tokens(usage).min(input_tokens);
+    let cache_write_input_tokens = responses_cache_write_input_tokens(usage)
+        .map(|tokens| tokens.min(input_tokens.saturating_sub(cached_input_tokens)));
+    let cache_creation_input_tokens = cache_write_input_tokens
+        .unwrap_or_else(|| usage["cache_creation_input_tokens"].as_u64().unwrap_or(0));
+
+    ProviderUsageMetadata {
+        input_tokens: input_tokens
+            .saturating_sub(cached_input_tokens)
+            .saturating_sub(cache_write_input_tokens.unwrap_or(0)),
+        output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+        reasoning_output_tokens: responses_reasoning_output_tokens(usage),
+        cache_creation_input_tokens,
+        cache_read_input_tokens: cached_input_tokens,
+    }
+}
+
+fn responses_reasoning_output_tokens(usage: &Value) -> u64 {
+    usage
+        .pointer("/output_tokens_details/reasoning_tokens")
+        .or_else(|| usage.pointer("/completion_tokens_details/reasoning_tokens"))
+        .or_else(|| usage.get("reasoning_output_tokens"))
+        .or_else(|| usage.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn responses_cached_input_tokens(usage: &Value) -> u64 {
+    usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+        .or_else(|| usage.get("cached_input_tokens"))
+        .or_else(|| usage.get("cache_read_input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn responses_cache_write_input_tokens(usage: &Value) -> Option<u64> {
+    usage
+        .pointer("/input_tokens_details/cache_write_tokens")
+        .or_else(|| usage.pointer("/prompt_tokens_details/cache_write_tokens"))
+        .or_else(|| usage.get("cache_write_input_tokens"))
+        .or_else(|| usage.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+}
+
+fn u64_to_u32_saturating(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn responses_usage_json(
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_creation_input_tokens: u32,
+    cache_read_input_tokens: u32,
+) -> Value {
+    json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
+    })
+}
+
+fn response_stop_reason_metadata(response: &Value) -> Option<String> {
+    if let Some(reason) = response["incomplete_details"]["reason"].as_str() {
+        return Some(reason.to_string());
+    }
+    response
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|status| matches!(*status, "completed" | "incomplete" | "failed"))
+        .map(str::to_string)
+}
+
+fn append_stream_preview(preview: &mut Vec<u8>, chunk: &[u8]) {
+    let remaining = MAX_MALFORMED_STREAM_PREVIEW_BYTES.saturating_sub(preview.len());
+    if remaining > 0 {
+        preview.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+    }
+}
+
+fn malformed_responses_stream_error(
+    status: u16,
+    content_type: &str,
+    preview: &[u8],
+) -> ProviderError {
+    let mut message = format!(
+        "empty or malformed Responses API stream from upstream (content-type: {content_type})"
+    );
+    let preview = String::from_utf8_lossy(preview);
+    let preview = preview.trim();
+    if preview.is_empty() {
+        message.push_str("; response body was empty");
+    } else {
+        message.push_str("; response preview: ");
+        message.push_str(preview);
+    }
+    message.push_str("; check for a proxy or gateway intercepting the request");
+
+    ProviderError::UpstreamError {
+        status,
+        body: message,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenBlock {
+    Text(u32),
+    Thinking(u32),
+}
+
+/// Removes the empty HTML comment that Codex may use as a separator between
+/// reasoning summary parts. The marker can be split across arbitrary SSE
+/// deltas, so only a possible standalone marker at the start of a line is
+/// buffered. Normal summary text continues to stream immediately.
+struct ReasoningSummaryFilter {
+    at_line_start: bool,
+    candidate: String,
+}
+
+impl Default for ReasoningSummaryFilter {
+    fn default() -> Self {
+        Self {
+            at_line_start: true,
+            candidate: String::new(),
+        }
+    }
+}
+
+impl ReasoningSummaryFilter {
+    fn push(&mut self, text: &str) -> String {
+        let mut output = String::with_capacity(text.len());
+
+        for ch in text.chars() {
+            if !self.at_line_start {
+                output.push(ch);
+                if ch == '\n' {
+                    self.at_line_start = true;
+                }
+                continue;
+            }
+
+            self.candidate.push(ch);
+            if ch == '\n' {
+                if !is_blank_reasoning_summary_comment_line(&self.candidate) {
+                    output.push_str(&self.candidate);
+                }
+                self.candidate.clear();
+            } else if !could_be_blank_reasoning_summary_comment_line(&self.candidate) {
+                output.push_str(&self.candidate);
+                self.candidate.clear();
+                self.at_line_start = false;
+            }
+        }
+
+        output
+    }
+
+    fn finish(&mut self) -> String {
+        let candidate = std::mem::take(&mut self.candidate);
+        self.at_line_start = true;
+
+        if candidate.trim().is_empty()
+            || is_blank_reasoning_summary_comment_line(&candidate)
+            || is_incomplete_blank_reasoning_summary_comment(&candidate)
+        {
+            String::new()
+        } else {
+            candidate
+        }
+    }
+}
+
+fn is_blank_reasoning_summary_comment_line(line: &str) -> bool {
+    let line = line.trim_matches(|ch| matches!(ch, ' ' | '\t' | '\r' | '\n'));
+    let Some(inner) = line
+        .strip_prefix("<!--")
+        .and_then(|line| line.strip_suffix("-->"))
+    else {
+        return false;
+    };
+
+    inner.chars().all(|ch| matches!(ch, ' ' | '\t'))
+}
+
+fn could_be_blank_reasoning_summary_comment_line(candidate: &str) -> bool {
+    let candidate = candidate.trim_start_matches([' ', '\t']);
+    if candidate.is_empty() || "<!--".starts_with(candidate) {
+        return true;
+    }
+
+    let Some(after_open) = candidate.strip_prefix("<!--") else {
+        return false;
+    };
+    let after_open = after_open.trim_start_matches([' ', '\t']);
+    if after_open.is_empty() || "-->".starts_with(after_open) {
+        return true;
+    }
+
+    let Some(after_close) = after_open.strip_prefix("-->") else {
+        return false;
+    };
+    after_close
+        .chars()
+        .all(|ch| matches!(ch, ' ' | '\t' | '\r'))
+}
+
+fn is_incomplete_blank_reasoning_summary_comment(candidate: &str) -> bool {
+    candidate
+        .trim_start_matches([' ', '\t'])
+        .starts_with("<!--")
+        && could_be_blank_reasoning_summary_comment_line(candidate)
+}
+
+fn strip_blank_reasoning_summary_comment_lines(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut removed = false;
+
+    for line in text.split_inclusive('\n') {
+        if is_blank_reasoning_summary_comment_line(line) {
+            removed = true;
+        } else {
+            output.push_str(line);
+        }
+    }
+
+    if removed {
+        output.truncate(output.trim_end().len());
+        output
+    } else {
+        text.to_string()
+    }
+}
+
+#[derive(Default)]
+struct ResponsesStreamConverter {
+    message_id: String,
+    model: String,
+    started: bool,
+    next_block_index: u32,
+    open_block: Option<OpenBlock>,
+    output_blocks: HashMap<(u64, u64), u32>,
+    reasoning_text: ReasoningTextSplitter,
+    reasoning_text_key: Option<(u64, u64)>,
+    reasoning_delta_buffers: HashMap<(bool, u64, u64), String>,
+    reasoning_summary_filters: HashMap<(u64, u64), ReasoningSummaryFilter>,
+    reasoning_summary_emitted: HashSet<(u64, u64)>,
+    function_blocks: HashMap<u64, u32>,
+    function_names: HashMap<u64, String>,
+    function_call_ids: HashMap<u64, String>,
+    function_argument_buffers: HashMap<u64, String>,
+    function_argument_emitted: HashMap<u64, String>,
+    function_queue: VecDeque<u64>,
+    function_done: HashSet<u64>,
+    function_completed: HashSet<u64>,
+    function_custom: HashSet<u64>,
+    custom_tool_input_buffers: HashMap<u64, String>,
+    custom_tool_input_raw_emitted: HashMap<u64, usize>,
+    active_function: Option<u64>,
+    tool_aliases: HashMap<String, u64>,
+    deferred_events: Vec<Value>,
+    allow_incomplete_tool_metadata: bool,
+    custom_tool_input_open: HashSet<u64>,
+    custom_tool_input_emitted: HashSet<u64>,
+    saw_function_call: bool,
+    reasoning_signatures: HashMap<u64, String>,
+    reasoning_completed: HashSet<u64>,
+    current_reasoning_output: Option<u64>,
+    web_search_completed: HashSet<String>,
+    correlation: ResponsesCorrelation,
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_creation_input_tokens: u32,
+    cache_read_input_tokens: u32,
+    stopped: bool,
+}
+
+impl ResponsesStreamConverter {
+    #[cfg(test)]
+    fn new() -> Self {
+        Self::with_marker_mode(ReasoningMarkerMode::Strict)
+    }
+
+    #[cfg(test)]
+    fn with_marker_mode(marker_mode: ReasoningMarkerMode) -> Self {
+        Self::with_context(marker_mode, ResponsesCorrelation::default())
+    }
+
+    fn with_context(marker_mode: ReasoningMarkerMode, correlation: ResponsesCorrelation) -> Self {
+        Self {
+            message_id: format!("msg_{}", uuid::Uuid::new_v4().to_string().replace('-', "")),
+            reasoning_text: ReasoningTextSplitter::new(marker_mode),
+            correlation,
+            ..Default::default()
+        }
+    }
+
+    fn process_event(&mut self, event: &Value) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        let event_type = event["type"].as_str().unwrap_or_default();
+
+        if !self.function_queue.is_empty() && !is_tool_protocol_event(event_type, event) {
+            self.deferred_events.push(event.clone());
+            return events;
+        }
+
+        match event_type {
+            "response.created" | "response.in_progress" => {
+                if let Some(response) = event.get("response") {
+                    self.ensure_started(response, &mut events);
+                }
+            }
+            "response.output_item.added" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                self.handle_output_item_added(event, &mut events);
+            }
+            "response.content_part.added" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                self.handle_content_part_added(event, &mut events);
+            }
+            "response.output_text.delta" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                let output_index = event["output_index"].as_u64().unwrap_or(0);
+                let content_index = event["content_index"].as_u64().unwrap_or(0);
+                let delta = event["delta"].as_str().unwrap_or_default();
+                if !delta.is_empty() {
+                    self.emit_text_stream(output_index, content_index, delta, &mut events);
+                }
+            }
+            "response.refusal.delta" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                let output_index = event["output_index"].as_u64().unwrap_or(0);
+                let content_index = event["content_index"].as_u64().unwrap_or(0);
+                let delta = event["delta"].as_str().unwrap_or_default();
+                if !delta.is_empty() {
+                    self.emit_text_stream(output_index, content_index, delta, &mut events);
+                }
+            }
+            "response.reasoning_summary_text.delta" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                let delta = event["delta"].as_str().unwrap_or_default();
+                self.emit_reasoning_summary_stream_text(event, delta, false, &mut events);
+            }
+            "response.reasoning_summary_text.done" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                let text = event["text"].as_str().unwrap_or_default();
+                self.emit_reasoning_summary_stream_text(event, text, true, &mut events);
+            }
+            "response.reasoning_text.delta" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                let delta = event["delta"].as_str().unwrap_or_default();
+                self.emit_reasoning_stream_text(event_type, event, delta, false, &mut events);
+            }
+            "response.reasoning_text.done" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                let text = event["text"].as_str().unwrap_or_default();
+                self.emit_reasoning_stream_text(event_type, event, text, true, &mut events);
+            }
+            "response.reasoning_summary_part.added" | "response.reasoning_summary_part.done" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                let text = event["part"]["text"].as_str().unwrap_or_default();
+                self.emit_reasoning_summary_stream_text(
+                    event,
+                    text,
+                    event_type.ends_with(".done"),
+                    &mut events,
+                );
+            }
+            "response.function_call_arguments.delta" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                self.flush_reasoning_text(&mut events);
+                let output_index = self.tool_output_index(event);
+                let delta = event["delta"].as_str().unwrap_or_default();
+                if !delta.is_empty() {
+                    self.remember_tool_call_metadata(output_index, event);
+                    self.enqueue_function(output_index, false);
+                    self.function_argument_buffers
+                        .entry(output_index)
+                        .or_default()
+                        .push_str(delta);
+                    self.drain_function_queue(&mut events);
+                }
+            }
+            "response.function_call_arguments.done" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                self.flush_reasoning_text(&mut events);
+                self.handle_function_call_arguments_done(event, &mut events);
+            }
+            "response.custom_tool_call_input.delta" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                self.flush_reasoning_text(&mut events);
+                self.handle_custom_tool_call_input_delta(event, &mut events);
+            }
+            "response.custom_tool_call_input.done" => {
+                self.ensure_started(event.get("response").unwrap_or(event), &mut events);
+                self.flush_reasoning_text(&mut events);
+                self.handle_custom_tool_call_input_done(event, &mut events);
+            }
+            "response.output_item.done" => {
+                self.flush_reasoning_text(&mut events);
+                self.handle_output_item_done(event, &mut events);
+            }
+            "response.completed" | "response.incomplete" | "response.failed" => {
+                if let Some(response) = event.get("response") {
+                    self.ensure_started(response, &mut events);
+                    self.set_usage(response);
+                    self.recover_terminal_tool_calls(response);
+                    self.allow_incomplete_tool_metadata = true;
+                    self.function_done
+                        .extend(self.function_queue.iter().copied());
+                    self.drain_function_queue(&mut events);
+                    self.replay_deferred_events(&mut events);
+                    self.recover_terminal_native_items(response, &mut events);
+                    self.flush_reasoning_text(&mut events);
+                    self.stop_response(response, &mut events);
+                }
+            }
+            _ => {}
+        }
+
+        if self.function_queue.is_empty() && !self.deferred_events.is_empty() && !self.stopped {
+            self.replay_deferred_events(&mut events);
+        }
+
+        events
+    }
+
+    fn finish(&mut self) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        if self.started && !self.stopped {
+            self.allow_incomplete_tool_metadata = true;
+            self.function_done
+                .extend(self.function_queue.iter().copied());
+            self.drain_function_queue(&mut events);
+            self.replay_deferred_events(&mut events);
+            self.flush_reasoning_text(&mut events);
+            self.close_open_block(&mut events);
+            self.stop_with_reason("end_turn", &mut events);
+        }
+        events
+    }
+
+    fn ensure_started(&mut self, response: &Value, events: &mut Vec<SseEvent>) {
+        if self.started {
+            return;
+        }
+
+        self.model = response["model"].as_str().unwrap_or("unknown").to_string();
+        if let Some(id) = response["id"].as_str() {
+            self.message_id = id.replace("resp_", "msg_");
+        }
+        self.set_usage(response);
+
+        events.push(SseEvent {
+            event: "message_start".to_string(),
+            data: json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": self.model,
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": responses_usage_json(
+                        self.input_tokens,
+                        0,
+                        self.cache_creation_input_tokens,
+                        self.cache_read_input_tokens,
+                    )
+                }
+            }),
+        });
+        self.started = true;
+    }
+
+    fn handle_output_item_added(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
+        let output_index = event["output_index"].as_u64().unwrap_or(0);
+        let item = &event["item"];
+        if is_responses_tool_call_type(item["type"].as_str()) {
+            self.flush_reasoning_text(events);
+            self.saw_function_call = true;
+            self.remember_tool_call_metadata(output_index, event);
+            self.enqueue_function(
+                output_index,
+                item["type"].as_str() == Some("custom_tool_call"),
+            );
+            self.drain_function_queue(events);
+        } else if item["type"].as_str() == Some("reasoning") {
+            self.begin_reasoning_item(output_index, item, events);
+        }
+    }
+
+    fn handle_content_part_added(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
+        let output_index = event["output_index"].as_u64().unwrap_or(0);
+        let content_index = event["content_index"].as_u64().unwrap_or(0);
+        let part = &event["part"];
+        match part["type"].as_str() {
+            Some("output_text") => {
+                if let Some(text) = part["text"].as_str()
+                    && !text.is_empty()
+                {
+                    self.emit_text_stream(output_index, content_index, text, events);
+                }
+            }
+            Some("refusal") => {
+                if let Some(text) = part["refusal"].as_str()
+                    && !text.is_empty()
+                {
+                    self.emit_text_stream(output_index, content_index, text, events);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn emit_reasoning_stream_text(
+        &mut self,
+        event_type: &str,
+        event: &Value,
+        text: &str,
+        final_text: bool,
+        events: &mut Vec<SseEvent>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+
+        self.flush_reasoning_text(events);
+        let key = reasoning_stream_key(event_type, event);
+        self.prepare_reasoning_output(key.1, events);
+        let previous = self
+            .reasoning_delta_buffers
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let delta = if final_text {
+            if previous.is_empty() {
+                text
+            } else {
+                text.strip_prefix(&previous).unwrap_or_default()
+            }
+        } else {
+            text
+        };
+        if delta.is_empty() {
+            return;
+        }
+
+        if previous.is_empty()
+            && key.0
+            && matches!(self.open_block, Some(OpenBlock::Thinking(_)))
+            && self
+                .reasoning_delta_buffers
+                .keys()
+                .any(|(is_summary, _, _)| *is_summary)
+        {
+            self.emit_thinking_content("\n", events);
+        }
+        self.emit_thinking_content(delta, events);
+
+        let buffer = self.reasoning_delta_buffers.entry(key).or_default();
+        if final_text {
+            *buffer = text.to_string();
+        } else {
+            buffer.push_str(text);
+        }
+    }
+
+    fn emit_reasoning_summary_stream_text(
+        &mut self,
+        event: &Value,
+        text: &str,
+        final_text: bool,
+        events: &mut Vec<SseEvent>,
+    ) {
+        if text.is_empty() && !final_text {
+            return;
+        }
+
+        self.flush_reasoning_text(events);
+        let key = reasoning_stream_key("response.reasoning_summary_text.delta", event);
+        self.prepare_reasoning_output(key.1, events);
+        let previous = self
+            .reasoning_delta_buffers
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        let raw_delta = if final_text {
+            if previous.is_empty() {
+                text
+            } else {
+                text.strip_prefix(&previous).unwrap_or_default()
+            }
+        } else {
+            text
+        };
+
+        let filter_key = (key.1, key.2);
+        let mut delta = {
+            let filter = self
+                .reasoning_summary_filters
+                .entry(filter_key)
+                .or_default();
+            let mut delta = filter.push(raw_delta);
+            if final_text {
+                delta.push_str(&filter.finish());
+            }
+            delta
+        };
+        if final_text {
+            self.reasoning_summary_filters.remove(&filter_key);
+        }
+
+        if !text.is_empty() {
+            let buffer = self.reasoning_delta_buffers.entry(key).or_default();
+            if final_text {
+                *buffer = text.to_string();
+            } else {
+                buffer.push_str(text);
+            }
+        }
+
+        if delta.is_empty() {
+            return;
+        }
+
+        if !self.reasoning_summary_emitted.contains(&filter_key)
+            && matches!(self.open_block, Some(OpenBlock::Thinking(_)))
+            && self
+                .reasoning_summary_emitted
+                .iter()
+                .any(|summary_key| *summary_key != filter_key)
+        {
+            delta.insert(0, '\n');
+        }
+        self.emit_thinking_content(&delta, events);
+        self.reasoning_summary_emitted.insert(filter_key);
+    }
+
+    fn emit_text_delta(
+        &mut self,
+        output_index: u64,
+        content_index: u64,
+        text: &str,
+        events: &mut Vec<SseEvent>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+
+        let idx = self.ensure_text_block(output_index, content_index, events);
+        events.push(content_delta(idx, "text_delta", "text", text));
+    }
+
+    fn handle_output_item_done(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
+        let output_index = self.tool_output_index(event);
+        let item = &event["item"];
+        match item["type"].as_str() {
+            Some("function_call") => {
+                self.saw_function_call = true;
+                self.remember_tool_call_metadata(output_index, event);
+                self.enqueue_function(output_index, false);
+                if let Some(arguments) = item["arguments"].as_str() {
+                    self.function_argument_buffers
+                        .insert(output_index, arguments.to_string());
+                }
+                self.function_done.insert(output_index);
+                self.drain_function_queue(events);
+            }
+            Some("custom_tool_call") => {
+                self.saw_function_call = true;
+                self.remember_tool_call_metadata(output_index, event);
+                self.enqueue_function(output_index, true);
+                if let Some(input) = item["input"].as_str() {
+                    self.custom_tool_input_buffers
+                        .insert(output_index, input.to_string());
+                }
+                self.function_done.insert(output_index);
+                self.drain_function_queue(events);
+            }
+            Some("reasoning") => self.finish_reasoning_item(output_index, item, events),
+            Some("web_search_call") => self.emit_web_search_blocks(item, events),
+            _ => {}
+        }
+    }
+
+    fn handle_function_call_arguments_done(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
+        let output_index = self.tool_output_index(event);
+        self.saw_function_call = true;
+        self.remember_tool_call_metadata(output_index, event);
+        self.enqueue_function(output_index, false);
+        if let Some(arguments) = event["arguments"].as_str() {
+            self.function_argument_buffers
+                .insert(output_index, arguments.to_string());
+        }
+        self.function_done.insert(output_index);
+        self.drain_function_queue(events);
+    }
+
+    fn handle_custom_tool_call_input_delta(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
+        let output_index = self.tool_output_index(event);
+        let delta = event["delta"].as_str().unwrap_or_default();
+        if delta.is_empty() {
+            return;
+        }
+
+        self.saw_function_call = true;
+        self.remember_tool_call_metadata(output_index, event);
+        self.enqueue_function(output_index, true);
+        self.custom_tool_input_buffers
+            .entry(output_index)
+            .or_default()
+            .push_str(delta);
+        self.drain_function_queue(events);
+    }
+
+    fn handle_custom_tool_call_input_done(&mut self, event: &Value, events: &mut Vec<SseEvent>) {
+        let output_index = self.tool_output_index(event);
+        self.saw_function_call = true;
+        self.remember_tool_call_metadata(output_index, event);
+        self.enqueue_function(output_index, true);
+        if let Some(input) = event["input"].as_str() {
+            self.custom_tool_input_buffers
+                .insert(output_index, input.to_string());
+        }
+        self.function_done.insert(output_index);
+        self.drain_function_queue(events);
+    }
+
+    fn remember_tool_call_metadata(&mut self, output_index: u64, event: &Value) {
+        let item = &event["item"];
+        if let Some(name) = item["name"].as_str().or_else(|| event["name"].as_str()) {
+            self.function_names.insert(output_index, name.to_string());
+        }
+        if let Some(call_id) = item["call_id"]
+            .as_str()
+            .or_else(|| event["call_id"].as_str())
+            .or_else(|| item["id"].as_str())
+            .or_else(|| event["item_id"].as_str())
+        {
+            self.function_call_ids
+                .insert(output_index, call_id.to_string());
+        }
+        for alias in [
+            item["id"].as_str(),
+            item["call_id"].as_str(),
+            event["item_id"].as_str(),
+            event["call_id"].as_str(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.tool_aliases.insert(alias.to_string(), output_index);
+        }
+    }
+
+    fn tool_output_index(&self, event: &Value) -> u64 {
+        event["output_index"].as_u64().unwrap_or_else(|| {
+            [
+                event["item_id"].as_str(),
+                event["call_id"].as_str(),
+                event["item"]["id"].as_str(),
+                event["item"]["call_id"].as_str(),
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(|alias| self.tool_aliases.get(alias).copied())
+            .unwrap_or(0)
+        })
+    }
+
+    fn enqueue_function(&mut self, output_index: u64, custom: bool) {
+        if self.function_completed.contains(&output_index)
+            || self.function_queue.contains(&output_index)
+        {
+            return;
+        }
+        self.function_queue.push_back(output_index);
+        if custom {
+            self.function_custom.insert(output_index);
+        }
+    }
+
+    fn drain_function_queue(&mut self, events: &mut Vec<SseEvent>) {
+        loop {
+            let Some(&output_index) = self.function_queue.front() else {
+                self.active_function = None;
+                return;
+            };
+            let done = self.function_done.contains(&output_index);
+            let metadata_ready = self
+                .function_names
+                .get(&output_index)
+                .is_some_and(|name| !name.is_empty());
+            if !(metadata_ready || done && self.allow_incomplete_tool_metadata) {
+                return;
+            }
+
+            if self.active_function != Some(output_index) {
+                self.active_function = Some(output_index);
+                let synthetic = json!({});
+                self.ensure_function_block(output_index, &synthetic, events);
+            }
+            let Some(&idx) = self.function_blocks.get(&output_index) else {
+                return;
+            };
+
+            if self.function_custom.contains(&output_index) {
+                let input = self
+                    .custom_tool_input_buffers
+                    .get(&output_index)
+                    .cloned()
+                    .unwrap_or_default();
+                let emitted = self
+                    .custom_tool_input_raw_emitted
+                    .get(&output_index)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(input.len());
+                if let Some(delta) = input.get(emitted..).filter(|delta| !delta.is_empty()) {
+                    self.emit_custom_tool_input_delta(output_index, idx, delta, events);
+                    self.custom_tool_input_raw_emitted
+                        .insert(output_index, input.len());
+                }
+                if done {
+                    self.emit_custom_tool_input_done(output_index, idx, Some(&input), events);
+                }
+            } else if done {
+                self.emit_function_arguments(output_index, idx, None, false, events);
+            } else {
+                let synthetic = json!({});
+                self.emit_parseable_function_arguments(output_index, &synthetic, events);
+            }
+
+            if !done {
+                return;
+            }
+            self.close_function_block(output_index, idx, events);
+            self.function_queue.pop_front();
+            self.function_done.remove(&output_index);
+            self.function_custom.remove(&output_index);
+            self.custom_tool_input_buffers.remove(&output_index);
+            self.custom_tool_input_raw_emitted.remove(&output_index);
+            self.function_completed.insert(output_index);
+            self.active_function = None;
+        }
+    }
+
+    fn recover_terminal_tool_calls(&mut self, response: &Value) {
+        let Some(output) = response["output"].as_array() else {
+            return;
+        };
+        for (position, item) in output.iter().enumerate() {
+            let Some(item_type) = item["type"].as_str() else {
+                continue;
+            };
+            if !is_responses_tool_call_type(Some(item_type)) {
+                continue;
+            }
+            let output_index = item["output_index"].as_u64().unwrap_or(position as u64);
+            if self.function_completed.contains(&output_index) {
+                continue;
+            }
+            let event = json!({"output_index": output_index, "item": item});
+            self.remember_tool_call_metadata(output_index, &event);
+            self.enqueue_function(output_index, item_type == "custom_tool_call");
+            if item_type == "custom_tool_call" {
+                if let Some(input) = item["input"].as_str() {
+                    self.custom_tool_input_buffers
+                        .insert(output_index, input.to_string());
+                }
+            } else if let Some(arguments) = item["arguments"].as_str() {
+                self.function_argument_buffers
+                    .insert(output_index, arguments.to_string());
+            }
+            self.function_done.insert(output_index);
+        }
+    }
+
+    fn recover_terminal_native_items(&mut self, response: &Value, events: &mut Vec<SseEvent>) {
+        let Some(output) = response["output"].as_array() else {
+            return;
+        };
+        for (position, item) in output.iter().enumerate() {
+            let output_index = item["output_index"].as_u64().unwrap_or(position as u64);
+            match item["type"].as_str() {
+                Some("reasoning") if !self.reasoning_completed.contains(&output_index) => {
+                    self.finish_reasoning_item(output_index, item, events);
+                }
+                Some("web_search_call") => self.emit_web_search_blocks(item, events),
+                _ => {}
+            }
+        }
+    }
+
+    fn replay_deferred_events(&mut self, events: &mut Vec<SseEvent>) {
+        if !self.function_queue.is_empty() || self.deferred_events.is_empty() {
+            return;
+        }
+        let deferred = std::mem::take(&mut self.deferred_events);
+        for event in deferred {
+            events.extend(self.process_event(&event));
+        }
+    }
+
+    fn emit_parseable_function_arguments(
+        &mut self,
+        output_index: u64,
+        event: &Value,
+        events: &mut Vec<SseEvent>,
+    ) {
+        let Some(arguments) = self.function_argument_buffers.get(&output_index) else {
+            return;
+        };
+        if serde_json::from_str::<Value>(arguments).is_err() {
+            return;
+        }
+        let idx = self.ensure_function_block(output_index, event, events);
+        self.emit_function_arguments(output_index, idx, None, true, events);
+    }
+
+    fn emit_custom_tool_input_delta(
+        &mut self,
+        output_index: u64,
+        idx: u32,
+        delta: &str,
+        events: &mut Vec<SseEvent>,
+    ) {
+        if self.custom_tool_input_open.insert(output_index) {
+            let prefix = match self.function_names.get(&output_index).map(String::as_str) {
+                Some("Bash") => "{\"command\":\"",
+                _ => "{\"input\":\"",
+            };
+            Self::push_function_arguments_delta(idx, prefix, events);
+        }
+        self.custom_tool_input_emitted.insert(output_index);
+        Self::push_function_arguments_delta(idx, &json_string_fragment(delta), events);
+    }
+
+    fn emit_custom_tool_input_done(
+        &mut self,
+        output_index: u64,
+        idx: u32,
+        input: Option<&str>,
+        events: &mut Vec<SseEvent>,
+    ) {
+        if self.close_custom_tool_input_if_open(output_index, idx, events) {
+            return;
+        }
+        if self.custom_tool_input_emitted.contains(&output_index) {
+            return;
+        }
+        let Some(input) = input else {
+            return;
+        };
+        let arguments = self
+            .function_names
+            .get(&output_index)
+            .map(String::as_str)
+            .map(|name| custom_tool_input_arguments(name, input))
+            .unwrap_or_else(|| custom_tool_input_arguments("", input));
+        Self::push_function_arguments_delta(idx, &arguments, events);
+        self.custom_tool_input_emitted.insert(output_index);
+    }
+
+    fn close_custom_tool_input_if_open(
+        &mut self,
+        output_index: u64,
+        idx: u32,
+        events: &mut Vec<SseEvent>,
+    ) -> bool {
+        if !self.custom_tool_input_open.remove(&output_index) {
+            return false;
+        }
+        let suffix = match self.function_names.get(&output_index).map(String::as_str) {
+            Some("Bash") => "\",\"description\":\"\"}",
+            _ => "\"}",
+        };
+        Self::push_function_arguments_delta(idx, suffix, events);
+        self.custom_tool_input_emitted.insert(output_index);
+        true
+    }
+
+    fn emit_function_arguments(
+        &mut self,
+        output_index: u64,
+        idx: u32,
+        final_arguments: Option<&str>,
+        require_valid_json: bool,
+        events: &mut Vec<SseEvent>,
+    ) {
+        let Some(arguments) = final_arguments
+            .filter(|arguments| !arguments.is_empty())
+            .or_else(|| {
+                self.function_argument_buffers
+                    .get(&output_index)
+                    .map(String::as_str)
+            })
+        else {
+            return;
+        };
+        if arguments.is_empty() {
+            return;
+        }
+
+        if require_valid_json && serde_json::from_str::<Value>(arguments).is_err() {
+            return;
+        }
+
+        let sanitized = self
+            .function_names
+            .get(&output_index)
+            .and_then(|name| sanitize_tool_arguments(name, arguments))
+            .map(Cow::Owned)
+            .unwrap_or(Cow::Borrowed(arguments));
+        let previous = self
+            .function_argument_emitted
+            .get(&output_index)
+            .map(String::as_str)
+            .unwrap_or("");
+        if sanitized.as_ref() == previous {
+            return;
+        }
+        if let Some(delta) = sanitized.strip_prefix(previous) {
+            Self::push_function_arguments_delta(idx, delta, events);
+            self.function_argument_emitted
+                .insert(output_index, sanitized.into_owned());
+        } else if previous.is_empty() {
+            Self::push_function_arguments_delta(idx, sanitized.as_ref(), events);
+            self.function_argument_emitted
+                .insert(output_index, sanitized.into_owned());
+        }
+    }
+
+    fn push_function_arguments_delta(idx: u32, arguments: &str, events: &mut Vec<SseEvent>) {
+        events.push(SseEvent {
+            event: "content_block_delta".to_string(),
+            data: json!({
+                "type": "content_block_delta",
+                "index": idx,
+                "delta": {"type": "input_json_delta", "partial_json": arguments}
+            }),
+        });
+    }
+
+    fn emit_text_stream(
+        &mut self,
+        output_index: u64,
+        content_index: u64,
+        text: &str,
+        events: &mut Vec<SseEvent>,
+    ) {
+        let key = (output_index, content_index);
+        if self.reasoning_text_key != Some(key) {
+            self.flush_reasoning_text(events);
+            self.reasoning_text_key = Some(key);
+        }
+        for segment in self.reasoning_text.push(text) {
+            self.emit_text_segment(key, segment, events);
+        }
+    }
+
+    fn flush_reasoning_text(&mut self, events: &mut Vec<SseEvent>) {
+        let key = self.reasoning_text_key.take();
+        for segment in self.reasoning_text.finish() {
+            if let Some(key) = key {
+                self.emit_text_segment(key, segment, events);
+            } else if let TextSegment::Reasoning(thinking) = segment {
+                self.emit_thinking_content(&thinking, events);
+            }
+        }
+    }
+
+    fn emit_text_segment(
+        &mut self,
+        (output_index, content_index): (u64, u64),
+        segment: TextSegment,
+        events: &mut Vec<SseEvent>,
+    ) {
+        match segment {
+            TextSegment::Text(text) => {
+                self.emit_text_delta(output_index, content_index, &text, events);
+            }
+            TextSegment::Reasoning(thinking) => {
+                self.emit_thinking_content(&thinking, events);
+            }
+        }
+    }
+
+    fn emit_thinking_content(&mut self, thinking: &str, events: &mut Vec<SseEvent>) {
+        if thinking.is_empty() {
+            return;
+        }
+        let idx = self.ensure_thinking_block(events);
+        events.push(content_delta(idx, "thinking_delta", "thinking", thinking));
+    }
+
+    fn begin_reasoning_item(
+        &mut self,
+        output_index: u64,
+        item: &Value,
+        events: &mut Vec<SseEvent>,
+    ) {
+        self.prepare_reasoning_output(output_index, events);
+        if let Some(signature) = item["encrypted_content"]
+            .as_str()
+            .filter(|signature| is_gpt_signature(signature))
+        {
+            self.reasoning_signatures
+                .insert(output_index, signature.to_string());
+        }
+    }
+
+    fn prepare_reasoning_output(&mut self, output_index: u64, events: &mut Vec<SseEvent>) {
+        if self.current_reasoning_output == Some(output_index) {
+            return;
+        }
+        if matches!(self.open_block, Some(OpenBlock::Thinking(_))) {
+            self.close_open_block(events);
+        }
+        self.current_reasoning_output = Some(output_index);
+    }
+
+    fn finish_reasoning_item(
+        &mut self,
+        output_index: u64,
+        item: &Value,
+        events: &mut Vec<SseEvent>,
+    ) {
+        self.prepare_reasoning_output(output_index, events);
+        if let Some(signature) = item["encrypted_content"]
+            .as_str()
+            .filter(|signature| is_gpt_signature(signature))
+        {
+            self.reasoning_signatures
+                .insert(output_index, signature.to_string());
+        }
+
+        let has_summary = self
+            .reasoning_summary_emitted
+            .iter()
+            .any(|(index, _)| *index == output_index);
+        if !has_summary && let Some(summary) = item["summary"].as_array() {
+            for part in summary {
+                if let Some(text) = part["text"].as_str() {
+                    let text = strip_blank_reasoning_summary_comment_lines(text);
+                    if !text.is_empty() {
+                        self.emit_thinking_content(&text, events);
+                    }
+                }
+            }
+        }
+
+        if let Some(signature) = self.reasoning_signatures.remove(&output_index) {
+            let idx = self.ensure_thinking_block(events);
+            events.push(content_delta(
+                idx,
+                "signature_delta",
+                "signature",
+                &signature,
+            ));
+        }
+        if matches!(self.open_block, Some(OpenBlock::Thinking(_))) {
+            self.close_open_block(events);
+        }
+        self.reasoning_completed.insert(output_index);
+        self.current_reasoning_output = None;
+    }
+
+    fn emit_web_search_blocks(&mut self, item: &Value, events: &mut Vec<SseEvent>) {
+        self.close_open_block(events);
+        let id = item["id"]
+            .as_str()
+            .or_else(|| item["call_id"].as_str())
+            .unwrap_or("web_search_unknown");
+        if !self.web_search_completed.insert(id.to_string()) {
+            return;
+        }
+        let query = item["action"]["query"]
+            .as_str()
+            .or_else(|| item["query"].as_str())
+            .unwrap_or_default();
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": id,
+                    "name": "web_search",
+                    "input": {}
+                }
+            }),
+        });
+        if !query.is_empty() {
+            events.push(content_delta(
+                idx,
+                "input_json_delta",
+                "partial_json",
+                &json!({"query": query}).to_string(),
+            ));
+        }
+        events.push(block_stop(idx));
+
+        let content = web_search_result_content(item);
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": id,
+                    "content": content
+                }
+            }),
+        });
+        events.push(block_stop(idx));
+    }
+
+    fn ensure_text_block(
+        &mut self,
+        output_index: u64,
+        content_index: u64,
+        events: &mut Vec<SseEvent>,
+    ) -> u32 {
+        if let Some(&idx) = self.output_blocks.get(&(output_index, content_index)) {
+            if self.open_block != Some(OpenBlock::Text(idx)) {
+                self.close_open_block(events);
+                self.open_block = Some(OpenBlock::Text(idx));
+            }
+            return idx;
+        }
+
+        self.close_open_block(events);
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        self.output_blocks
+            .insert((output_index, content_index), idx);
+        self.open_block = Some(OpenBlock::Text(idx));
+        events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        });
+        idx
+    }
+
+    fn ensure_thinking_block(&mut self, events: &mut Vec<SseEvent>) -> u32 {
+        if let Some(OpenBlock::Thinking(idx)) = self.open_block {
+            return idx;
+        }
+
+        self.close_open_block(events);
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        self.open_block = Some(OpenBlock::Thinking(idx));
+        events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "thinking", "thinking": ""}
+            }),
+        });
+        idx
+    }
+
+    fn ensure_function_block(
+        &mut self,
+        output_index: u64,
+        event: &Value,
+        events: &mut Vec<SseEvent>,
+    ) -> u32 {
+        if let Some(&idx) = self.function_blocks.get(&output_index) {
+            return idx;
+        }
+
+        self.flush_reasoning_text(events);
+        self.close_open_block(events);
+        let item = &event["item"];
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        self.function_blocks.insert(output_index, idx);
+        let call_id = item["call_id"]
+            .as_str()
+            .or_else(|| item["id"].as_str())
+            .or_else(|| event["call_id"].as_str())
+            .or_else(|| event["item_id"].as_str())
+            .map(str::to_string)
+            .or_else(|| self.function_call_ids.get(&output_index).cloned())
+            .unwrap_or_else(|| format!("call_{}", uuid::Uuid::new_v4()));
+        let name = item["name"]
+            .as_str()
+            .or_else(|| event["name"].as_str())
+            .map(str::to_string)
+            .or_else(|| self.function_names.get(&output_index).cloned())
+            .unwrap_or_default();
+        let call_id = self.correlation.anthropic_call_id(&call_id).to_string();
+        let name = self.correlation.anthropic_tool_name(&name).to_string();
+        events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": {}
+                }
+            }),
+        });
+        idx
+    }
+
+    fn close_open_block(&mut self, events: &mut Vec<SseEvent>) {
+        if let Some(block) = self.open_block.take() {
+            let idx = match block {
+                OpenBlock::Text(idx) => {
+                    self.output_blocks.retain(|_, block_idx| *block_idx != idx);
+                    idx
+                }
+                OpenBlock::Thinking(idx) => idx,
+            };
+            events.push(block_stop(idx));
+        }
+    }
+
+    fn stop_response(&mut self, response: &Value, events: &mut Vec<SseEvent>) {
+        if self.stopped {
+            return;
+        }
+        self.flush_reasoning_text(events);
+        self.close_open_block(events);
+        self.close_function_blocks(events);
+        let reason = response_stop_reason(response, self.saw_function_call);
+        self.stop_with_reason(reason, events);
+    }
+
+    fn close_function_blocks(&mut self, events: &mut Vec<SseEvent>) {
+        let blocks = std::mem::take(&mut self.function_blocks);
+        for (output_index, idx) in blocks {
+            self.close_custom_tool_input_if_open(output_index, idx, events);
+            self.emit_function_arguments(output_index, idx, None, false, events);
+            events.push(block_stop(idx));
+        }
+        self.function_argument_buffers.clear();
+        self.function_argument_emitted.clear();
+        self.custom_tool_input_open.clear();
+        self.custom_tool_input_emitted.clear();
+    }
+
+    fn close_function_block(&mut self, output_index: u64, idx: u32, events: &mut Vec<SseEvent>) {
+        self.close_custom_tool_input_if_open(output_index, idx, events);
+        events.push(block_stop(idx));
+        self.function_blocks.remove(&output_index);
+        self.function_argument_buffers.remove(&output_index);
+        self.function_argument_emitted.remove(&output_index);
+        self.custom_tool_input_open.remove(&output_index);
+        self.custom_tool_input_emitted.remove(&output_index);
+    }
+
+    fn stop_with_reason(&mut self, reason: &str, events: &mut Vec<SseEvent>) {
+        if self.stopped {
+            return;
+        }
+        events.push(SseEvent {
+            event: "message_delta".to_string(),
+            data: json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": reason, "stop_sequence": null},
+                "usage": responses_usage_json(
+                    self.input_tokens,
+                    self.output_tokens,
+                    self.cache_creation_input_tokens,
+                    self.cache_read_input_tokens,
+                )
+            }),
+        });
+        events.push(SseEvent {
+            event: "message_stop".to_string(),
+            data: json!({"type": "message_stop"}),
+        });
+        self.stopped = true;
+    }
+
+    fn set_usage(&mut self, response: &Value) {
+        if let Some(usage) = response.get("usage") {
+            let usage = provider_usage_from_responses_usage(usage);
+            self.input_tokens = u64_to_u32_saturating(usage.input_tokens);
+            self.output_tokens = u64_to_u32_saturating(usage.output_tokens);
+            self.cache_creation_input_tokens =
+                u64_to_u32_saturating(usage.cache_creation_input_tokens);
+            self.cache_read_input_tokens = u64_to_u32_saturating(usage.cache_read_input_tokens);
+        }
+    }
+}
+
+fn response_stop_reason(response: &Value, saw_function_call: bool) -> &'static str {
+    if let Some(reason) = response["stop_reason"].as_str() {
+        return match reason {
+            "max_output_tokens" | "max_tokens" | "length" => "max_tokens",
+            "tool_use" | "tool_calls" => "tool_use",
+            "stop_sequence" => "stop_sequence",
+            "content_filter" | "content_policy_violation" | "refusal" => "refusal",
+            "error" => "error",
+            _ => "end_turn",
+        };
+    }
+    if let Some(reason) = response["incomplete_details"]["reason"].as_str() {
+        return match reason {
+            "max_output_tokens" | "max_tokens" => "max_tokens",
+            "content_filter" | "content_policy_violation" => "refusal",
+            _ => "end_turn",
+        };
+    }
+
+    if response["status"].as_str() == Some("failed") {
+        return "error";
+    }
+
+    if saw_function_call
+        || response["output"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| is_responses_tool_call_type(item["type"].as_str()))
+        })
+    {
+        "tool_use"
+    } else {
+        "end_turn"
+    }
+}
+
+fn is_responses_tool_call_type(item_type: Option<&str>) -> bool {
+    matches!(item_type, Some("function_call") | Some("custom_tool_call"))
+}
+
+fn is_tool_protocol_event(event_type: &str, event: &Value) -> bool {
+    match event_type {
+        "response.function_call_arguments.delta"
+        | "response.function_call_arguments.done"
+        | "response.custom_tool_call_input.delta"
+        | "response.custom_tool_call_input.done"
+        | "response.completed"
+        | "response.incomplete"
+        | "response.failed" => true,
+        "response.output_item.added" | "response.output_item.done" => {
+            is_responses_tool_call_type(event["item"]["type"].as_str())
+        }
+        _ => false,
+    }
+}
+
+fn custom_tool_input_arguments(tool_name: &str, input: &str) -> String {
+    if tool_name == "Bash" {
+        if let Ok(value) = serde_json::from_str::<Value>(input)
+            && value.get("command").is_some()
+        {
+            return value.to_string();
+        }
+        return json!({"command": input, "description": ""}).to_string();
+    }
+    json!({"input": input}).to_string()
+}
+
+fn json_string_fragment(text: &str) -> String {
+    let encoded = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+    encoded
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn reasoning_stream_key(event_type: &str, event: &Value) -> (bool, u64, u64) {
+    let is_summary = event_type.contains("reasoning_summary");
+    let output_index = event["output_index"].as_u64().unwrap_or(0);
+    let text_index = event["summary_index"]
+        .as_u64()
+        .or_else(|| event["content_index"].as_u64())
+        .unwrap_or(0);
+    (is_summary, output_index, text_index)
+}
+
+fn content_delta(index: u32, delta_type: &str, key: &str, value: &str) -> SseEvent {
+    SseEvent {
+        event: "content_block_delta".to_string(),
+        data: json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": delta_type, key: value}
+        }),
+    }
+}
+
+fn block_stop(index: u32) -> SseEvent {
+    SseEvent {
+        event: "content_block_stop".to_string(),
+        data: json!({"type": "content_block_stop", "index": index}),
+    }
+}
+
+fn web_search_result_content(item: &Value) -> Vec<Value> {
+    item["results"]
+        .as_array()
+        .or_else(|| item["action"]["sources"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|result| {
+            let url = result["url"].as_str()?;
+            Some(json!({
+                "type": "web_search_result",
+                "title": result["title"].as_str().unwrap_or(url),
+                "url": url,
+                "page_age": result.get("page_age").cloned().unwrap_or(Value::Null),
+            }))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub fn convert_non_streaming_response(data: &Value) -> Vec<SseEvent> {
+    convert_non_streaming_response_with_marker_mode(data, ReasoningMarkerMode::Strict)
+}
+
+#[cfg(test)]
+pub fn convert_non_streaming_response_with_marker_mode(
+    data: &Value,
+    marker_mode: ReasoningMarkerMode,
+) -> Vec<SseEvent> {
+    convert_non_streaming_response_with_context(data, marker_mode, ResponsesCorrelation::default())
+}
+
+pub fn convert_non_streaming_response_with_context(
+    data: &Value,
+    marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
+) -> Vec<SseEvent> {
+    let mut converter = NonStreamingResponsesConverter::new(data, marker_mode, correlation);
+    converter.convert()
+}
+
+pub fn convert_non_streaming_provider_response_with_context(
+    data: &Value,
+    marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
+) -> ProviderEvent {
+    let normalized =
+        convert_non_streaming_response_with_context(data, marker_mode, correlation.clone());
+    let response = correlation.restore_response_event(data);
+    ProviderEvent::openai_responses(
+        response_sse_event(json!({
+            "type": terminal_response_event_type(&response),
+            "response": response,
+        })),
+        normalized,
+    )
+}
+
+fn terminal_response_event_type(response: &Value) -> &'static str {
+    match response["status"].as_str() {
+        Some("incomplete") => "response.incomplete",
+        Some("failed") | Some("cancelled") => "response.failed",
+        _ => "response.completed",
+    }
+}
+
+struct NonStreamingResponsesConverter<'a> {
+    data: &'a Value,
+    events: Vec<SseEvent>,
+    next_block_index: u32,
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_creation_input_tokens: u32,
+    cache_read_input_tokens: u32,
+    marker_mode: ReasoningMarkerMode,
+    correlation: ResponsesCorrelation,
+}
+
+impl<'a> NonStreamingResponsesConverter<'a> {
+    fn new(
+        data: &'a Value,
+        marker_mode: ReasoningMarkerMode,
+        correlation: ResponsesCorrelation,
+    ) -> Self {
+        let usage = provider_usage_from_responses_usage(&data["usage"]);
+        Self {
+            data,
+            events: Vec::new(),
+            next_block_index: 0,
+            input_tokens: u64_to_u32_saturating(usage.input_tokens),
+            output_tokens: u64_to_u32_saturating(usage.output_tokens),
+            cache_creation_input_tokens: u64_to_u32_saturating(usage.cache_creation_input_tokens),
+            cache_read_input_tokens: u64_to_u32_saturating(usage.cache_read_input_tokens),
+            marker_mode,
+            correlation,
+        }
+    }
+
+    fn convert(&mut self) -> Vec<SseEvent> {
+        self.events.push(SseEvent {
+            event: "message_start".to_string(),
+            data: json!({
+                "type": "message_start",
+                "message": {
+                    "id": self.data["id"].as_str().unwrap_or("msg_response"),
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": self.data["model"].as_str().unwrap_or("unknown"),
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": responses_usage_json(
+                        self.input_tokens,
+                        0,
+                        self.cache_creation_input_tokens,
+                        self.cache_read_input_tokens,
+                    )
+                }
+            }),
+        });
+
+        if let Some(output) = self.data["output"].as_array() {
+            for item in output {
+                match item["type"].as_str() {
+                    Some("message") => self.convert_message(item),
+                    Some("function_call") => self.convert_function_call(item),
+                    Some("custom_tool_call") => self.convert_custom_tool_call(item),
+                    Some("reasoning") => self.convert_reasoning_item(item),
+                    Some("web_search_call") => self.convert_web_search_call(item),
+                    _ => {}
+                }
+            }
+        }
+
+        self.events.push(SseEvent {
+            event: "message_delta".to_string(),
+            data: json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": response_stop_reason(self.data, false), "stop_sequence": null},
+                "usage": responses_usage_json(
+                    self.input_tokens,
+                    self.output_tokens,
+                    self.cache_creation_input_tokens,
+                    self.cache_read_input_tokens,
+                )
+            }),
+        });
+        self.events.push(SseEvent {
+            event: "message_stop".to_string(),
+            data: json!({"type": "message_stop"}),
+        });
+
+        std::mem::take(&mut self.events)
+    }
+
+    fn convert_message(&mut self, item: &Value) {
+        if let Some(content) = item["content"].as_array() {
+            for part in content {
+                match part["type"].as_str() {
+                    Some("output_text") => {
+                        if let Some(text) = part["text"].as_str()
+                            && !text.is_empty()
+                        {
+                            self.add_text_block(text);
+                        }
+                    }
+                    Some("refusal") => {
+                        if let Some(text) = part["refusal"].as_str()
+                            && !text.is_empty()
+                        {
+                            self.add_text_block(text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn convert_function_call(&mut self, item: &Value) {
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        let input = item["arguments"]
+            .as_str()
+            .and_then(|args| {
+                let arguments = item["name"]
+                    .as_str()
+                    .and_then(|name| sanitize_tool_arguments(name, args))
+                    .unwrap_or_else(|| args.to_string());
+                serde_json::from_str::<Value>(&arguments).ok()
+            })
+            .unwrap_or_else(|| json!({}));
+        self.events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": self.correlation.anthropic_call_id(item["call_id"].as_str().or_else(|| item["id"].as_str()).unwrap_or("call_unknown")),
+                    "name": self.correlation.anthropic_tool_name(item["name"].as_str().unwrap_or("")),
+                    "input": input
+                }
+            }),
+        });
+        self.events.push(block_stop(idx));
+    }
+
+    fn convert_custom_tool_call(&mut self, item: &Value) {
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        let input = item["input"]
+            .as_str()
+            .map(|input| {
+                let name = item["name"].as_str().unwrap_or_default();
+                serde_json::from_str::<Value>(&custom_tool_input_arguments(name, input))
+                    .unwrap_or_else(|_| json!({}))
+            })
+            .unwrap_or_else(|| json!({}));
+        self.events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": self.correlation.anthropic_call_id(item["call_id"].as_str().or_else(|| item["id"].as_str()).unwrap_or("call_unknown")),
+                    "name": self.correlation.anthropic_tool_name(item["name"].as_str().unwrap_or("")),
+                    "input": input
+                }
+            }),
+        });
+        self.events.push(block_stop(idx));
+    }
+
+    fn convert_reasoning_item(&mut self, item: &Value) {
+        let signature = item["encrypted_content"]
+            .as_str()
+            .filter(|signature| is_gpt_signature(signature));
+        if let Some(text) = item["text"].as_str()
+            && !text.is_empty()
+        {
+            self.add_thinking_block(text, signature);
+            return;
+        }
+
+        let mut summaries = Vec::new();
+        if let Some(summary) = item["summary"].as_array() {
+            for part in summary {
+                if let Some(text) = part["text"].as_str() {
+                    let text = strip_blank_reasoning_summary_comment_lines(text);
+                    if !text.is_empty() {
+                        summaries.push(text);
+                    }
+                }
+            }
+        }
+        if !summaries.is_empty() {
+            self.add_thinking_block(&summaries.join("\n"), signature);
+        } else if signature.is_some() {
+            self.add_thinking_block("", signature);
+        }
+    }
+
+    fn convert_web_search_call(&mut self, item: &Value) {
+        let id = item["id"].as_str().unwrap_or("web_search_unknown");
+        let query = item["action"]["query"]
+            .as_str()
+            .or_else(|| item["query"].as_str())
+            .unwrap_or_default();
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        self.events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": id,
+                    "name": "web_search",
+                    "input": {"query": query}
+                }
+            }),
+        });
+        self.events.push(block_stop(idx));
+
+        let content = web_search_result_content(item);
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        self.events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": id,
+                    "content": content
+                }
+            }),
+        });
+        self.events.push(block_stop(idx));
+    }
+
+    fn add_text_block(&mut self, text: &str) {
+        for segment in split_text(text, self.marker_mode) {
+            match segment {
+                TextSegment::Text(text) => self.add_plain_text_block(&text),
+                TextSegment::Reasoning(thinking) => self.add_thinking_block(&thinking, None),
+            }
+        }
+    }
+
+    fn add_plain_text_block(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        self.events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "text", "text": ""}
+            }),
+        });
+        self.events
+            .push(content_delta(idx, "text_delta", "text", text));
+        self.events.push(block_stop(idx));
+    }
+
+    fn add_thinking_block(&mut self, text: &str, signature: Option<&str>) {
+        let idx = self.next_block_index;
+        self.next_block_index += 1;
+        self.events.push(SseEvent {
+            event: "content_block_start".to_string(),
+            data: json!({
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": "thinking", "thinking": ""}
+            }),
+        });
+        if !text.is_empty() {
+            self.events
+                .push(content_delta(idx, "thinking_delta", "thinking", text));
+        }
+        if let Some(signature) = signature {
+            self.events.push(content_delta(
+                idx,
+                "signature_delta",
+                "signature",
+                signature,
+            ));
+        }
+        self.events.push(block_stop(idx));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::provider::NativeProviderEvent;
+    use base64::Engine as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn text_deltas(events: &[SseEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "text_delta")
+                    .then(|| event.data["delta"]["text"].as_str())
+                    .flatten()
+                    .map(ToOwned::to_owned)
+            })
+            .collect()
+    }
+
+    fn thinking_deltas(events: &[SseEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "thinking_delta")
+                    .then(|| event.data["delta"]["thinking"].as_str())
+                    .flatten()
+                    .map(ToOwned::to_owned)
+            })
+            .collect()
+    }
+
+    fn fixture_sse_values(fixture: &str) -> Vec<Value> {
+        fixture.split("\n\n").filter_map(parse_sse_json).collect()
+    }
+
+    fn convert_fixture_sse(fixture: &str) -> Vec<SseEvent> {
+        let mut converter = ResponsesStreamConverter::new();
+        fixture_sse_values(fixture)
+            .iter()
+            .flat_map(|event| converter.process_event(event))
+            .collect()
+    }
+
+    fn stop_reason(events: &[SseEvent]) -> String {
+        events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .and_then(|event| event.data["delta"]["stop_reason"].as_str())
+            .expect("message_delta stop reason")
+            .to_string()
+    }
+
+    fn tool_input_delta_json(events: &[SseEvent]) -> Value {
+        let arguments = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+        serde_json::from_str(&arguments).expect("valid input_json_delta payload")
+    }
+
+    async fn response_from_body(content_type: &str, body: &str) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let content_type = content_type.to_string();
+        let body = body.to_string();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn response_from_unterminated_chunked_body(
+        content_type: &str,
+        body: &str,
+    ) -> reqwest::Response {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let content_type = content_type.to_string();
+        let body = body.to_string();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{body}\r\n",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn test_parse_sse_json_accepts_data_without_space() {
+        let value = parse_sse_json(r#"data:{"type":"response.output_text.delta"}"#).unwrap();
+        assert_eq!(value["type"], "response.output_text.delta");
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_surfaces_sse_error_event() {
+        let body = concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}\n\n",
+        );
+        let response = response_from_body("text/event-stream", body).await;
+        let mut stream = stream_responses_response(response);
+
+        let error = stream
+            .next()
+            .await
+            .expect("stream should emit error")
+            .expect_err("error SSE frame should fail the stream");
+        match error.without_upstream_metadata() {
+            ProviderError::RequestTooLarge(message) => assert_eq!(message, "too long"),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_surfaces_failed_policy_as_invalid_request() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"model\":\"gpt-5.6-sol\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-1\",\"status\":\"failed\",\"error\":{\"code\":\"bio_policy\",\"message\":\"biological safety policy\"}}}\n\n",
+        );
+        let response = response_from_body("text/event-stream", body).await;
+        let mut stream = stream_responses_response(response);
+
+        stream
+            .next()
+            .await
+            .expect("created event")
+            .expect("created event should start the message");
+        let error = stream
+            .next()
+            .await
+            .expect("failed event")
+            .expect_err("response.failed should fail the stream");
+
+        match error.without_upstream_metadata() {
+            ProviderError::InvalidRequest(message) => {
+                assert_eq!(message, "biological safety policy");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_stream_preserves_response_failed_event() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\",\"model\":\"gpt-5.6-sol\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-1\",\"status\":\"failed\",\"error\":{\"code\":\"rate_limit_exceeded\",\"message\":\"retry in 2s\"}}}\n\n",
+        );
+        let response = response_from_body("text/event-stream", body).await;
+        let mut stream =
+            stream_native_responses_response_with_provider_observer(response, None, 1024 * 1024);
+        let mut failed = None;
+
+        while let Some(event) = stream.next().await {
+            let event = event.expect("native failure must remain a protocol event");
+            if let Some(NativeProviderEvent::OpenAiResponses(native)) = event.native_event()
+                && native.event == "response.failed"
+            {
+                failed = Some(native.data.clone());
+            }
+        }
+
+        let failed = failed.expect("response.failed event");
+        assert_eq!(failed["response"]["error"]["code"], "rate_limit_exceeded");
+        assert_eq!(failed["response"]["error"]["message"], "retry in 2s");
+    }
+
+    #[test]
+    fn response_failed_event_classifies_known_error_codes() {
+        let cases = [
+            ("context_length_exceeded", "request_too_large"),
+            ("invalid_prompt", "invalid_request"),
+            ("bio_policy", "invalid_request"),
+            ("cyber_policy", "invalid_request"),
+            ("insufficient_quota", "invalid_request"),
+            ("usage_not_included", "invalid_request"),
+            ("rate_limit_exceeded", "rate_limited"),
+            ("server_error", "overloaded"),
+            ("server_is_overloaded", "overloaded"),
+            ("slow_down", "rate_limited"),
+        ];
+
+        for (code, expected) in cases {
+            let event = json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {"code": code, "message": "upstream failure"}
+                }
+            });
+            let error = responses_error_event(&event).expect("response.failed error");
+            let actual = match error.without_upstream_metadata() {
+                ProviderError::RequestTooLarge(_) => "request_too_large",
+                ProviderError::InvalidRequest(_) => "invalid_request",
+                ProviderError::RateLimited { .. } => "rate_limited",
+                ProviderError::Overloaded { .. } => "overloaded",
+                other => panic!("unexpected error for {code}: {other}"),
+            };
+            assert_eq!(actual, expected, "error code {code}");
+        }
+    }
+
+    #[test]
+    fn response_failed_event_preserves_unknown_error_payload() {
+        let event = json!({
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {"code": "new_failure", "message": "new failure shape"}
+            }
+        });
+
+        let error = responses_error_event(&event).expect("response.failed error");
+        match error.without_upstream_metadata() {
+            ProviderError::UpstreamError { status, body } => {
+                assert_eq!(*status, 200);
+                assert!(body.contains("new_failure"));
+                assert!(body.contains("new failure shape"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_reports_malformed_http_200_body() {
+        let response =
+            response_from_body("text/html", "<html><title>login required</title></html>").await;
+        let mut stream = stream_responses_response(response);
+
+        let error = stream
+            .next()
+            .await
+            .expect("malformed stream error")
+            .expect_err("malformed HTTP 200 body should not finish empty");
+
+        match error.without_upstream_metadata() {
+            ProviderError::UpstreamError { status, body } => {
+                assert_eq!(*status, 200);
+                assert!(body.contains("empty or malformed Responses API stream"));
+                assert!(body.contains("content-type: text/html"));
+                assert!(body.contains("login required"));
+                assert!(body.contains("check for a proxy or gateway"));
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_ignores_trailing_chunk_eof_after_completed_event() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        let response = response_from_unterminated_chunked_body("text/event-stream", body).await;
+        let mut stream = stream_responses_response(response);
+        let mut events = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            events.push(item.expect("completed stream should ignore trailing chunk EOF"));
+        }
+
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.data["delta"]["stop_reason"] == "end_turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_ignores_chunk_eof_after_undelimited_completed_event() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}",
+        );
+        let response = response_from_unterminated_chunked_body("text/event-stream", body).await;
+        let mut stream = stream_responses_response(response);
+        let mut events = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            events.push(item.expect("terminal frame should be flushed before chunk EOF"));
+        }
+
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.data["delta"]["stop_reason"] == "end_turn")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_ignores_chunk_eof_after_done_marker() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let response = response_from_unterminated_chunked_body("text/event-stream", body).await;
+        let mut stream = stream_responses_response(response);
+        let mut events = Vec::new();
+
+        while let Some(item) = stream.next().await {
+            events.push(item.expect("done marker should make chunk EOF terminal"));
+        }
+
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_errors_on_clean_eof_without_terminal_event() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n",
+        );
+        let response = response_from_body("text/event-stream", body).await;
+        let mut stream = stream_responses_response(response);
+        let mut saw_truncated_error = false;
+
+        while let Some(item) = stream.next().await {
+            if let Err(ProviderError::Network(message)) = item
+                && message.contains("ended before a terminal response event")
+            {
+                saw_truncated_error = true;
+                break;
+            }
+        }
+
+        assert!(
+            saw_truncated_error,
+            "clean EOF before response.completed/failed/incomplete or [DONE] must produce an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_observer_sees_raw_events() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"codex.rate_limits\",\"plan_type\":\"plus\",\"rate_limits\":{\"primary\":{\"used_percent\":55}}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n",
+        );
+        let response = response_from_body("text/event-stream", body).await;
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_hook = std::sync::Arc::clone(&observed);
+        let mut stream = stream_responses_response_with_observer(response, move |event| {
+            observed_for_hook
+                .lock()
+                .unwrap()
+                .push(event["type"].clone());
+        });
+
+        while let Some(item) = stream.next().await {
+            item.expect("stream should convert regular Responses events");
+        }
+
+        let observed = observed.lock().unwrap();
+        assert!(observed.iter().any(|kind| kind == "codex.rate_limits"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_observer_sees_failed_event_before_error() {
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5\"}}\n\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"code\":\"server_error\",\"message\":\"failed\"}}}\n\n",
+        );
+        let response = response_from_body("text/event-stream", body).await;
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_for_hook = std::sync::Arc::clone(&observed);
+        let mut stream = stream_responses_response_with_observer(response, move |event| {
+            observed_for_hook
+                .lock()
+                .unwrap()
+                .push(event["type"].clone());
+        });
+
+        while let Some(item) = stream.next().await {
+            if item.is_err() {
+                break;
+            }
+        }
+
+        let observed = observed.lock().unwrap();
+        assert!(observed.iter().any(|kind| kind == "response.failed"));
+    }
+
+    #[test]
+    fn responses_usage_accounting_treats_cached_tokens_as_input_subset() {
+        let usage = provider_usage_from_responses_usage(&json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "input_tokens_details": {"cached_tokens": 30},
+            "output_tokens_details": {"reasoning_tokens": 8}
+        }));
+
+        assert_eq!(usage.input_tokens, 70);
+        assert_eq!(usage.cache_read_input_tokens, 30);
+        assert_eq!(usage.output_tokens, 20);
+        assert_eq!(usage.reasoning_output_tokens, 8);
+        assert_eq!(
+            usage.input_tokens + usage.cache_read_input_tokens + usage.output_tokens,
+            120
+        );
+    }
+
+    #[test]
+    fn responses_usage_accounting_tracks_cache_write_tokens_as_input_subset() {
+        let usage = provider_usage_from_responses_usage(&json!({
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "total_tokens": 110,
+            "input_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 60
+            }
+        }));
+
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 60);
+        assert_eq!(usage.cache_read_input_tokens, 40);
+        assert_eq!(usage.output_tokens, 10);
+        assert_eq!(
+            usage.input_tokens
+                + usage.cache_creation_input_tokens
+                + usage.cache_read_input_tokens
+                + usage.output_tokens,
+            110
+        );
+    }
+
+    #[test]
+    fn responses_usage_accounting_preserves_legacy_separate_cache_creation_tokens() {
+        let usage = provider_usage_from_responses_usage(&json!({
+            "input_tokens": 70,
+            "output_tokens": 10,
+            "cache_creation_input_tokens": 30
+        }));
+
+        assert_eq!(usage.input_tokens, 70);
+        assert_eq!(usage.cache_creation_input_tokens, 30);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn responses_usage_accounting_defaults_missing_cached_details_to_zero() {
+        let usage = provider_usage_from_responses_usage(&json!({
+            "input_tokens": 11,
+            "output_tokens": 7
+        }));
+
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.reasoning_output_tokens, 0);
+    }
+
+    #[test]
+    fn stream_converter_emits_normalized_cached_usage() {
+        let mut converter = ResponsesStreamConverter::new();
+        let events = converter.process_event(&json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-5",
+                "status": "completed",
+                "output": [],
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "input_tokens_details": {
+                        "cached_tokens": 30,
+                        "cache_write_tokens": 20
+                    }
+                }
+            }
+        }));
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+
+        assert_eq!(stop.data["usage"]["input_tokens"], 50);
+        assert_eq!(stop.data["usage"]["cache_creation_input_tokens"], 20);
+        assert_eq!(stop.data["usage"]["cache_read_input_tokens"], 30);
+        assert_eq!(stop.data["usage"]["output_tokens"], 20);
+    }
+
+    #[test]
+    fn test_stream_converter_native_codex_success_fixture() {
+        let events = convert_fixture_sse(include_str!(
+            "../tests/fixtures/chatgpt_codex/stream_success.sse"
+        ));
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+
+        assert_eq!(text_deltas(&events), vec!["done"]);
+        assert_eq!(stop.data["delta"]["stop_reason"], "end_turn");
+        assert_eq!(stop.data["usage"]["input_tokens"], 12);
+        assert_eq!(stop.data["usage"]["output_tokens"], 3);
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn test_stream_converter_native_codex_incomplete_and_failed_fixtures() {
+        let incomplete = convert_fixture_sse(include_str!(
+            "../tests/fixtures/chatgpt_codex/stream_incomplete.sse"
+        ));
+        let failed = convert_fixture_sse(include_str!(
+            "../tests/fixtures/chatgpt_codex/stream_failed.sse"
+        ));
+
+        assert_eq!(text_deltas(&incomplete), vec!["partial"]);
+        assert_eq!(stop_reason(&incomplete), "max_tokens");
+        assert_eq!(stop_reason(&failed), "error");
+        assert!(failed.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn test_stream_converter_native_codex_rate_limit_fixture() {
+        let fixture = include_str!("../tests/fixtures/chatgpt_codex/stream_rate_limit.sse");
+        let raw_types = fixture_sse_values(fixture)
+            .iter()
+            .filter_map(|event| event["type"].as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>();
+        let events = convert_fixture_sse(fixture);
+
+        assert!(raw_types.iter().any(|kind| kind == "codex.rate_limits"));
+        assert_eq!(stop_reason(&events), "end_turn");
+        assert!(events.iter().any(|event| event.event == "message_stop"));
+    }
+
+    #[test]
+    fn test_stream_converter_native_codex_function_tool_fixture() {
+        let events = convert_fixture_sse(include_str!(
+            "../tests/fixtures/chatgpt_codex/stream_function_tool.sse"
+        ));
+        let tool_block = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block");
+
+        assert_eq!(tool_block.data["content_block"]["id"], "call_fixture_1");
+        assert_eq!(tool_block.data["content_block"]["name"], "Bash");
+        assert_eq!(
+            tool_input_delta_json(&events),
+            json!({"command": "git status --short", "description": ""})
+        );
+        assert_eq!(stop_reason(&events), "tool_use");
+    }
+
+    #[test]
+    fn test_stream_converter_native_codex_custom_tool_fixture() {
+        let events = convert_fixture_sse(include_str!(
+            "../tests/fixtures/chatgpt_codex/stream_custom_tool.sse"
+        ));
+        let tool_block = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block");
+
+        assert_eq!(
+            tool_block.data["content_block"]["id"],
+            "call_custom_fixture_1"
+        );
+        assert_eq!(tool_block.data["content_block"]["name"], "python");
+        assert_eq!(
+            tool_input_delta_json(&events),
+            json!({"input": "print(\"hi\")\n"})
+        );
+        assert_eq!(stop_reason(&events), "tool_use");
+    }
+
+    #[test]
+    fn test_stream_converter_native_codex_custom_tool_output_item_done_fixture() {
+        let events = convert_fixture_sse(include_str!(
+            "../tests/fixtures/chatgpt_codex/stream_custom_tool_output_item_done.sse"
+        ));
+        let tool_block = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block");
+
+        assert_eq!(
+            tool_block.data["content_block"]["id"],
+            "call_custom_fixture_done_1"
+        );
+        assert_eq!(tool_block.data["content_block"]["name"], "exec");
+        assert_eq!(
+            tool_input_delta_json(&events),
+            json!({"input": "echo ready"})
+        );
+        assert_eq!(stop_reason(&events), "tool_use");
+    }
+
+    #[test]
+    fn test_convert_to_responses_maps_tools_and_outputs() {
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: Some(SystemPrompt::Text("Be useful.".to_string())),
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Text("Weather?".to_string()),
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: MessageContent::Blocks(vec![Content::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "weather".to_string(),
+                        input: json!({"city": "Shanghai"}),
+                    }]),
+                },
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Blocks(vec![Content::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: Some(Value::String("sunny".to_string())),
+                        is_error: None,
+                    }]),
+                },
+            ],
+            max_tokens: Some(1024),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: Some(vec![Tool {
+                name: "weather".to_string(),
+                description: Some("Get weather".to_string()),
+                input_schema: json!({"type": "object"}),
+                extra: Default::default(),
+            }]),
+            tool_choice: None,
+            thinking: Some(ThinkingConfig {
+                r#type: Some("enabled".to_string()),
+                budget_tokens: None,
+            }),
+            metadata: Some(json!({"user_id": "client-user"})),
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert_eq!(body["instructions"], "Be useful.");
+        assert_eq!(body["max_output_tokens"], 1024);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "weather");
+        assert_eq!(body["input"][1]["type"], "function_call");
+        assert_eq!(body["input"][2]["type"], "function_call_output");
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+        assert!(body.get("metadata").is_none());
+    }
+
+    #[test]
+    fn test_convert_to_responses_omits_sampling_for_reasoning_requests() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hello".to_string()),
+            }],
+            max_tokens: None,
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+    }
+
+    #[test]
+    fn test_convert_to_responses_keeps_sampling_for_non_reasoning_requests() {
+        let req = MessagesRequest {
+            model: "gpt-4.1".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hello".to_string()),
+            }],
+            max_tokens: None,
+            temperature: Some(0.2),
+            top_p: Some(0.9),
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert!((body["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6);
+        assert!((body["top_p"].as_f64().unwrap() - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_convert_to_responses_maps_anthropic_image_blocks() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![
+                    Content::Text {
+                        text: "What is in this image?".to_string(),
+                    },
+                    Content::Unknown(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": "iVBORw0KGgo="
+                        }
+                    })),
+                ]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            "What is in this image?"
+        );
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            body["input"][0]["content"][1]["image_url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+    }
+
+    #[test]
+    fn test_convert_to_responses_accepts_camel_case_image_media_type() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![Content::Unknown(json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "mediaType": "image/jpeg",
+                        "data": "/9j/4AAQSkZJRg=="
+                    }
+                }))]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_image");
+        assert_eq!(
+            body["input"][0]["content"][0]["image_url"],
+            "data:image/jpeg;base64,/9j/4AAQSkZJRg=="
+        );
+    }
+
+    #[test]
+    fn test_convert_to_responses_maps_anthropic_document_blocks() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![
+                    Content::Text {
+                        text: "Summarize this PDF.".to_string(),
+                    },
+                    Content::Unknown(json!({
+                        "type": "document",
+                        "title": "report.pdf",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": "JVBERi0x"
+                        }
+                    })),
+                ]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_file");
+        assert_eq!(body["input"][0]["content"][1]["file_data"], "JVBERi0x");
+        assert_eq!(body["input"][0]["content"][1]["filename"], "report.pdf");
+    }
+
+    #[test]
+    fn test_convert_to_responses_maps_tool_result_image_content() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: MessageContent::Blocks(vec![Content::ToolUse {
+                        id: "call_1".to_string(),
+                        name: "screenshot".to_string(),
+                        input: json!({}),
+                    }]),
+                },
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Blocks(vec![Content::ToolResult {
+                        tool_use_id: "call_1".to_string(),
+                        content: Some(json!([
+                            {"type": "text", "text": "Captured screenshot."},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "iVBORw0KGgo="
+                                }
+                            }
+                        ])),
+                        is_error: None,
+                    }]),
+                },
+            ],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert_eq!(body["input"][1]["type"], "function_call_output");
+        assert_eq!(body["input"][1]["output"][0]["type"], "input_text");
+        assert_eq!(
+            body["input"][1]["output"][0]["text"],
+            "Captured screenshot."
+        );
+        assert_eq!(body["input"][1]["output"][1]["type"], "input_image");
+        assert_eq!(
+            body["input"][1]["output"][1]["image_url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+    }
+
+    #[test]
+    fn test_convert_to_responses_preserves_encrypted_mcp_tool_content() {
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![Content::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: Some(json!([
+                        {"type": "text", "text": "Lookup completed"},
+                        {
+                            "type": "text",
+                            "text": "gAAAA-test",
+                            "_meta": {"codex/encryptedContent": true}
+                        }
+                    ])),
+                    is_error: None,
+                }]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert_eq!(
+            body["input"][0]["output"],
+            json!([
+                {"type": "input_text", "text": "Lookup completed"},
+                {"type": "encrypted_content", "encrypted_content": "gAAAA-test"}
+            ])
+        );
+    }
+
+    #[test]
+    fn test_encrypted_mcp_tool_content_bypasses_history_truncation() {
+        let encrypted = "e".repeat(MAX_CURRENT_TOOL_OUTPUT_BYTES + 1);
+        let content = Some(json!([{
+            "type": "text",
+            "text": encrypted,
+            "_meta": {"codex/encryptedContent": true}
+        }]));
+        let mut compression = HistoryCompressionState {
+            text_items_to_consider: 0,
+            tool_outputs_to_consider: 1,
+            excess_bytes: MAX_CURRENT_TOOL_OUTPUT_BYTES,
+        };
+
+        assert!(!should_truncate_tool_output(
+            &content,
+            false,
+            &mut compression
+        ));
+        assert_eq!(compression.excess_bytes, MAX_CURRENT_TOOL_OUTPUT_BYTES);
+        let output = tool_result_output(&content, None, true);
+        assert_eq!(
+            output[0]["encrypted_content"].as_str().map(str::len),
+            Some(MAX_CURRENT_TOOL_OUTPUT_BYTES + 1)
+        );
+    }
+
+    #[test]
+    fn test_convert_to_responses_preserves_json_array_tool_result_as_text() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![Content::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: Some(json!([{"path": "README.md"}])),
+                    is_error: None,
+                }]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert_eq!(body["input"][0]["output"], r#"[{"path":"README.md"}]"#);
+    }
+
+    #[test]
+    fn test_convert_to_responses_keeps_error_tool_result_text_only() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![Content::ToolResult {
+                    tool_use_id: "call_1".to_string(),
+                    content: Some(json!([
+                        {"type": "text", "text": "Permission denied."},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "iVBORw0KGgo="
+                            }
+                        }
+                    ])),
+                    is_error: Some(true),
+                }]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert_eq!(
+            body["input"][0]["output"],
+            "ERROR: Permission denied.\n[image omitted from error tool result]"
+        );
+    }
+
+    #[test]
+    fn test_convert_to_responses_normalizes_tool_schemas() {
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: Some(vec![
+                Tool {
+                    name: "empty".to_string(),
+                    description: None,
+                    input_schema: json!({}),
+                    extra: Default::default(),
+                },
+                Tool {
+                    name: "bad_required".to_string(),
+                    description: None,
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": "path"
+                    }),
+                    extra: Default::default(),
+                },
+                Tool {
+                    name: "non_object".to_string(),
+                    description: None,
+                    input_schema: json!({"type": "string"}),
+                    extra: Default::default(),
+                },
+            ]),
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert_eq!(
+            body["tools"][0]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+        assert_eq!(
+            body["tools"][1]["parameters"],
+            json!({"type": "object", "properties": {"path": {"type": "string"}}})
+        );
+        assert_eq!(
+            body["tools"][2]["parameters"],
+            json!({"type": "object", "properties": {}})
+        );
+    }
+
+    #[test]
+    fn test_convert_to_responses_normalizes_named_tool_choice() {
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Search docs".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: Some(json!({"type": "tool", "name": "WebSearch"})),
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "function", "name": "WebSearch"})
+        );
+    }
+
+    #[test]
+    fn test_convert_to_responses_omits_include_without_reasoning() {
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert!(body.get("include").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn test_convert_to_responses_preserves_parallel_tool_calls_false() {
+        let mut extra = HashMap::new();
+        extra.insert("parallel_tool_calls".to_string(), json!(false));
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Use one tool".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: Some(vec![Tool {
+                name: "lookup".to_string(),
+                description: None,
+                input_schema: json!({"type": "object"}),
+                extra: Default::default(),
+            }]),
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra,
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert_eq!(body["parallel_tool_calls"], false);
+    }
+
+    #[test]
+    fn test_convert_to_responses_omits_reasoning_summary_for_none_effort() {
+        let mut extra = HashMap::new();
+        extra.insert("reasoning_effort".to_string(), json!("none"));
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra,
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert!(body.get("include").is_none());
+        assert_eq!(body["reasoning"], json!({"effort": "none"}));
+    }
+
+    #[test]
+    fn test_convert_to_responses_omits_reasoning_summary_for_codex_spark() {
+        let req = MessagesRequest {
+            model: "gpt-5.3-codex-spark".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(ThinkingConfig {
+                r#type: Some("enabled".to_string()),
+                budget_tokens: None,
+            }),
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert_eq!(body["reasoning"], json!({"effort": "medium"}));
+    }
+
+    #[test]
+    fn test_convert_to_responses_maps_thinking_budget_to_reasoning_effort() {
+        for (budget_tokens, expected_effort) in [
+            (2048, "low"),
+            (8192, "medium"),
+            (16_384, "high"),
+            (16_385, "max"),
+        ] {
+            let req = MessagesRequest {
+                model: "gpt-5".to_string(),
+                system: None,
+                messages: vec![Message {
+                    role: Role::User,
+                    content: MessageContent::Text("Hi".to_string()),
+                }],
+                max_tokens: None,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                stop_sequences: None,
+                stream: true,
+                tools: None,
+                tool_choice: None,
+                thinking: Some(ThinkingConfig {
+                    r#type: Some("enabled".to_string()),
+                    budget_tokens: Some(budget_tokens),
+                }),
+                metadata: None,
+                extra: HashMap::new(),
+            };
+
+            let body = convert_to_responses(&req).unwrap();
+
+            assert_eq!(body["reasoning"]["effort"], expected_effort);
+            assert_eq!(body["reasoning"]["summary"], "detailed");
+        }
+    }
+
+    #[test]
+    fn test_convert_to_responses_context_clamps_reasoning_effort_to_model_metadata() {
+        let mut extra = HashMap::new();
+        extra.insert("reasoning_effort".to_string(), json!("xhigh"));
+        let req = MessagesRequest {
+            model: "custom-reasoning".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra,
+        };
+        let model = ModelInfo {
+            model_id: "custom-reasoning".to_string(),
+            vendor: Some("test".to_string()),
+            is_chat_default: None,
+            capabilities: ModelCapabilities {
+                limits: ModelLimits {
+                    reasoning_effort_levels: vec!["low".to_string(), "medium".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+
+        let body = convert_to_responses_with_context(
+            &req,
+            ConversionContext {
+                provider_id: Some("test"),
+                model: Some(&model),
+                ..ConversionContext::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(body["reasoning"]["effort"], "medium");
+    }
+
+    #[test]
+    fn test_convert_to_responses_downgrades_xhigh_budget_without_model_support() {
+        let req = MessagesRequest {
+            model: "gpt-4.1".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(ThinkingConfig {
+                r#type: Some("enabled".to_string()),
+                budget_tokens: Some(31_999),
+            }),
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+    }
+
+    #[test]
+    fn test_convert_to_responses_maps_adaptive_thinking_without_budget_to_high_reasoning_effort() {
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".to_string()),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: Some(ThinkingConfig {
+                r#type: Some("adaptive".to_string()),
+                budget_tokens: None,
+            }),
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "detailed");
+    }
+
+    #[test]
+    fn test_convert_to_responses_includes_reasoning_for_history_thinking() {
+        let req = MessagesRequest {
+            model: "gpt-5".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![Content::Thinking {
+                    thinking: "prior thought".to_string(),
+                    signature: None,
+                }]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn test_convert_to_responses_truncates_old_large_tool_outputs() {
+        let large_output = "x".repeat(MAX_HISTORICAL_TEXT_BYTES * 2);
+        let mut messages = Vec::new();
+        for index in 0..(RECENT_TOOL_OUTPUTS_TO_KEEP + 2) {
+            messages.push(Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![Content::ToolResult {
+                    tool_use_id: format!("call_{index}"),
+                    content: Some(Value::String(large_output.clone())),
+                    is_error: if index == 0 { Some(true) } else { None },
+                }]),
+            });
+        }
+        messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![Content::ToolResult {
+                tool_use_id: "current_call".to_string(),
+                content: Some(Value::String(large_output.clone())),
+                is_error: None,
+            }]),
+        });
+        let req = MessagesRequest {
+            model: "gpt-5.4-mini".to_string(),
+            system: None,
+            messages,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+        let input = body["input"].as_array().expect("input items");
+
+        assert!(
+            input[0]["output"]
+                .as_str()
+                .unwrap()
+                .starts_with("ERROR: [tool output truncated:")
+        );
+        assert!(
+            input[1]["output"]
+                .as_str()
+                .unwrap()
+                .starts_with("[tool output truncated:")
+        );
+        assert_eq!(input[2]["output"], large_output);
+        assert_eq!(input.last().unwrap()["output"], large_output);
+    }
+
+    #[test]
+    fn test_convert_to_responses_truncates_current_oversized_tool_output_with_head_and_tail() {
+        let large_output = format!(
+            "{}TAIL_SENTINEL",
+            "x".repeat(MAX_CURRENT_TOOL_OUTPUT_BYTES * 2)
+        );
+        let req = MessagesRequest {
+            model: "gpt-5.4-mini".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Blocks(vec![Content::ToolResult {
+                    tool_use_id: "current_call".to_string(),
+                    content: Some(Value::String(large_output)),
+                    is_error: None,
+                }]),
+            }],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+        let output = body["input"][0]["output"]
+            .as_str()
+            .expect("tool output string");
+
+        assert!(output.starts_with("[tool output truncated:"));
+        assert!(output.contains("max_current_tool_output_bytes="));
+        assert!(output.contains("[... middle of tool output omitted ...]"));
+        assert!(output.ends_with("TAIL_SENTINEL"));
+        assert!(output.len() <= MAX_CURRENT_TOOL_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn test_convert_to_responses_truncates_old_large_text_items() {
+        let large_text = "x".repeat(MAX_HISTORICAL_TEXT_BYTES * 2);
+        let mut messages = Vec::new();
+        for _ in 0..(RECENT_TEXT_ITEMS_TO_KEEP + 2) {
+            messages.push(Message {
+                role: Role::User,
+                content: MessageContent::Text(large_text.clone()),
+            });
+        }
+        messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Text(large_text.clone()),
+        });
+        let req = MessagesRequest {
+            model: "gpt-5.4-mini".to_string(),
+            system: None,
+            messages,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+        let input = body["input"].as_array().expect("input items");
+
+        assert!(
+            input[0]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[text content truncated:")
+        );
+        assert!(
+            input[1]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[text content truncated:")
+        );
+        assert_eq!(input[2]["content"], large_text);
+        assert_eq!(input.last().unwrap()["content"], large_text);
+    }
+
+    #[test]
+    fn test_convert_to_responses_preserves_large_model_history_within_budget() {
+        let large_text = "x".repeat(MAX_HISTORICAL_TEXT_BYTES * 2);
+        let mut messages = Vec::new();
+        for _ in 0..(RECENT_TEXT_ITEMS_TO_KEEP + 2) {
+            messages.push(Message {
+                role: Role::User,
+                content: MessageContent::Text(large_text.clone()),
+            });
+        }
+        messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Text("current".to_string()),
+        });
+        let req = MessagesRequest {
+            model: "gpt-5.5".to_string(),
+            system: None,
+            messages,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+        let input = body["input"].as_array().expect("input items");
+
+        assert_eq!(input[0]["content"], large_text);
+        assert_eq!(input[1]["content"], large_text);
+    }
+
+    #[test]
+    fn test_convert_to_responses_omits_history_thinking_text_items() {
+        let large_text = "x".repeat(MAX_HISTORICAL_TEXT_BYTES * 2);
+        let mut messages = Vec::new();
+        for _ in 0..(RECENT_TEXT_ITEMS_TO_KEEP + 20) {
+            messages.push(Message {
+                role: Role::Assistant,
+                content: MessageContent::Blocks(vec![Content::Thinking {
+                    thinking: large_text.clone(),
+                    signature: None,
+                }]),
+            });
+        }
+        messages.push(Message {
+            role: Role::User,
+            content: MessageContent::Text("current".to_string()),
+        });
+        let req = MessagesRequest {
+            model: "gpt-5.4-mini".to_string(),
+            system: None,
+            messages,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        };
+
+        let body = convert_to_responses(&req).unwrap();
+        let input = body["input"].as_array().expect("input items");
+        let serialized = serde_json::to_string(input).expect("input json");
+
+        assert!(!serialized.contains("[thinking]"));
+        assert!(!serialized.contains(&large_text));
+        assert_eq!(input.last().unwrap()["content"], "current");
+    }
+
+    #[test]
+    fn test_tool_result_text_prefixes_errors() {
+        let text = tool_result_text(
+            &Some(Value::String("failed".to_string())),
+            Some(true),
+            false,
+        );
+
+        assert_eq!(text, "ERROR: failed");
+    }
+
+    #[test]
+    fn test_stream_converter_maps_text_function_and_incomplete() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "hello"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {"type": "function_call", "call_id": "call_1", "name": "weather"}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "delta": "{\"city\":\"Shanghai\"}"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-5",
+                "status": "completed",
+                "output": [{"type": "function_call"}],
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }
+        })));
+
+        assert!(events.iter().any(|event| event.event == "message_start"));
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_delta"
+                && event.data["delta"]["type"] == "input_json_delta"
+        }));
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(stop.data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_stream_converter_maps_tagged_output_text_to_thinking() {
+        let mut converter =
+            ResponsesStreamConverter::with_marker_mode(ReasoningMarkerMode::LegacyTags);
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "hello [thinking]plan[/thinking] world"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-5",
+                "status": "completed",
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }
+        })));
+
+        assert_eq!(
+            text_and_thinking_deltas(&events),
+            vec![
+                ("text_delta".to_string(), "hello ".to_string()),
+                ("thinking_delta".to_string(), "plan".to_string()),
+                ("text_delta".to_string(), " world".to_string()),
+            ]
+        );
+        assert!(!text_deltas(&events).join("").contains("plan"));
+    }
+
+    #[test]
+    fn test_stream_converter_preserves_tagged_output_text_by_default() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "use `<analysis>...</analysis>` here"
+        })));
+
+        assert_eq!(
+            text_deltas(&events),
+            vec!["use `<analysis>...</analysis>` here"]
+        );
+        assert!(
+            text_and_thinking_deltas(&events)
+                .iter()
+                .all(|(kind, _)| kind == "text_delta")
+        );
+    }
+
+    #[test]
+    fn test_stream_converter_maps_split_tagged_output_text_to_thinking() {
+        let mut converter =
+            ResponsesStreamConverter::with_marker_mode(ReasoningMarkerMode::LegacyTags);
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "hello [thin"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "king]plan[/thin"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "king] world"
+        })));
+
+        assert_eq!(
+            text_and_thinking_deltas(&events),
+            vec![
+                ("text_delta".to_string(), "hello ".to_string()),
+                ("thinking_delta".to_string(), "plan".to_string()),
+                ("text_delta".to_string(), " world".to_string()),
+            ]
+        );
+        assert!(!text_deltas(&events).join("").contains("plan"));
+    }
+
+    #[test]
+    fn test_stream_converter_drops_unclosed_thinking_marker_in_output_text() {
+        let mut converter =
+            ResponsesStreamConverter::with_marker_mode(ReasoningMarkerMode::LegacyTags);
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "visible [thinking]secret"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-5",
+                "status": "completed",
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }
+        })));
+
+        assert_eq!(text_deltas(&events), vec!["visible "]);
+        assert!(!text_deltas(&events).join("").contains("secret"));
+        assert!(thinking_deltas(&events).is_empty());
+    }
+
+    #[test]
+    fn test_stream_converter_preserves_typed_reasoning_delta() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "typed thought"
+        })));
+
+        assert_eq!(
+            text_and_thinking_deltas(&events),
+            vec![("thinking_delta".to_string(), "typed thought".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_stream_converter_preserves_reasoning_summary_delta() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "summary_index": 0,
+            "delta": "checked constraints"
+        })));
+
+        assert_eq!(thinking_deltas(&events), vec!["checked constraints"]);
+    }
+
+    #[test]
+    fn test_stream_converter_drops_split_blank_comment_from_reasoning_summary() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        for delta in ["**Planning**\n\n<!--", " -->", "\n"] {
+            events.extend(converter.process_event(&json!({
+                "type": "response.reasoning_summary_text.delta",
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": delta
+            })));
+        }
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.done",
+            "output_index": 0,
+            "summary_index": 0,
+            "text": "**Planning**\n\n<!-- -->\n"
+        })));
+
+        let thinking = thinking_deltas(&events).join("");
+        assert_eq!(thinking, "**Planning**\n\n");
+        assert!(!thinking.contains("<!--"));
+        assert!(!thinking.contains("-->"));
+    }
+
+    #[test]
+    fn test_stream_converter_preserves_non_placeholder_summary_comments() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "summary_index": 0,
+            "delta": "Keep <!-- --> inline\n<!-- note -->\n"
+        })));
+
+        assert_eq!(
+            thinking_deltas(&events).join(""),
+            "Keep <!-- --> inline\n<!-- note -->\n"
+        );
+    }
+
+    #[test]
+    fn test_stream_converter_preserves_blank_comment_in_raw_reasoning_text() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "<!-- -->"
+        })));
+
+        assert_eq!(thinking_deltas(&events), vec!["<!-- -->"]);
+    }
+
+    #[test]
+    fn test_stream_converter_preserves_incomplete_non_marker_summary_text() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "summary_index": 0,
+            "delta": "<"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.done",
+            "output_index": 0,
+            "summary_index": 0,
+            "text": "<"
+        })));
+
+        assert_eq!(thinking_deltas(&events), vec!["<"]);
+    }
+
+    #[test]
+    fn test_stream_converter_does_not_separate_after_marker_only_summary_part() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_part.done",
+            "output_index": 0,
+            "summary_index": 0,
+            "part": {"type": "summary_text", "text": "<!-- -->"}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "summary_index": 1,
+            "delta": "next summary"
+        })));
+
+        assert_eq!(thinking_deltas(&events), vec!["next summary"]);
+    }
+
+    #[test]
+    fn test_stream_converter_deduplicates_reasoning_summary_done_text() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.delta",
+            "output_index": 0,
+            "summary_index": 0,
+            "delta": "checked"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_text.done",
+            "output_index": 0,
+            "summary_index": 0,
+            "text": "checked constraints"
+        })));
+
+        assert_eq!(thinking_deltas(&events).join(""), "checked constraints");
+    }
+
+    #[test]
+    fn test_stream_converter_maps_reasoning_summary_part_done() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.reasoning_summary_part.done",
+            "output_index": 0,
+            "summary_index": 0,
+            "part": {"type": "summary_text", "text": "part summary"}
+        })));
+
+        assert_eq!(thinking_deltas(&events), vec!["part summary"]);
+    }
+
+    #[test]
+    fn test_stream_converter_uses_done_function_arguments_without_delta() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_1", "name": "Edit"}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "call_id": "call_1",
+            "name": "Edit",
+            "arguments": "{\"file_path\":\"src/main.rs\",\"old_string\":\"old\",\"new_string\":\"new\"}"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "Edit"
+            }
+        })));
+
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "tool_use"
+                && event.data["content_block"]["name"] == "Edit"
+                && event.data["content_block"]["id"] == "call_1"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_delta"
+                && event.data["delta"]["type"] == "input_json_delta"
+                && event.data["delta"]["partial_json"]
+                    == "{\"file_path\":\"src/main.rs\",\"old_string\":\"old\",\"new_string\":\"new\"}"
+        }));
+    }
+
+    #[test]
+    fn test_stream_converter_marks_tool_use_when_completed_output_is_empty() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "Read", "arguments": ""}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_1",
+            "delta": "{\"file_path\":\"src/main.rs\"}"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "Read",
+                "arguments": "{\"file_path\":\"src/main.rs\"}"
+            }
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-5",
+                "status": "completed",
+                "output": [],
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            }
+        })));
+
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+        assert_eq!(stop.data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_stream_converter_sanitizes_split_read_arguments_on_done() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "Read", "arguments": ""}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_1",
+            "delta": "{\"file_path\":\"src/main.rs\","
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_1",
+            "delta": "\"pages\":\"\"}"
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "item_id": "fc_1",
+            "name": "Read",
+            "arguments": "{\"file_path\":\"src/main.rs\",\"pages\":\"\"}"
+        })));
+
+        let arguments = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+        let arguments: Value = serde_json::from_str(&arguments).expect("valid arguments");
+        assert_eq!(arguments, json!({"file_path": "src/main.rs"}));
+    }
+
+    #[test]
+    fn test_stream_converter_incrementally_sanitizes_when_json_completes() {
+        let mut converter = ResponsesStreamConverter::new();
+
+        let mut events = converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        }));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "Read", "arguments": ""}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_1",
+            "delta": "{\"file_path\":\"src/main.rs\","
+        })));
+
+        assert!(!events.iter().any(|event| {
+            event.event == "content_block_delta"
+                && event.data["delta"]["type"] == "input_json_delta"
+        }));
+
+        let events = converter.process_event(&json!({
+            "type": "response.function_call_arguments.delta",
+            "output_index": 0,
+            "item_id": "fc_1",
+            "delta": "\"pages\":\"\"}"
+        }));
+        let arguments = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+        let arguments: Value = serde_json::from_str(&arguments).expect("valid arguments");
+        assert_eq!(arguments, json!({"file_path": "src/main.rs"}));
+    }
+
+    #[test]
+    fn test_stream_converter_chatgpt_codex_tool_fixture() {
+        let mut converter = ResponsesStreamConverter::new();
+        let fixture = [
+            json!({
+                "type": "response.created",
+                "response": {"id": "resp_chatgpt_1", "model": "gpt-5.3-codex", "usage": null}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_chatgpt_1",
+                    "call_id": "call_chatgpt_1",
+                    "name": "Bash",
+                    "arguments": ""
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "item_id": "fc_chatgpt_1",
+                "delta": "{\"command\":\"git"
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "output_index": 0,
+                "item_id": "fc_chatgpt_1",
+                "delta": " status --short\",\"description\":\"\"}"
+            }),
+            json!({
+                "type": "response.function_call_arguments.done",
+                "output_index": 0,
+                "item_id": "fc_chatgpt_1",
+                "name": "Bash",
+                "arguments": "{\"command\":\"git status --short\",\"description\":\"\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_chatgpt_1",
+                    "call_id": "call_chatgpt_1",
+                    "name": "Bash",
+                    "arguments": "{\"command\":\"git status --short\",\"description\":\"\"}"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_chatgpt_1",
+                    "model": "gpt-5.3-codex",
+                    "status": "completed",
+                    "output": [],
+                    "usage": {"input_tokens": 10, "output_tokens": 5}
+                }
+            }),
+        ];
+
+        let events = fixture
+            .iter()
+            .flat_map(|event| converter.process_event(event))
+            .collect::<Vec<_>>();
+        let arguments = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).expect("valid arguments"),
+            json!({"command": "git status --short", "description": ""})
+        );
+        assert_eq!(stop.data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_stream_converter_maps_custom_tool_call_input_delta() {
+        let mut converter = ResponsesStreamConverter::new();
+        let fixture = [
+            json!({
+                "type": "response.created",
+                "response": {"id": "resp_custom_1", "model": "gpt-5.3-codex", "usage": null}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "custom_tool_call",
+                    "id": "ctc_1",
+                    "call_id": "call_custom_1",
+                    "name": "python"
+                }
+            }),
+            json!({
+                "type": "response.custom_tool_call_input.delta",
+                "output_index": 0,
+                "item_id": "ctc_1",
+                "delta": "print(\""
+            }),
+            json!({
+                "type": "response.custom_tool_call_input.delta",
+                "output_index": 0,
+                "item_id": "ctc_1",
+                "delta": "hi\")\n"
+            }),
+            json!({
+                "type": "response.custom_tool_call_input.done",
+                "output_index": 0,
+                "item_id": "ctc_1",
+                "input": "print(\"hi\")\n"
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_custom_1",
+                    "model": "gpt-5.3-codex",
+                    "status": "completed",
+                    "output": [{"type": "custom_tool_call"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5}
+                }
+            }),
+        ];
+
+        let events = fixture
+            .iter()
+            .flat_map(|event| converter.process_event(event))
+            .collect::<Vec<_>>();
+        let tool_block = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block");
+        let arguments = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+
+        assert_eq!(tool_block.data["content_block"]["id"], "call_custom_1");
+        assert_eq!(tool_block.data["content_block"]["name"], "python");
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).expect("valid arguments"),
+            json!({"input": "print(\"hi\")\n"})
+        );
+        assert_eq!(stop.data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_stream_converter_maps_custom_bash_input_to_command() {
+        let mut converter = ResponsesStreamConverter::new();
+        let fixture = [
+            json!({
+                "type": "response.created",
+                "response": {"id": "resp_custom_bash", "model": "gpt-5.3-codex", "usage": null}
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "custom_tool_call",
+                    "id": "ctc_bash_1",
+                    "call_id": "call_bash_1",
+                    "name": "Bash"
+                }
+            }),
+            json!({
+                "type": "response.custom_tool_call_input.delta",
+                "output_index": 0,
+                "item_id": "ctc_bash_1",
+                "delta": "git"
+            }),
+            json!({
+                "type": "response.custom_tool_call_input.delta",
+                "output_index": 0,
+                "item_id": "ctc_bash_1",
+                "delta": " status --short"
+            }),
+            json!({
+                "type": "response.custom_tool_call_input.done",
+                "output_index": 0,
+                "item_id": "ctc_bash_1",
+                "input": "git status --short"
+            }),
+        ];
+
+        let events = fixture
+            .iter()
+            .flat_map(|event| converter.process_event(event))
+            .collect::<Vec<_>>();
+        let arguments = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&arguments).expect("valid arguments"),
+            json!({"command": "git status --short", "description": ""})
+        );
+    }
+
+    #[test]
+    fn test_non_streaming_response_maps_text_and_function() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "hello"}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "weather",
+                    "arguments": "{\"city\":\"Shanghai\"}"
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events =
+            convert_non_streaming_response_with_marker_mode(&data, ReasoningMarkerMode::LegacyTags);
+
+        assert_eq!(
+            events.first().map(|event| event.event.as_str()),
+            Some("message_start")
+        );
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_start"
+                && event.data["content_block"]["type"] == "tool_use"
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.event == "message_delta")
+                .unwrap()
+                .data["delta"]["stop_reason"],
+            "tool_use"
+        );
+    }
+
+    #[test]
+    fn test_non_streaming_response_maps_custom_tool_call() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5.3-codex",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_custom_1",
+                    "name": "python",
+                    "input": "print(\"hi\")\n"
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events = convert_non_streaming_response(&data);
+        let tool_block = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block");
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+
+        assert_eq!(tool_block.data["content_block"]["id"], "call_custom_1");
+        assert_eq!(tool_block.data["content_block"]["name"], "python");
+        assert_eq!(
+            tool_block.data["content_block"]["input"],
+            json!({"input": "print(\"hi\")\n"})
+        );
+        assert_eq!(stop.data["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_non_streaming_response_maps_bash_custom_tool_call_to_command() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5.3-codex",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_bash_1",
+                    "name": "Bash",
+                    "input": "git status --short"
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events = convert_non_streaming_response(&data);
+        let tool_block = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+            })
+            .expect("tool block");
+
+        assert_eq!(tool_block.data["content_block"]["id"], "call_bash_1");
+        assert_eq!(tool_block.data["content_block"]["name"], "Bash");
+        assert_eq!(
+            tool_block.data["content_block"]["input"],
+            json!({"command": "git status --short", "description": ""})
+        );
+    }
+
+    #[test]
+    fn test_non_streaming_response_maps_tagged_output_text_to_thinking() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "hello [thinking]plan[/thinking] world"}]
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events =
+            convert_non_streaming_response_with_marker_mode(&data, ReasoningMarkerMode::LegacyTags);
+
+        assert_eq!(
+            text_and_thinking_deltas(&events),
+            vec![
+                ("text_delta".to_string(), "hello ".to_string()),
+                ("thinking_delta".to_string(), "plan".to_string()),
+                ("text_delta".to_string(), " world".to_string()),
+            ]
+        );
+        assert!(!text_deltas(&events).join("").contains("plan"));
+    }
+
+    #[test]
+    fn test_non_streaming_response_drops_unclosed_thinking_marker_in_output_text() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "visible [thinking]secret"}]
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events =
+            convert_non_streaming_response_with_marker_mode(&data, ReasoningMarkerMode::LegacyTags);
+
+        assert_eq!(text_deltas(&events), vec!["visible "]);
+        assert!(!text_deltas(&events).join("").contains("secret"));
+        assert!(thinking_deltas(&events).is_empty());
+    }
+
+    #[test]
+    fn test_non_streaming_response_maps_refusal_reasoning_and_incomplete() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_tokens"},
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "checked constraints"}]
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "refusal", "refusal": "I can’t help with that."}]
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events = convert_non_streaming_response(&data);
+        let stop = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta");
+
+        assert_eq!(thinking_deltas(&events), vec!["checked constraints"]);
+        assert_eq!(text_deltas(&events), vec!["I can’t help with that."]);
+        assert_eq!(stop.data["delta"]["stop_reason"], "max_tokens");
+    }
+
+    #[test]
+    fn test_non_streaming_response_drops_blank_summary_comment_lines() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [{
+                "type": "reasoning",
+                "summary": [
+                    {"type": "summary_text", "text": "**Planning**\n\n<!-- -->"},
+                    {"type": "summary_text", "text": "Keep <!-- --> inline"}
+                ]
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events = convert_non_streaming_response(&data);
+
+        assert_eq!(
+            thinking_deltas(&events).join(""),
+            "**Planning**\nKeep <!-- --> inline"
+        );
+    }
+
+    #[test]
+    fn test_non_streaming_response_prefers_reasoning_text_over_summary() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [{
+                "type": "reasoning",
+                "text": "full reasoning text",
+                "summary": [{"type": "summary_text", "text": "summary text"}]
+            }],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events = convert_non_streaming_response(&data);
+
+        assert_eq!(thinking_deltas(&events), vec!["full reasoning text"]);
+    }
+
+    #[test]
+    fn test_stream_converter_sanitizes_read_empty_pages_from_done_arguments() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_1", "name": "Read"}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "call_id": "call_1",
+            "name": "Read",
+            "arguments": "{\"file_path\":\"src/main.rs\",\"pages\":\"\"}"
+        })));
+
+        let arguments = events
+            .iter()
+            .find_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .expect("tool arguments");
+        let arguments: Value = serde_json::from_str(arguments).expect("valid arguments");
+        assert_eq!(arguments, json!({"file_path": "src/main.rs"}));
+    }
+
+    #[test]
+    fn test_read_sanitizer_recovers_concatenated_large_offset() {
+        let path = temp_read_fixture(1_113);
+        let sanitized = sanitize_tool_arguments(
+            "Read",
+            &json!({
+                "file_path": path.to_string_lossy(),
+                "offset": 5_206_854_u64,
+                "limit": 5
+            })
+            .to_string(),
+        )
+        .expect("sanitized read arguments");
+        let input: Value = serde_json::from_str(&sanitized).expect("valid json");
+
+        assert_eq!(input["offset"], 520);
+        assert_eq!(input["limit"], 5);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_read_sanitizer_removes_absurd_offset_when_file_is_unavailable() {
+        let sanitized = sanitize_tool_arguments(
+            "Read",
+            &json!({
+                "file_path": "missing-routes.rs",
+                "offset": 5_206_854_u64,
+                "limit": 5
+            })
+            .to_string(),
+        )
+        .expect("sanitized read arguments");
+        let input: Value = serde_json::from_str(&sanitized).expect("valid json");
+
+        assert!(input.get("offset").is_none());
+        assert_eq!(input["limit"], 5);
+    }
+
+    #[test]
+    fn test_stream_converter_sanitizes_read_large_offset_before_tool_use() {
+        let path = temp_read_fixture(1_113);
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+        let arguments = json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 5_206_854_u64,
+            "limit": 5
+        })
+        .to_string();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_1", "name": "Read"}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "call_id": "call_1",
+            "name": "Read",
+            "arguments": arguments
+        })));
+
+        let arguments = events
+            .iter()
+            .find_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .expect("tool arguments");
+        let input: Value = serde_json::from_str(arguments).expect("valid arguments");
+        assert_eq!(input["offset"], 520);
+        assert_eq!(input["limit"], 5);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_stream_converter_preserves_bash_command_and_empty_strings() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = Vec::new();
+
+        events.extend(converter.process_event(&json!({
+            "type": "response.created",
+            "response": {"id": "resp_1", "model": "gpt-5", "usage": null}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"type": "function_call", "call_id": "call_1", "name": "Bash"}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type": "response.function_call_arguments.done",
+            "output_index": 0,
+            "call_id": "call_1",
+            "name": "Bash",
+            "arguments": "{\"command\":\"git status --short\",\"description\":\"\",\"run_in_background\":false}"
+        })));
+
+        let arguments = events
+            .iter()
+            .find_map(|event| {
+                (event.event == "content_block_delta"
+                    && event.data["delta"]["type"] == "input_json_delta")
+                    .then(|| event.data["delta"]["partial_json"].as_str())
+                    .flatten()
+            })
+            .expect("tool arguments");
+        assert_eq!(
+            arguments,
+            "{\"command\":\"git status --short\",\"description\":\"\",\"run_in_background\":false}"
+        );
+    }
+
+    #[test]
+    fn test_non_streaming_response_sanitizes_read_empty_pages_only() {
+        let data = json!({
+            "id": "resp_1",
+            "model": "gpt-5",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "Read",
+                    "arguments": "{\"file_path\":\"src/main.rs\",\"pages\":\"\"}"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_2",
+                    "name": "Bash",
+                    "arguments": "{\"command\":\"git status --short\",\"description\":\"\"}"
+                }
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        });
+
+        let events = convert_non_streaming_response(&data);
+        let inputs = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use")
+                    .then_some(&event.data["content_block"]["input"])
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(inputs[0], &json!({"file_path": "src/main.rs"}));
+        assert_eq!(
+            inputs[1],
+            &json!({"command": "git status --short", "description": ""})
+        );
+    }
+
+    #[test]
+    fn test_non_read_tool_pages_empty_string_is_preserved() {
+        assert_eq!(
+            sanitize_tool_arguments("Other", "{\"pages\":\"\",\"value\":\"\"}"),
+            None
+        );
+    }
+
+    fn valid_gpt_signature(seed: u8) -> String {
+        let mut payload = vec![0_u8; 73];
+        payload[0] = 0x80;
+        payload[16] = seed;
+        base64::engine::general_purpose::URL_SAFE.encode(payload)
+    }
+
+    fn assert_anthropic_block_lifecycle(events: &[SseEvent]) {
+        let mut open = None;
+        let mut stopped = false;
+        let mut seen_indices = HashSet::new();
+        for event in events {
+            assert!(!stopped, "event emitted after message_stop: {event:?}");
+            match event.event.as_str() {
+                "content_block_start" => {
+                    assert!(open.is_none(), "content blocks overlap");
+                    let index = event.data["index"].as_u64().expect("block index");
+                    assert!(seen_indices.insert(index), "block index reused");
+                    open = Some(index);
+                }
+                "content_block_delta" => {
+                    assert_eq!(
+                        open,
+                        event.data["index"].as_u64(),
+                        "delta targets a block that is not open"
+                    );
+                }
+                "content_block_stop" => {
+                    assert_eq!(open, event.data["index"].as_u64());
+                    open = None;
+                }
+                "message_delta" => assert!(open.is_none()),
+                "message_stop" => {
+                    assert!(open.is_none());
+                    stopped = true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn signed_reasoning_round_trips_through_request_stream_and_non_stream() {
+        let signature = valid_gpt_signature(7);
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model": "gpt-5",
+            "messages": [{
+                "role": "assistant",
+                "content": [{
+                    "type": "thinking",
+                    "thinking": "summary",
+                    "signature": signature
+                }]
+            }]
+        }))
+        .unwrap();
+        let body = convert_to_responses(&request).unwrap();
+        assert_eq!(body["input"][0]["type"], "reasoning");
+        assert_eq!(body["input"][0]["encrypted_content"], signature);
+
+        let early_signature = valid_gpt_signature(8);
+        let final_signature = valid_gpt_signature(9);
+        let mut converter = ResponsesStreamConverter::new();
+        let upstream = [
+            json!({"type":"response.created","response":{"id":"resp_1","model":"gpt-5"}}),
+            json!({
+                "type":"response.output_item.added",
+                "output_index":0,
+                "item":{"type":"reasoning","encrypted_content":early_signature}
+            }),
+            json!({
+                "type":"response.reasoning_summary_text.delta",
+                "output_index":0,
+                "summary_index":0,
+                "delta":"summary"
+            }),
+            json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{
+                    "type":"reasoning",
+                    "summary":[{"type":"summary_text","text":"summary"}],
+                    "encrypted_content":final_signature
+                }
+            }),
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+        ];
+        let events = upstream
+            .iter()
+            .flat_map(|event| converter.process_event(event))
+            .collect::<Vec<_>>();
+        assert_anthropic_block_lifecycle(&events);
+        let signatures = events
+            .iter()
+            .filter_map(|event| event.data["delta"]["signature"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(signatures, vec![final_signature.as_str()]);
+
+        let data = json!({
+            "id":"resp_1",
+            "model":"gpt-5",
+            "status":"completed",
+            "output":[{"type":"reasoning","summary":[],"encrypted_content":final_signature}],
+            "usage":{}
+        });
+        let events = convert_non_streaming_response(&data);
+        assert_anthropic_block_lifecycle(&events);
+        assert!(events.iter().any(|event| {
+            event.data["delta"]["type"] == "signature_delta"
+                && event.data["delta"]["signature"] == final_signature
+        }));
+    }
+
+    #[test]
+    fn parallel_function_calls_are_serialized_and_deferred_text_is_replayed() {
+        let mut converter = ResponsesStreamConverter::new();
+        let upstream = [
+            json!({"type":"response.created","response":{"id":"resp_1","model":"gpt-5"}}),
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"item_a","call_id":"call_a","name":"first"}}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"item_b","call_id":"call_b","name":"second"}}),
+            json!({"type":"response.function_call_arguments.delta","item_id":"item_b","delta":"{\"b\":2}"}),
+            json!({"type":"response.output_text.delta","output_index":2,"content_index":0,"delta":"after tools"}),
+            json!({"type":"response.function_call_arguments.done","call_id":"call_b","arguments":"{\"b\":2}"}),
+            json!({"type":"response.function_call_arguments.done","call_id":"call_a","arguments":"{\"a\":1}"}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+        ];
+        let events = upstream
+            .iter()
+            .flat_map(|event| converter.process_event(event))
+            .collect::<Vec<_>>();
+        assert_anthropic_block_lifecycle(&events);
+        let block_types = events
+            .iter()
+            .filter_map(|event| {
+                (event.event == "content_block_start")
+                    .then(|| event.data["content_block"]["type"].as_str())
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(block_types, vec!["tool_use", "tool_use", "text"]);
+    }
+
+    #[test]
+    fn function_block_waits_for_name_from_output_item_done() {
+        let mut converter = ResponsesStreamConverter::new();
+        let mut events = converter.process_event(&json!({
+            "type":"response.created",
+            "response":{"id":"resp_1","model":"gpt-5"}
+        }));
+        events.extend(converter.process_event(&json!({
+            "type":"response.output_item.added",
+            "output_index":0,
+            "item":{"type":"function_call","id":"item_1","call_id":"call_1"}
+        })));
+        events.extend(converter.process_event(&json!({
+            "type":"response.function_call_arguments.done",
+            "item_id":"item_1",
+            "arguments":"{\"path\":\"a\"}"
+        })));
+        assert!(
+            !events
+                .iter()
+                .any(|event| { event.data["content_block"]["type"] == "tool_use" })
+        );
+
+        events.extend(converter.process_event(&json!({
+            "type":"response.output_item.done",
+            "output_index":0,
+            "item":{
+                "type":"function_call",
+                "id":"item_1",
+                "call_id":"call_1",
+                "name":"Read",
+                "arguments":"{\"path\":\"a\"}"
+            }
+        })));
+        assert_anthropic_block_lifecycle(&events);
+        let start = events
+            .iter()
+            .find(|event| event.data["content_block"]["type"] == "tool_use")
+            .unwrap();
+        assert_eq!(start.data["content_block"]["name"], "Read");
+    }
+
+    #[test]
+    fn request_maps_native_web_search_parallel_choice_effort_and_identifiers() {
+        let long_name = "tool/".repeat(20);
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5",
+            "messages":[{"role":"user","content":"search"}],
+            "thinking":{"type":"adaptive"},
+            "output_config":{"effort":"low"},
+            "tool_choice":{"type":"auto","disable_parallel_tool_use":true},
+            "tools":[
+                {
+                    "type":"web_search_20250305",
+                    "name":"web_search",
+                    "allowed_domains":[" Example.COM ", "", "example.com"],
+                    "blocked_domains":[],
+                    "user_location":{"type":"approximate","country":"CN"}
+                },
+                {
+                    "name":long_name,
+                    "input_schema":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}
+                }
+            ]
+        }))
+        .unwrap();
+        let body = convert_to_responses(&request).unwrap();
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["tools"][0]["type"], "web_search");
+        assert_eq!(
+            body["tools"][0]["filters"]["allowed_domains"][0],
+            "example.com"
+        );
+        assert_eq!(
+            body["tools"][0]["filters"]["allowed_domains"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(body["tools"][0]["filters"].get("blocked_domains").is_none());
+        assert_eq!(body["tools"][0]["user_location"]["country"], "CN");
+        let mapped_name = body["tools"][1]["name"].as_str().unwrap();
+        assert!(mapped_name.len() <= RESPONSES_IDENTIFIER_MAX_BYTES);
+        assert!(
+            !body["tools"][1]["parameters"]
+                .as_object()
+                .unwrap()
+                .contains_key("$schema")
+        );
+    }
+
+    #[test]
+    fn request_omits_empty_native_web_search_filters() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5",
+            "messages":[{"role":"user","content":"search"}],
+            "tools":[{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "allowed_domains":[],
+                "blocked_domains":["", "   "]
+            }]
+        }))
+        .unwrap();
+
+        let body = convert_to_responses(&request).unwrap();
+
+        assert_eq!(body["tools"][0]["type"], "web_search");
+        assert!(body["tools"][0].get("filters").is_none());
+    }
+
+    #[test]
+    fn request_preserves_normalized_native_web_search_blocklist() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5",
+            "messages":[{"role":"user","content":"search"}],
+            "tools":[{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "blocked_domains":[" Bad.Example ", "bad.example"]
+            }]
+        }))
+        .unwrap();
+
+        let body = convert_to_responses(&request).unwrap();
+
+        assert_eq!(
+            body["tools"][0]["filters"]["blocked_domains"],
+            json!(["bad.example"])
+        );
+        assert!(body["tools"][0]["filters"].get("allowed_domains").is_none());
+    }
+
+    #[test]
+    fn request_rejects_conflicting_native_web_search_filters() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5",
+            "messages":[{"role":"user","content":"search"}],
+            "tools":[{
+                "type":"web_search_20250305",
+                "name":"web_search",
+                "allowed_domains":["example.com"],
+                "blocked_domains":["bad.example"]
+            }]
+        }))
+        .unwrap();
+
+        let error = convert_to_responses(&request).unwrap_err();
+
+        assert!(matches!(error, ProviderError::InvalidRequest(_)));
+        assert_eq!(
+            error.to_string(),
+            "invalid request: tools[0] cannot specify both allowed_domains and blocked_domains"
+        );
+    }
+
+    #[test]
+    fn request_rejects_malformed_native_web_search_filters() {
+        let cases = [
+            (
+                json!({"allowed_domains":"example.com"}),
+                "invalid request: tools[0].allowed_domains must be an array",
+            ),
+            (
+                json!({"allowed_domains":["example.com", 42]}),
+                "invalid request: tools[0].allowed_domains[1] must be a string",
+            ),
+        ];
+
+        for (fields, expected) in cases {
+            let mut tool = json!({
+                "type":"web_search_20250305",
+                "name":"web_search"
+            });
+            tool.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let request: MessagesRequest = serde_json::from_value(json!({
+                "model":"gpt-5",
+                "messages":[{"role":"user","content":"search"}],
+                "tools":[tool]
+            }))
+            .unwrap();
+
+            let error = convert_to_responses(&request).unwrap_err();
+
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn request_replays_native_web_search_history_as_a_responses_output_item() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5",
+            "messages":[
+                {
+                    "role":"assistant",
+                    "content":[
+                        {
+                            "type":"server_tool_use",
+                            "id":"ws_1",
+                            "name":"web_search",
+                            "input":{"query":"rust"}
+                        },
+                        {
+                            "type":"web_search_tool_result",
+                            "tool_use_id":"ws_1",
+                            "content":[{"type":"web_search_result","title":"Rust","url":"https://www.rust-lang.org/"}]
+                        }
+                    ]
+                },
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .unwrap();
+        let body = convert_to_responses(&request).unwrap();
+        assert_eq!(body["input"][0]["type"], "web_search_call");
+        assert_eq!(body["input"][0]["id"], "ws_1");
+        assert_eq!(body["input"][0]["action"]["query"], "rust");
+        assert_eq!(
+            body["input"][0]["results"][0]["url"],
+            "https://www.rust-lang.org/"
+        );
+    }
+
+    #[test]
+    fn non_streaming_web_search_maps_to_anthropic_server_blocks() {
+        let data = json!({
+            "id":"resp_1",
+            "model":"gpt-5",
+            "status":"completed",
+            "output":[{
+                "type":"web_search_call",
+                "id":"ws_1",
+                "action":{
+                    "query":"rust",
+                    "sources":[{"title":"Rust","url":"https://www.rust-lang.org/"}]
+                }
+            }],
+            "usage":{}
+        });
+        let events = convert_non_streaming_response(&data);
+        assert_anthropic_block_lifecycle(&events);
+        let types = events
+            .iter()
+            .filter_map(|event| event.data["content_block"]["type"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(types, vec!["server_tool_use", "web_search_tool_result"]);
+        assert!(events.iter().any(|event| {
+            event.data["content_block"]["content"][0]["url"] == "https://www.rust-lang.org/"
+        }));
+    }
+
+    fn text_and_thinking_deltas(events: &[SseEvent]) -> Vec<(String, String)> {
+        events
+            .iter()
+            .filter_map(|event| {
+                if event.event != "content_block_delta" {
+                    return None;
+                }
+                let delta = &event.data["delta"];
+                match delta["type"].as_str()? {
+                    "text_delta" => Some((
+                        "text_delta".to_string(),
+                        delta["text"].as_str()?.to_string(),
+                    )),
+                    "thinking_delta" => Some((
+                        "thinking_delta".to_string(),
+                        delta["thinking"].as_str()?.to_string(),
+                    )),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    fn temp_read_fixture(lines: usize) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "aisub2api-read-fixture-{}-{}.txt",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let body = (1..=lines)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(&path, body).expect("write read fixture");
+        path
+    }
+}

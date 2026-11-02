@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Breaking
+
+- Renamed the product, repository, Rust crates, release artifacts, binary, CLI command, and runtime paths from `claude-proxy` to `aisub2api`.
+- Moved the canonical configuration directory to `~/.config/aisub2api` and the model capability cache to the platform cache directory under `aisub2api`.
+
+### Changed
+
+- Repositioned the project around its primary job: exposing ChatGPT/Codex and GitHub Copilot subscriptions through Anthropic- and OpenAI-compatible APIs. Multi-provider routing remains available as a supporting capability.
+- Updated the CLI help, TUI labels, installers, release workflow, diagnostics script, documentation, and architecture metadata to use the single canonical name `aisub2api`.
+
+### Migration
+
+- On first CLI startup, if the new state directory does not exist, `aisub2api` atomically moves the legacy configuration and cache directories to their new locations. OAuth tokens, metrics, logs, and cached model capabilities are retained.
+- If old and new state directories both exist, `aisub2api` does not merge or overwrite either directory and prints a warning. Resolve the duplicate state explicitly before continuing.
+
 ## v4.0.3 - 2026-10-17
 
 ### Added
@@ -266,7 +283,7 @@
 
 ### Changed in v1.3.5
 
-- Claude Code settings sync now defaults `ENABLE_TOOL_SEARCH=true` for proxy-backed sessions, including during `claude-proxy server start`, while preserving an explicit user override.
+- Claude Code settings sync now defaults `ENABLE_TOOL_SEARCH=true` for proxy-backed sessions, including during `aisub2api server start`, while preserving an explicit user override.
 - Improved Anthropic streaming correctness by decoding complete SSE frames before forwarding events.
 - Added anti-buffering headers to SSE responses to discourage intermediary response buffering.
 
@@ -285,14 +302,14 @@
 
 ### Removed in v1.3.3
 
-- Removed the `claude-proxy completions` command and shell-completion documentation.
+- Removed the `aisub2api completions` command and shell-completion documentation.
 
 ## v1.3.2 - 2026-05-27
 
 ### Added in v1.3.2
 
-- Added `claude-proxy clean` to remove local log files and the persisted `metrics.db` SQLite database files, with daemon-running protection by default.
-- Added `claude-proxy logs` to stream the active or explicitly selected log file in real time from the terminal.
+- Added `aisub2api clean` to remove local log files and the persisted `metrics.db` SQLite database files, with daemon-running protection by default.
+- Added `aisub2api logs` to stream the active or explicitly selected log file in real time from the terminal.
 
 ## v1.3.1 - 2026-05-27
 
@@ -374,7 +391,7 @@ This release focuses on ChatGPT/Codex compatibility, output-budget resilience, a
 - Fresh oversized tool results are now bounded with head/tail retention before being forwarded to Responses, reducing the chance that one large tool output breaks a Claude Code turn.
 - ChatGPT Responses `max_output_tokens` is clamped against known model output limits, including the common `gpt-5.4-mini` 16,384-token ceiling.
 - ChatGPT upstream output-limit failures are normalized into clearer Anthropic-compatible `max_tokens` guidance while preserving the correct 400/413 response classes.
-- Workspace package metadata now points to the actual repository, `https://github.com/MorseWayne/claude-proxy`.
+- Workspace package metadata now points to the actual repository, `https://github.com/MorseWayne/aisub2api`.
 
 ### Notes
 

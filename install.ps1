@@ -1,11 +1,11 @@
 $ErrorActionPreference = "Stop"
 
-$Repo = "MorseWayne/claude-proxy"
+$Repo = "MorseWayne/aisub2api"
 $Target = "x86_64-pc-windows-msvc"
-$InstallDir = if ($env:CLP_INSTALL_DIR) {
-    $env:CLP_INSTALL_DIR
+$InstallDir = if ($env:AISUB2API_INSTALL_DIR) {
+    $env:AISUB2API_INSTALL_DIR
 } else {
-    Join-Path $env:LOCALAPPDATA "Programs\claude-proxy"
+    Join-Path $env:LOCALAPPDATA "Programs\aisub2api"
 }
 $ServiceWasRunning = $false
 
@@ -42,13 +42,13 @@ function Add-ToUserPath {
 
         [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
         Write-Host "Added $PathToAdd to your user PATH."
-        Write-Host "Restart your terminal to use claude-proxy globally."
+        Write-Host "Restart your terminal to use aisub2api globally."
         Write-Host ""
     }
 }
 
-function Get-ClaudeProxyProcesses {
-    @(Get-Process -Name "claude-proxy" -ErrorAction SilentlyContinue)
+function Get-AiSub2ApiProcesses {
+    @(Get-Process -Name "aisub2api", "claude-proxy" -ErrorAction SilentlyContinue)
 }
 
 function Confirm-YesNo {
@@ -62,13 +62,13 @@ function Confirm-YesNo {
 }
 
 function Prepare-ExistingService {
-    if ((Get-ClaudeProxyProcesses).Count -gt 0) {
+    if ((Get-AiSub2ApiProcesses).Count -gt 0) {
         $script:ServiceWasRunning = $true
-        Write-Host "A running claude-proxy process was detected."
+        Write-Host "A running aisub2api or legacy process was detected."
         Write-Host "Continuing installation will stop it before replacing the binary."
     }
 
-    if (-not (Confirm-YesNo -Prompt "Continue installing claude-proxy?")) {
+    if (-not (Confirm-YesNo -Prompt "Continue installing aisub2api?")) {
         Write-Host "Installation cancelled."
         exit 1
     }
@@ -79,19 +79,19 @@ function Stop-ExistingService {
         return
     }
 
-    $processes = Get-ClaudeProxyProcesses
+    $processes = Get-AiSub2ApiProcesses
     if ($processes.Count -eq 0) {
-        Write-Host "claude-proxy is no longer running."
+        Write-Host "aisub2api is no longer running."
         return
     }
 
-    Write-Host "Stopping existing claude-proxy process..."
+    Write-Host "Stopping existing aisub2api process..."
     $processes | Stop-Process -Force -ErrorAction Stop
 
     foreach ($process in $processes) {
         Wait-Process -Id $process.Id -Timeout 10 -ErrorAction SilentlyContinue
         if (Get-Process -Id $process.Id -ErrorAction SilentlyContinue) {
-            throw "Failed to stop claude-proxy process $($process.Id) within 10 seconds."
+            throw "Failed to stop aisub2api process $($process.Id) within 10 seconds."
         }
     }
 }
@@ -102,29 +102,29 @@ function Start-InstalledService {
         [string]$BinaryPath
     )
 
-    if (-not (Confirm-YesNo -Prompt "Start claude-proxy now?")) {
+    if (-not (Confirm-YesNo -Prompt "Start aisub2api now?")) {
         return
     }
 
-    if (Confirm-YesNo -Prompt "Run claude-proxy in the background?") {
-        Write-Host "Starting claude-proxy in the background..."
+    if (Confirm-YesNo -Prompt "Run aisub2api in the background?") {
+        Write-Host "Starting aisub2api in the background..."
         Start-Process -FilePath $BinaryPath -ArgumentList @("server", "start") -WindowStyle Hidden | Out-Null
     } else {
-        Write-Host "Starting claude-proxy in the foreground..."
+        Write-Host "Starting aisub2api in the foreground..."
         & $BinaryPath server start
     }
 }
 
-function Install-ClaudeProxy {
+function Install-AiSub2Api {
     Test-Architecture
 
-    $archive = "claude-proxy-$Target.zip"
+    $archive = "aisub2api-$Target.zip"
     $url = "https://github.com/$Repo/releases/latest/download/$archive"
     $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
 
     Prepare-ExistingService
 
-    Write-Host "Downloading claude-proxy for Windows..."
+    Write-Host "Downloading aisub2api for Windows..."
     Write-Host "  URL: $url"
 
     New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
@@ -137,8 +137,8 @@ function Install-ClaudeProxy {
         Stop-ExistingService
 
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-        $binaryPath = Join-Path $InstallDir "claude-proxy.exe"
-        Move-Item -Force (Join-Path $tempDir "claude-proxy.exe") $binaryPath
+        $binaryPath = Join-Path $InstallDir "aisub2api.exe"
+        Move-Item -Force (Join-Path $tempDir "aisub2api.exe") $binaryPath
 
         Write-Host ""
         Write-Host "Installed to $binaryPath"
@@ -156,4 +156,4 @@ function Install-ClaudeProxy {
     }
 }
 
-Install-ClaudeProxy
+Install-AiSub2Api

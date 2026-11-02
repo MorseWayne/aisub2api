@@ -4,7 +4,7 @@ Date: 2026-06-08
 
 ## Goal
 
-Keep `claude-proxy` aligned with Codex's recent Responses Lite and WebSocket protocol changes while adding enough observability to measure whether the proxy is reducing repeated upstream payloads.
+Keep `aisub2api` aligned with Codex's recent Responses Lite and WebSocket protocol changes while adding enough observability to measure whether the proxy is reducing repeated upstream payloads.
 
 ## Approved scope
 
@@ -27,7 +27,7 @@ Implement a conservative first slice:
 
 ### 1. Responses Lite transport markers
 
-Codex now sends a Responses Lite marker when the selected model uses Responses Lite. `claude-proxy` should mirror this for ChatGPT/Codex upstream calls.
+Codex now sends a Responses Lite marker when the selected model uses Responses Lite. `aisub2api` should mirror this for ChatGPT/Codex upstream calls.
 
 For HTTP Responses requests, add this header only when the request is known to be Responses Lite:
 
@@ -65,7 +65,7 @@ Use `1` for true, `0` for false when known, and `NULL` when unavailable.
 
 ### 3. Continuation saved bytes
 
-`claude-proxy` already records logical request body bytes and actual upstream send body bytes. Add a derived metric:
+`aisub2api` already records logical request body bytes and actual upstream send body bytes. Add a derived metric:
 
 ```text
 continuation_saved_bytes = max(request_body_bytes - upstream_send_body_bytes, 0)
@@ -105,7 +105,7 @@ Add focused tests that cover the new behavior without requiring live ChatGPT acc
 
 ## Risks
 
-- The Responses Lite capability source may not yet be explicit in `claude-proxy`. Keep detection narrow and test-covered to avoid enabling the marker for unrelated models.
+- The Responses Lite capability source may not yet be explicit in `aisub2api`. Keep detection narrow and test-covered to avoid enabling the marker for unrelated models.
 - WebSocket metadata shape is protocol-sensitive. Add tests around the serialized `response.create` payload instead of relying only on helper-level tests.
 - Metrics schema changes must remain compatible with existing user databases.
 - ANSI-free logging should not remove terminal color unless the current logging architecture makes per-layer control impossible.

@@ -7,17 +7,17 @@ Read this reference only when the upstream delta affects Responses, ChatGPT/Code
 Keep these separate during analysis:
 
 1. The current official OpenAI Responses API contract.
-2. The narrower downstream contract deliberately exposed by claude-proxy.
+2. The narrower downstream contract deliberately exposed by aisub2api.
 3. The observed private ChatGPT/Codex backend contract.
 
-At the reviewed baseline, claude-proxy required `stream: true`, forced `store: false`, rejected stateful fields, and accepted string or item-array input. Native Responses routing was limited to OpenAI and ChatGPT providers.
+At the reviewed baseline, aisub2api required `stream: true`, forced `store: false`, rejected stateful fields, and accepted string or item-array input. Native Responses routing was limited to OpenAI and ChatGPT providers.
 
 ## Provider Differences Observed
 
 - OpenAI accepted standard `input`, `text.format`, and `max_output_tokens` behavior through native passthrough.
-- The ChatGPT/Codex backend required list input; claude-proxy normalized public string input to a user item.
-- The backend rejected `max_output_tokens`; claude-proxy removed it while retaining the requested value only for observability. This does not enforce an output limit.
-- Responses Lite required `reasoning.context=all_turns` and `parallel_tool_calls=false`; claude-proxy applied both only when Lite was effective.
+- The ChatGPT/Codex backend required list input; aisub2api normalized public string input to a user item.
+- The backend rejected `max_output_tokens`; aisub2api removed it while retaining the requested value only for observability. This does not enforce an output limit.
+- Responses Lite required `reasoning.context=all_turns` and `parallel_tool_calls=false`; aisub2api applied both only when Lite was effective.
 - `text.format.type=json_schema` succeeded end to end after isolating those unrelated request-shape failures.
 
 These are dated observations. Compare new Codex builders, fixtures, model metadata, and live behavior before keeping or removing a workaround.

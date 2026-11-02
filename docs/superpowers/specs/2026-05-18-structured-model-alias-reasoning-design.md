@@ -177,7 +177,7 @@ Claude Code env 同步仍只同步模型名相关环境变量，不同步 reason
   - `provider switch` 和 provider add 更新默认模型名时保留已有 `model.default.reasoning_effort`。
 - 工作区验证：
   - `cargo fmt --check`
-  - `cargo test -p claude-proxy-config`
+  - `cargo test -p aisub2api-config`
   - 相关 server/TUI 目标测试
   - 必要时 `cargo test`
   - `cargo clippy -- -D warnings`

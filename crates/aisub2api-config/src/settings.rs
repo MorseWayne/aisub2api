@@ -1,0 +1,1946 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::error::ConfigError;
+
+pub const REASONING_MARKER_MODE_EXTRA_KEY: &str = "__aisub2api_reasoning_marker_mode";
+
+/// Top-level configuration loaded from TOML.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Settings {
+    #[serde(default)]
+    pub providers: HashMap<String, ProviderConfig>,
+
+    #[serde(default)]
+    pub model: ModelConfig,
+
+    #[serde(default)]
+    pub server: ServerConfig,
+
+    #[serde(default)]
+    pub admin: AdminConfig,
+
+    #[serde(default)]
+    pub limits: LimitsConfig,
+
+    #[serde(default)]
+    pub http: HttpConfig,
+
+    #[serde(default)]
+    pub log: LogConfig,
+
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    #[serde(default = "default_empty")]
+    pub api_key: String,
+    #[serde(default = "default_empty")]
+    pub base_url: String,
+    #[serde(default = "default_empty")]
+    pub proxy: String,
+    /// Known provider type. Inferred from the provider key if absent in old configs.
+    #[serde(default)]
+    pub provider_type: Option<ProviderType>,
+    /// Copilot-specific OAuth and optimization configuration.
+    #[serde(default)]
+    pub copilot: Option<CopilotProviderConfig>,
+    /// ChatGPT-specific Codex request configuration.
+    #[serde(default)]
+    pub chatgpt: Option<ChatGptProviderConfig>,
+    /// Provider-specific upstream runtime policy and request options.
+    #[serde(default)]
+    pub runtime: ProviderRuntimeConfig,
+    /// How plain text marker tags such as [thinking] are handled for this provider.
+    #[serde(default)]
+    pub reasoning_markers: ReasoningMarkerMode,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderRuntimeConfig {
+    #[serde(default)]
+    pub retry: ProviderRetryConfig,
+    #[serde(default)]
+    pub request: ProviderRequestConfig,
+    #[serde(default)]
+    pub openai: OpenAiRuntimeConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderRetryConfig {
+    #[serde(default)]
+    pub max_attempts: Option<usize>,
+    #[serde(default)]
+    pub base_delay_ms: Option<u64>,
+    /// Retry budget used only for connection-establishment failures.
+    #[serde(default)]
+    pub connection_max_attempts: Option<usize>,
+    /// Initial exponential backoff for connection-establishment failures.
+    #[serde(default)]
+    pub connection_base_delay_ms: Option<u64>,
+    /// Maximum exponential backoff for connection-establishment failures.
+    #[serde(default)]
+    pub connection_max_delay_ms: Option<u64>,
+    #[serde(default)]
+    pub network_errors: Option<bool>,
+    #[serde(default)]
+    pub timeout_errors: Option<bool>,
+    #[serde(default)]
+    pub rate_limits: Option<bool>,
+    #[serde(default)]
+    pub transient_statuses: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderRequestConfig {
+    #[serde(default)]
+    pub attempt_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub stream_idle_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub extra_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub query_params: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpenAiRuntimeConfig {
+    #[serde(default)]
+    pub service_tier: Option<String>,
+}
+
+impl ProviderConfig {
+    /// Resolve the provider type, falling back to inference from the provider ID.
+    pub fn resolve_type(&self, provider_id: &str) -> ProviderType {
+        self.provider_type
+            .clone()
+            .unwrap_or_else(|| ProviderType::parse(provider_id))
+    }
+
+    /// Whether this provider uses OAuth (not API key).
+    pub fn uses_oauth(&self, provider_id: &str) -> bool {
+        self.resolve_type(provider_id).auth_method() == AuthMethod::OAuth
+    }
+}
+
+/// Copilot provider configuration (OAuth + premium optimizations).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CopilotProviderConfig {
+    /// OAuth application to use: "vscode" (default) or "opencode".
+    #[serde(default = "default_oauth_app")]
+    pub oauth_app: String,
+    /// Model used for warmup requests (no tools, no beta header).
+    #[serde(default = "default_small_model")]
+    pub small_model: String,
+    /// Maximum thinking tokens for requests.
+    #[serde(default = "default_max_thinking_tokens")]
+    pub max_thinking_tokens: u32,
+    /// Enable warmup detection (route tool-less requests to small model).
+    #[serde(default = "default_true")]
+    pub enable_warmup: bool,
+    /// Enable tool_result merging to reduce premium request count.
+    #[serde(default = "default_true")]
+    pub enable_tool_result_merge: bool,
+    /// Enable compact/auto-continue request detection.
+    #[serde(default = "default_true")]
+    pub enable_compact_detection: bool,
+    /// Enable subagent marker detection (x-initiator: agent).
+    #[serde(default = "default_true")]
+    pub enable_agent_marking: bool,
+    /// Enable /responses routing when Copilot reports model support.
+    #[serde(default = "default_true")]
+    pub enable_responses_api: bool,
+}
+
+pub const CHATGPT_CODEX_ORIGINATOR: &str = "codex_cli_rs";
+pub const CHATGPT_CODEX_USER_AGENT: &str = "codex_cli_rs/1.0.0 (aisub2api)";
+pub const DEFAULT_CHATGPT_ORIGINATOR: &str = CHATGPT_CODEX_ORIGINATOR;
+pub const DEFAULT_CHATGPT_USER_AGENT: &str = CHATGPT_CODEX_USER_AGENT;
+
+/// ChatGPT provider configuration (OAuth + Codex backend request metadata).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatGptProviderConfig {
+    /// Optional originator header override sent to ChatGPT Codex requests.
+    #[serde(default = "default_empty", skip_serializing_if = "String::is_empty")]
+    pub originator: String,
+    /// Optional User-Agent header override sent to ChatGPT Codex requests.
+    #[serde(default = "default_empty", skip_serializing_if = "String::is_empty")]
+    pub user_agent: String,
+    /// Transport used for ChatGPT Codex Responses streams.
+    #[serde(default)]
+    pub transport: ChatGptTransport,
+    /// Enable Codex WebSocket prewarm by sending a generate=false request before the first real turn.
+    #[serde(default)]
+    pub websocket_prewarm: bool,
+    /// Responses Lite policy for ChatGPT Codex requests.
+    #[serde(default)]
+    pub responses_lite: ResponsesLiteMode,
+    /// Enable Codex-style standalone/custom tools for ChatGPT Codex requests.
+    #[serde(default = "default_true")]
+    pub standalone_tools: bool,
+    /// Enable Codex fast mode by sending the priority service tier when no explicit service tier is configured.
+    #[serde(default)]
+    pub fast_mode: bool,
+    /// Claude Code context projection policy for ChatGPT models.
+    #[serde(default)]
+    pub claude_code_context: ClaudeCodeContextMode,
+    /// Per-model capability overrides keyed by upstream model id.
+    #[serde(default)]
+    pub model_capabilities: HashMap<String, ChatGptModelCapabilityOverride>,
+}
+
+impl Default for ChatGptProviderConfig {
+    fn default() -> Self {
+        Self {
+            originator: default_empty(),
+            user_agent: default_empty(),
+            transport: ChatGptTransport::default(),
+            websocket_prewarm: false,
+            responses_lite: ResponsesLiteMode::Auto,
+            standalone_tools: true,
+            fast_mode: false,
+            claude_code_context: ClaudeCodeContextMode::Auto,
+            model_capabilities: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeCodeContextMode {
+    #[default]
+    Auto,
+    Standard,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesLiteMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl<'de> Deserialize<'de> for ResponsesLiteMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserialize_responses_lite_mode(deserializer)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChatGptModelCapabilityOverride {
+    #[serde(default)]
+    pub responses_lite: Option<bool>,
+    #[serde(default)]
+    pub context_window: Option<u32>,
+    #[serde(default)]
+    pub image_input: Option<bool>,
+    #[serde(default)]
+    pub reasoning_effort_levels: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatGptTransport {
+    Sse,
+    Websocket,
+    #[default]
+    Auto,
+}
+
+fn default_oauth_app() -> String {
+    "vscode".to_string()
+}
+fn default_small_model() -> String {
+    "gpt-5-mini".to_string()
+}
+fn default_max_thinking_tokens() -> u32 {
+    16000
+}
+fn default_true() -> bool {
+    true
+}
+
+fn deserialize_responses_lite_mode<'de, D>(deserializer: D) -> Result<ResponsesLiteMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct Visitor;
+
+    impl serde::de::Visitor<'_> for Visitor {
+        type Value = ResponsesLiteMode;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(r#"a boolean or one of "auto", "on", "off""#)
+        }
+
+        fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(if value {
+                ResponsesLiteMode::On
+            } else {
+                ResponsesLiteMode::Off
+            })
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "auto" => Ok(ResponsesLiteMode::Auto),
+                "on" | "true" | "enabled" => Ok(ResponsesLiteMode::On),
+                "off" | "false" | "disabled" => Ok(ResponsesLiteMode::Off),
+                other => Err(E::custom(format!(
+                    "invalid responses_lite mode `{other}`, expected auto, on, or off"
+                ))),
+            }
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_str(&value)
+        }
+    }
+
+    deserializer.deserialize_any(Visitor)
+}
+
+/// Authentication method for a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthMethod {
+    #[serde(rename = "api_key")]
+    ApiKey,
+    #[serde(rename = "oauth")]
+    OAuth,
+}
+
+/// Known provider type. Informs base URL, auth method, and provider implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderType {
+    OpenAI,
+    Anthropic,
+    Copilot,
+    ChatGPT,
+    OpenRouter,
+    Google,
+    /// Custom OpenAI-compatible endpoint.
+    Custom(String),
+    /// Custom Anthropic-compatible endpoint.
+    CustomAnthropic(String),
+}
+
+impl std::str::FromStr for ProviderType {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
+            "openai" => ProviderType::OpenAI,
+            "anthropic" => ProviderType::Anthropic,
+            "copilot" | "github-copilot" => ProviderType::Copilot,
+            "chatgpt" | "openai-chatgpt" => ProviderType::ChatGPT,
+            "openrouter" => ProviderType::OpenRouter,
+            "google" => ProviderType::Google,
+            "custom-anthropic" => ProviderType::CustomAnthropic(String::new()),
+            _ => ProviderType::Custom(s.to_string()),
+        })
+    }
+}
+
+impl ProviderType {
+    /// Parse from a string identifier (infallible alias for FromStr).
+    pub fn parse(s: &str) -> Self {
+        s.parse().unwrap()
+    }
+
+    /// Return the canonical string identifier.
+    pub fn as_str(&self) -> &str {
+        match self {
+            ProviderType::OpenAI => "openai",
+            ProviderType::Anthropic => "anthropic",
+            ProviderType::Copilot => "copilot",
+            ProviderType::ChatGPT => "chatgpt",
+            ProviderType::OpenRouter => "openrouter",
+            ProviderType::Google => "google",
+            ProviderType::Custom(s) => s.as_str(),
+            ProviderType::CustomAnthropic(s) => s.as_str(),
+        }
+    }
+
+    /// Human-readable display name for UI.
+    pub fn display_name(&self) -> &str {
+        match self {
+            ProviderType::OpenAI => "OpenAI",
+            ProviderType::Anthropic => "Anthropic",
+            ProviderType::Copilot => "GitHub Copilot",
+            ProviderType::ChatGPT => "ChatGPT",
+            ProviderType::OpenRouter => "OpenRouter",
+            ProviderType::Google => "Google",
+            ProviderType::Custom(_) => "Custom (OpenAI-compatible)",
+            ProviderType::CustomAnthropic(_) => "Custom (Anthropic-compatible)",
+        }
+    }
+
+    /// Default API base URL for this provider type.
+    pub fn default_base_url(&self) -> &str {
+        match self {
+            ProviderType::OpenAI => "https://api.openai.com/v1",
+            ProviderType::Anthropic => "https://api.anthropic.com",
+            ProviderType::Copilot => "https://api.githubcopilot.com",
+            ProviderType::ChatGPT => "https://chatgpt.com/backend-api/codex",
+            ProviderType::OpenRouter => "https://openrouter.ai/api/v1",
+            ProviderType::Google => "https://generativelanguage.googleapis.com/v1beta",
+            ProviderType::Custom(_) => "",
+            ProviderType::CustomAnthropic(_) => "",
+        }
+    }
+
+    /// How this provider authenticates.
+    pub fn auth_method(&self) -> AuthMethod {
+        match self {
+            ProviderType::Copilot | ProviderType::ChatGPT => AuthMethod::OAuth,
+            _ => AuthMethod::ApiKey,
+        }
+    }
+
+    /// Whether this provider requires an API key (not OAuth).
+    pub fn needs_api_key(&self) -> bool {
+        matches!(self.auth_method(), AuthMethod::ApiKey)
+    }
+
+    /// Default model name to use as fallback when switching providers.
+    pub fn default_model_name(&self) -> &str {
+        match self {
+            ProviderType::Copilot => "gpt-5",
+            ProviderType::ChatGPT => "gpt-5.6-sol",
+            _ => "",
+        }
+    }
+
+    /// All known provider types for selection UIs.
+    pub fn known_types() -> Vec<ProviderType> {
+        vec![
+            ProviderType::OpenAI,
+            ProviderType::Anthropic,
+            ProviderType::Copilot,
+            ProviderType::ChatGPT,
+            ProviderType::OpenRouter,
+            ProviderType::Google,
+            ProviderType::Custom(String::new()),
+            ProviderType::CustomAnthropic(String::new()),
+        ]
+    }
+}
+
+impl Serialize for ProviderType {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ProviderType::Custom(s) => serializer.serialize_str(&format!("custom:{s}")),
+            ProviderType::CustomAnthropic(s) => {
+                serializer.serialize_str(&format!("custom-anthropic:{s}"))
+            }
+            _ => serializer.serialize_str(self.as_str()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        if let Some(name) = s.strip_prefix("custom-anthropic:") {
+            Ok(ProviderType::CustomAnthropic(name.to_string()))
+        } else if let Some(name) = s.strip_prefix("custom:anthropic:") {
+            Ok(ProviderType::CustomAnthropic(name.to_string()))
+        } else if let Some(name) = s.strip_prefix("custom:") {
+            Ok(ProviderType::Custom(name.to_string()))
+        } else {
+            Ok(ProviderType::parse(&s))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelAliasConfig {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ModelReasoningEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_markers: Option<ReasoningMarkerMode>,
+}
+
+impl ModelAliasConfig {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            reasoning_effort: None,
+            reasoning_markers: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningMarkerMode {
+    #[default]
+    Strict,
+    LegacyTags,
+    SanitizeOnly,
+    Disabled,
+}
+
+impl ReasoningMarkerMode {
+    pub fn as_config_value(self) -> &'static str {
+        match self {
+            ReasoningMarkerMode::Strict => "strict",
+            ReasoningMarkerMode::LegacyTags => "legacy_tags",
+            ReasoningMarkerMode::SanitizeOnly => "sanitize_only",
+            ReasoningMarkerMode::Disabled => "disabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ModelReasoningEffort {
+    #[serde(rename = "default")]
+    Auto,
+    #[serde(rename = "none")]
+    Disabled,
+    #[serde(rename = "minimal")]
+    Minimal,
+    #[serde(rename = "low")]
+    Low,
+    #[serde(rename = "medium")]
+    Medium,
+    #[serde(rename = "high")]
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    #[serde(rename = "max")]
+    Max,
+    #[serde(rename = "ultra")]
+    Ultra,
+}
+
+impl ModelReasoningEffort {
+    pub fn request_value(self) -> Option<&'static str> {
+        match self {
+            ModelReasoningEffort::Auto => None,
+            ModelReasoningEffort::Disabled => Some("none"),
+            ModelReasoningEffort::Minimal => Some("minimal"),
+            ModelReasoningEffort::Low => Some("low"),
+            ModelReasoningEffort::Medium => Some("medium"),
+            ModelReasoningEffort::High => Some("high"),
+            ModelReasoningEffort::XHigh => Some("xhigh"),
+            ModelReasoningEffort::Max => Some("max"),
+            ModelReasoningEffort::Ultra => Some("ultra"),
+        }
+    }
+
+    pub fn as_config_value(self) -> &'static str {
+        match self {
+            ModelReasoningEffort::Auto => "default",
+            ModelReasoningEffort::Disabled => "none",
+            ModelReasoningEffort::Minimal => "minimal",
+            ModelReasoningEffort::Low => "low",
+            ModelReasoningEffort::Medium => "medium",
+            ModelReasoningEffort::High => "high",
+            ModelReasoningEffort::XHigh => "xhigh",
+            ModelReasoningEffort::Max => "max",
+            ModelReasoningEffort::Ultra => "ultra",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelAliasKind {
+    DefaultAlias,
+    Reasoning,
+    Opus,
+    Sonnet,
+    Haiku,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelResolutionSource {
+    DirectProviderModel,
+    Alias(ModelAliasKind),
+    DefaultProviderFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel {
+    pub requested_model: String,
+    pub provider_id: String,
+    pub upstream_model: String,
+    pub source: ModelResolutionSource,
+    pub reasoning_effort: Option<ModelReasoningEffort>,
+    pub reasoning_marker_mode: Option<ReasoningMarkerMode>,
+}
+
+impl ResolvedModel {
+    pub fn model_ref(&self) -> String {
+        format!("{}/{}", self.provider_id, self.upstream_model)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum ModelAliasConfigRepr {
+    Name(String),
+    Config(ModelAliasConfig),
+}
+
+impl From<ModelAliasConfigRepr> for ModelAliasConfig {
+    fn from(value: ModelAliasConfigRepr) -> Self {
+        match value {
+            ModelAliasConfigRepr::Name(name) => ModelAliasConfig::new(name),
+            ModelAliasConfigRepr::Config(config) => config,
+        }
+    }
+}
+
+fn deserialize_model_alias<'de, D>(deserializer: D) -> Result<ModelAliasConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    ModelAliasConfigRepr::deserialize(deserializer).map(Into::into)
+}
+
+fn deserialize_optional_model_alias<'de, D>(
+    deserializer: D,
+) -> Result<Option<ModelAliasConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<ModelAliasConfigRepr>::deserialize(deserializer).map(|value| value.map(Into::into))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelConfig {
+    #[serde(
+        default = "default_model_alias",
+        deserialize_with = "deserialize_model_alias"
+    )]
+    pub default: ModelAliasConfig,
+    #[serde(default, deserialize_with = "deserialize_optional_model_alias")]
+    pub reasoning: Option<ModelAliasConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_model_alias")]
+    pub opus: Option<ModelAliasConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_model_alias")]
+    pub sonnet: Option<ModelAliasConfig>,
+    #[serde(default, deserialize_with = "deserialize_optional_model_alias")]
+    pub haiku: Option<ModelAliasConfig>,
+}
+
+impl ModelConfig {
+    /// Configure GPT-5.6 role defaults for a newly-added ChatGPT/Codex provider.
+    /// Existing non-empty role aliases are preserved.
+    pub fn apply_chatgpt_56_defaults(&mut self, provider_id: &str) {
+        self.default = chatgpt_56_alias(provider_id, "gpt-5.6-sol");
+        self.reasoning
+            .get_or_insert_with(|| chatgpt_56_alias(provider_id, "gpt-5.6-sol"));
+        self.opus
+            .get_or_insert_with(|| chatgpt_56_alias(provider_id, "gpt-5.6-sol"));
+        self.sonnet
+            .get_or_insert_with(|| chatgpt_56_alias(provider_id, "gpt-5.6-terra"));
+        self.haiku
+            .get_or_insert_with(|| chatgpt_56_alias(provider_id, "gpt-5.6-luna"));
+    }
+
+    pub fn default_name(&self) -> &str {
+        &self.default.name
+    }
+
+    pub fn reasoning_name(&self) -> Option<&str> {
+        self.reasoning.as_ref().map(|alias| alias.name.as_str())
+    }
+
+    pub fn opus_name(&self) -> Option<&str> {
+        self.opus.as_ref().map(|alias| alias.name.as_str())
+    }
+
+    pub fn sonnet_name(&self) -> Option<&str> {
+        self.sonnet.as_ref().map(|alias| alias.name.as_str())
+    }
+
+    pub fn haiku_name(&self) -> Option<&str> {
+        self.haiku.as_ref().map(|alias| alias.name.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    #[serde(default = "default_host")]
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(default = "default_auth_token")]
+    pub auth_token: String,
+    #[serde(default = "default_sse_heartbeat_interval_seconds")]
+    pub sse_heartbeat_interval_seconds: u64,
+    #[serde(default = "default_stream_idle_timeout_seconds")]
+    pub stream_idle_timeout_seconds: u64,
+    #[serde(default = "default_stream_overall_timeout_seconds")]
+    pub stream_overall_timeout_seconds: u64,
+    #[serde(default = "default_tool_use_terminal_timeout_seconds")]
+    pub tool_use_terminal_timeout_seconds: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AdminConfig {
+    pub auth_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LimitsConfig {
+    #[serde(default = "default_rate_limit")]
+    pub rate_limit: u32,
+    #[serde(default = "default_rate_window")]
+    pub rate_window: u32,
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: u32,
+    /// Maximum number of requests allowed to wait for a global concurrency permit.
+    /// A value of zero disables waiting and preserves fail-fast admission.
+    #[serde(default = "default_max_concurrency_queue")]
+    pub max_concurrency_queue: u32,
+    #[serde(default = "default_provider_max_concurrency")]
+    pub provider_max_concurrency: u32,
+    /// Maximum number of requests allowed to wait for one provider's concurrency permit.
+    /// A value of zero disables waiting and preserves fail-fast admission.
+    #[serde(default = "default_provider_max_concurrency_queue")]
+    pub provider_max_concurrency_queue: u32,
+    #[serde(default = "default_model_cache_ttl_seconds")]
+    pub model_cache_ttl_seconds: u64,
+    /// Maximum logical payload bytes retained while assembling one non-stream response.
+    #[serde(default = "default_max_non_stream_response_bytes")]
+    pub max_non_stream_response_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpConfig {
+    #[serde(default = "default_read_timeout")]
+    pub read_timeout: u64,
+    #[serde(default = "default_write_timeout")]
+    pub write_timeout: u64,
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout: u64,
+    /// Maximum bytes read from one successful non-stream upstream response.
+    #[serde(default = "default_max_response_body_bytes")]
+    pub max_response_body_bytes: u64,
+    /// Maximum bytes buffered for one incomplete upstream SSE frame.
+    #[serde(default = "default_max_sse_frame_bytes")]
+    pub max_sse_frame_bytes: u64,
+    /// Extra CA certificate files (PEM, single cert or bundle) to trust in
+    /// addition to the built-in webpki Mozilla roots. Required for corporate
+    /// networks that perform TLS MITM (Fortinet, Zscaler, Bluecoat, ...) —
+    /// without this, every outbound HTTPS call fails with `error sending
+    /// request` even though `curl` works, because the rustls feature this
+    /// crate uses (`rustls-tls`) does not consult the system trust store.
+    ///
+    /// Example: `extra_ca_certs = ["/etc/ssl/certs/ca-certificates.crt"]`
+    /// or point at the specific corporate root, e.g.
+    /// `["/etc/ssl/certs/FG201ETK19909125.pem"]`.
+    #[serde(default)]
+    pub extra_ca_certs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogConfig {
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    /// Path to log file. Defaults to config_dir/aisub2api.log if not set.
+    #[serde(default)]
+    pub file: Option<String>,
+    /// Also emit logs to stderr (true for non-daemon server, false for TUI/daemon).
+    #[serde(default = "default_true")]
+    pub with_stdout: bool,
+    #[serde(default)]
+    pub raw_api_payloads: bool,
+    #[serde(default)]
+    pub raw_sse_events: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservabilityConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_observability_idle_gap_ms")]
+    pub idle_gap_ms: u64,
+}
+
+// --- Defaults ---
+
+fn default_empty() -> String {
+    String::new()
+}
+fn default_model() -> String {
+    "openai/gpt-4.1".to_string()
+}
+fn default_model_alias() -> ModelAliasConfig {
+    ModelAliasConfig::new(default_model())
+}
+fn default_host() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_port() -> u16 {
+    8082
+}
+fn default_auth_token() -> String {
+    "freecc".to_string()
+}
+fn default_sse_heartbeat_interval_seconds() -> u64 {
+    15
+}
+fn default_stream_idle_timeout_seconds() -> u64 {
+    300
+}
+fn default_stream_overall_timeout_seconds() -> u64 {
+    600
+}
+fn default_tool_use_terminal_timeout_seconds() -> u64 {
+    120
+}
+fn default_rate_limit() -> u32 {
+    240
+}
+fn default_rate_window() -> u32 {
+    60
+}
+fn default_max_concurrency() -> u32 {
+    5
+}
+fn default_max_concurrency_queue() -> u32 {
+    32
+}
+fn default_provider_max_concurrency() -> u32 {
+    4
+}
+fn default_provider_max_concurrency_queue() -> u32 {
+    16
+}
+fn default_model_cache_ttl_seconds() -> u64 {
+    60 * 60
+}
+fn default_max_non_stream_response_bytes() -> u64 {
+    32 * 1024 * 1024
+}
+fn default_read_timeout() -> u64 {
+    300
+}
+fn default_write_timeout() -> u64 {
+    60
+}
+fn default_connect_timeout() -> u64 {
+    60
+}
+fn default_max_response_body_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+fn default_max_sse_frame_bytes() -> u64 {
+    1024 * 1024
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
+fn default_observability_idle_gap_ms() -> u64 {
+    30_000
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            default: default_model_alias(),
+            reasoning: None,
+            opus: None,
+            sonnet: None,
+            haiku: None,
+        }
+    }
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            host: default_host(),
+            port: default_port(),
+            auth_token: default_auth_token(),
+            sse_heartbeat_interval_seconds: default_sse_heartbeat_interval_seconds(),
+            stream_idle_timeout_seconds: default_stream_idle_timeout_seconds(),
+            stream_overall_timeout_seconds: default_stream_overall_timeout_seconds(),
+            tool_use_terminal_timeout_seconds: default_tool_use_terminal_timeout_seconds(),
+        }
+    }
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            rate_limit: default_rate_limit(),
+            rate_window: default_rate_window(),
+            max_concurrency: default_max_concurrency(),
+            max_concurrency_queue: default_max_concurrency_queue(),
+            provider_max_concurrency: default_provider_max_concurrency(),
+            provider_max_concurrency_queue: default_provider_max_concurrency_queue(),
+            model_cache_ttl_seconds: default_model_cache_ttl_seconds(),
+            max_non_stream_response_bytes: default_max_non_stream_response_bytes(),
+        }
+    }
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            read_timeout: default_read_timeout(),
+            write_timeout: default_write_timeout(),
+            connect_timeout: default_connect_timeout(),
+            max_response_body_bytes: default_max_response_body_bytes(),
+            max_sse_frame_bytes: default_max_sse_frame_bytes(),
+            extra_ca_certs: Vec::new(),
+        }
+    }
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            file: None,
+            with_stdout: true,
+            raw_api_payloads: false,
+            raw_sse_events: false,
+        }
+    }
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            idle_gap_ms: default_observability_idle_gap_ms(),
+        }
+    }
+}
+
+fn resolved_model(
+    requested_model: &str,
+    provider_id: &str,
+    upstream_model: &str,
+    source: ModelResolutionSource,
+    reasoning_effort: Option<ModelReasoningEffort>,
+    reasoning_marker_mode: Option<ReasoningMarkerMode>,
+) -> ResolvedModel {
+    ResolvedModel {
+        requested_model: requested_model.to_string(),
+        provider_id: provider_id.to_string(),
+        upstream_model: upstream_model.to_string(),
+        source,
+        reasoning_effort,
+        reasoning_marker_mode,
+    }
+}
+
+impl Settings {
+    /// Load settings from a TOML file.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(path).map_err(|e| ConfigError::Read {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        Self::from_toml(&content, path)
+    }
+
+    /// Parse settings from a TOML string.
+    pub fn from_toml(content: &str, path: &Path) -> Result<Self, ConfigError> {
+        let mut settings: Self = toml::from_str(content).map_err(|e| ConfigError::Parse {
+            path: path.to_path_buf(),
+            message: e.to_string(),
+        })?;
+        settings.infer_provider_types();
+        Ok(settings)
+    }
+
+    /// Fill in missing provider_type fields from the HashMap key.
+    pub fn infer_provider_types(&mut self) {
+        for (id, config) in self.providers.iter_mut() {
+            if config.provider_type.is_none() {
+                config.provider_type = Some(ProviderType::parse(id));
+            }
+        }
+    }
+
+    /// Serialize settings to a TOML string.
+    pub fn to_toml(&self) -> String {
+        toml::to_string_pretty(self).expect("Settings serialization should not fail")
+    }
+
+    /// Resolve a Claude model name to a `provider_id/upstream_model` string.
+    pub fn resolve_model(&self, claude_model: &str) -> String {
+        self.resolve_model_with_intent(claude_model, None)
+            .model_ref()
+    }
+
+    pub fn resolve_model_with_intent(
+        &self,
+        claude_model: &str,
+        intent: Option<&str>,
+    ) -> ResolvedModel {
+        if claude_model.contains('/') {
+            return resolved_model(
+                claude_model,
+                Self::parse_provider_id(claude_model),
+                Self::parse_model_name(claude_model),
+                ModelResolutionSource::DirectProviderModel,
+                self.reasoning_effort_for_model_ref(claude_model),
+                self.reasoning_markers_for_model_ref(claude_model),
+            );
+        }
+
+        let lower = claude_model.to_lowercase();
+        if lower.contains("opus")
+            && let Some(ref alias) = self.model.opus
+        {
+            return self.resolve_alias(claude_model, alias, ModelAliasKind::Opus);
+        } else if lower.contains("haiku")
+            && let Some(ref alias) = self.model.haiku
+        {
+            return self.resolve_alias(claude_model, alias, ModelAliasKind::Haiku);
+        } else if lower.contains("sonnet")
+            && let Some(ref alias) = self.model.sonnet
+        {
+            return self.resolve_alias(claude_model, alias, ModelAliasKind::Sonnet);
+        } else if self.should_use_reasoning_alias(&lower, intent)
+            && let Some(ref alias) = self.model.reasoning
+        {
+            return self.resolve_alias(claude_model, alias, ModelAliasKind::Reasoning);
+        } else if lower == "default" {
+            return self.resolve_alias(
+                claude_model,
+                &self.model.default,
+                ModelAliasKind::DefaultAlias,
+            );
+        }
+
+        resolved_model(
+            claude_model,
+            Self::parse_provider_id(&self.model.default.name),
+            claude_model,
+            ModelResolutionSource::DefaultProviderFallback,
+            None,
+            None,
+        )
+    }
+
+    fn should_use_reasoning_alias(&self, lower_model: &str, intent: Option<&str>) -> bool {
+        lower_model.contains("reasoning") || matches!(intent, Some("deep_think" | "reasoning"))
+    }
+
+    fn resolve_alias(
+        &self,
+        requested_model: &str,
+        alias: &ModelAliasConfig,
+        kind: ModelAliasKind,
+    ) -> ResolvedModel {
+        resolved_model(
+            requested_model,
+            Self::parse_provider_id(&alias.name),
+            Self::parse_model_name(&alias.name),
+            ModelResolutionSource::Alias(kind),
+            alias.reasoning_effort,
+            alias.reasoning_markers,
+        )
+    }
+
+    fn reasoning_effort_for_model_ref(&self, model_ref: &str) -> Option<ModelReasoningEffort> {
+        [
+            self.model.reasoning.as_ref(),
+            self.model.opus.as_ref(),
+            self.model.sonnet.as_ref(),
+            self.model.haiku.as_ref(),
+            Some(&self.model.default),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|alias| alias.name == model_ref)
+        .and_then(|alias| alias.reasoning_effort)
+    }
+
+    fn reasoning_markers_for_model_ref(&self, model_ref: &str) -> Option<ReasoningMarkerMode> {
+        [
+            self.model.reasoning.as_ref(),
+            self.model.opus.as_ref(),
+            self.model.sonnet.as_ref(),
+            self.model.haiku.as_ref(),
+            Some(&self.model.default),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|alias| alias.name == model_ref)
+        .and_then(|alias| alias.reasoning_markers)
+    }
+
+    /// Extract the provider ID from a `provider_id/model` string (first `/` only).
+    pub fn parse_provider_id(model_ref: &str) -> &str {
+        model_ref
+            .find('/')
+            .map(|i| &model_ref[..i])
+            .unwrap_or(model_ref)
+    }
+
+    /// Extract the upstream model name from a `provider_id/model` string (first `/` only).
+    pub fn parse_model_name(model_ref: &str) -> &str {
+        model_ref
+            .find('/')
+            .map(|i| &model_ref[i + 1..])
+            .unwrap_or(model_ref)
+    }
+
+    /// Get the admin auth token, falling back to server.auth_token.
+    pub fn admin_auth_token(&self) -> &str {
+        self.admin
+            .auth_token
+            .as_deref()
+            .unwrap_or(&self.server.auth_token)
+    }
+
+    /// Get the config file path for this platform.
+    pub fn config_dir() -> Option<PathBuf> {
+        crate::paths::config_dir()
+    }
+
+    /// Get the full config file path.
+    pub fn config_file_path() -> Option<PathBuf> {
+        Self::config_dir().map(|p| p.join("config.toml"))
+    }
+
+    /// Validate the settings, returning errors for critical issues.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.server.port == 0 {
+            return Err(ConfigError::Validation(
+                "server.port must be non-zero".to_string(),
+            ));
+        }
+        if self.limits.rate_limit == 0 {
+            return Err(ConfigError::Validation(
+                "limits.rate_limit must be > 0".to_string(),
+            ));
+        }
+        if self.limits.max_concurrency == 0 {
+            return Err(ConfigError::Validation(
+                "limits.max_concurrency must be > 0".to_string(),
+            ));
+        }
+        if self.limits.provider_max_concurrency == 0 {
+            return Err(ConfigError::Validation(
+                "limits.provider_max_concurrency must be > 0".to_string(),
+            ));
+        }
+        if self.limits.model_cache_ttl_seconds == 0 {
+            return Err(ConfigError::Validation(
+                "limits.model_cache_ttl_seconds must be > 0".to_string(),
+            ));
+        }
+        if self.limits.max_non_stream_response_bytes == 0 {
+            return Err(ConfigError::Validation(
+                "limits.max_non_stream_response_bytes must be > 0".to_string(),
+            ));
+        }
+        if self.http.max_response_body_bytes == 0 {
+            return Err(ConfigError::Validation(
+                "http.max_response_body_bytes must be > 0".to_string(),
+            ));
+        }
+        if self.http.max_sse_frame_bytes == 0 {
+            return Err(ConfigError::Validation(
+                "http.max_sse_frame_bytes must be > 0".to_string(),
+            ));
+        }
+        // Validate model format: must contain provider_id/model_name
+        let models = [
+            ("model.default", Some(&self.model.default)),
+            ("model.reasoning", self.model.reasoning.as_ref()),
+            ("model.opus", self.model.opus.as_ref()),
+            ("model.sonnet", self.model.sonnet.as_ref()),
+            ("model.haiku", self.model.haiku.as_ref()),
+        ];
+        for (field, value) in models {
+            if let Some(alias) = value
+                && !alias.name.contains('/')
+            {
+                return Err(ConfigError::Validation(format!(
+                    "{field}.name must be in 'provider_id/model_name' format, got: {}",
+                    alias.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn chatgpt_56_alias(provider_id: &str, model_id: &str) -> ModelAliasConfig {
+    let mut alias = ModelAliasConfig::new(format!("{provider_id}/{model_id}"));
+    alias.reasoning_effort = Some(ModelReasoningEffort::High);
+    alias
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_provider_id() {
+        assert_eq!(Settings::parse_provider_id("openai/gpt-4.1"), "openai");
+        assert_eq!(
+            Settings::parse_provider_id("anthropic/claude-opus-4-20250514"),
+            "anthropic"
+        );
+    }
+
+    #[test]
+    fn test_parse_model_name() {
+        assert_eq!(Settings::parse_model_name("openai/gpt-4.1"), "gpt-4.1");
+        assert_eq!(
+            Settings::parse_model_name("anthropic/claude-opus-4-20250514"),
+            "claude-opus-4-20250514"
+        );
+    }
+
+    #[test]
+    fn test_resolve_model() {
+        let settings = Settings {
+            model: ModelConfig {
+                default: ModelAliasConfig::new("openai/gpt-4.1"),
+                reasoning: None,
+                opus: Some(ModelAliasConfig::new("anthropic/claude-opus-4-20250514")),
+                sonnet: None,
+                haiku: Some(ModelAliasConfig::new("openai/gpt-4.1-mini")),
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            settings.resolve_model("claude-opus-4-20250514"),
+            "anthropic/claude-opus-4-20250514"
+        );
+        assert_eq!(
+            settings.resolve_model("claude-3-5-haiku-latest"),
+            "openai/gpt-4.1-mini"
+        );
+        assert_eq!(
+            settings.resolve_model("claude-sonnet-4-20250514"),
+            "openai/claude-sonnet-4-20250514"
+        );
+        assert_eq!(
+            settings.resolve_model("deepseek-v4-flash"),
+            "openai/deepseek-v4-flash"
+        );
+        assert_eq!(
+            settings.resolve_model("opencode-go/deepseek-v4-pro"),
+            "opencode-go/deepseek-v4-pro"
+        );
+    }
+
+    #[test]
+    fn explicit_provider_model_takes_precedence_over_role_aliases() {
+        let settings = Settings {
+            model: ModelConfig {
+                default: ModelAliasConfig::new("openai/gpt-4.1"),
+                reasoning: None,
+                opus: Some(ModelAliasConfig::new("anthropic/claude-opus-4-20250514")),
+                sonnet: Some(ModelAliasConfig::new("openai/gpt-4.1")),
+                haiku: Some(ModelAliasConfig::new("openai/gpt-4.1-mini")),
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            settings.resolve_model("copilot/claude-sonnet-4"),
+            "copilot/claude-sonnet-4"
+        );
+        assert_eq!(
+            settings.resolve_model("custom/claude-3-5-haiku-latest"),
+            "custom/claude-3-5-haiku-latest"
+        );
+    }
+
+    #[test]
+    fn resolve_model_reports_alias_source_and_reasoning_effort() {
+        let mut reasoning = ModelAliasConfig::new("openai/gpt-5");
+        reasoning.reasoning_effort = Some(ModelReasoningEffort::High);
+        reasoning.reasoning_markers = Some(ReasoningMarkerMode::LegacyTags);
+        let settings = Settings {
+            model: ModelConfig {
+                default: ModelAliasConfig::new("openai/gpt-4.1"),
+                reasoning: Some(reasoning),
+                opus: None,
+                sonnet: None,
+                haiku: None,
+            },
+            ..Default::default()
+        };
+
+        let resolved = settings.resolve_model_with_intent("claude-sonnet", Some("deep_think"));
+
+        assert_eq!(resolved.provider_id, "openai");
+        assert_eq!(resolved.upstream_model, "gpt-5");
+        assert_eq!(
+            resolved.source,
+            ModelResolutionSource::Alias(ModelAliasKind::Reasoning)
+        );
+        assert_eq!(resolved.reasoning_effort, Some(ModelReasoningEffort::High));
+        assert_eq!(
+            resolved.reasoning_marker_mode,
+            Some(ReasoningMarkerMode::LegacyTags)
+        );
+    }
+
+    #[test]
+    fn direct_and_fallback_models_do_not_inherit_default_reasoning_effort() {
+        let mut default = ModelAliasConfig::new("openai/gpt-4.1");
+        default.reasoning_effort = Some(ModelReasoningEffort::Disabled);
+        let settings = Settings {
+            model: ModelConfig {
+                default,
+                reasoning: None,
+                opus: None,
+                sonnet: None,
+                haiku: None,
+            },
+            ..Default::default()
+        };
+
+        let direct = settings.resolve_model_with_intent("copilot/gpt-5", None);
+        assert_eq!(direct.source, ModelResolutionSource::DirectProviderModel);
+        assert_eq!(direct.reasoning_effort, None);
+
+        let fallback = settings.resolve_model_with_intent("gpt-5", None);
+        assert_eq!(
+            fallback.source,
+            ModelResolutionSource::DefaultProviderFallback
+        );
+        assert_eq!(fallback.reasoning_effort, None);
+    }
+
+    #[test]
+    fn direct_model_ref_uses_matching_alias_reasoning_effort() {
+        let mut default = ModelAliasConfig::new("chatgpt/gpt-5.5");
+        default.reasoning_effort = Some(ModelReasoningEffort::Low);
+        let mut reasoning = ModelAliasConfig::new("chatgpt/gpt-5.5");
+        reasoning.reasoning_effort = Some(ModelReasoningEffort::High);
+        reasoning.reasoning_markers = Some(ReasoningMarkerMode::SanitizeOnly);
+        let settings = Settings {
+            model: ModelConfig {
+                default,
+                reasoning: Some(reasoning),
+                opus: None,
+                sonnet: None,
+                haiku: None,
+            },
+            ..Default::default()
+        };
+
+        let resolved = settings.resolve_model_with_intent("chatgpt/gpt-5.5", None);
+
+        assert_eq!(resolved.source, ModelResolutionSource::DirectProviderModel);
+        assert_eq!(resolved.provider_id, "chatgpt");
+        assert_eq!(resolved.upstream_model, "gpt-5.5");
+        assert_eq!(resolved.reasoning_effort, Some(ModelReasoningEffort::High));
+        assert_eq!(
+            resolved.reasoning_marker_mode,
+            Some(ReasoningMarkerMode::SanitizeOnly)
+        );
+    }
+
+    #[test]
+    fn reasoning_marker_mode_defaults_and_parses_overrides() {
+        let toml = r#"
+[providers.openai]
+reasoning_markers = "legacy_tags"
+
+[model]
+reasoning = { name = "openai/gpt-5", reasoning_markers = "sanitize_only" }
+"#;
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+
+        assert_eq!(
+            settings.providers["openai"].reasoning_markers,
+            ReasoningMarkerMode::LegacyTags
+        );
+        assert_eq!(
+            settings
+                .model
+                .reasoning
+                .as_ref()
+                .and_then(|alias| alias.reasoning_markers),
+            Some(ReasoningMarkerMode::SanitizeOnly)
+        );
+        assert_eq!(
+            Settings::from_toml("", Path::new("test.toml"))
+                .unwrap()
+                .providers
+                .get("openai")
+                .map(|provider| provider.reasoning_markers)
+                .unwrap_or_default(),
+            ReasoningMarkerMode::Strict
+        );
+    }
+
+    #[test]
+    fn structured_and_legacy_model_alias_toml_are_both_supported() {
+        let toml = r#"
+[model]
+default = "openai/gpt-4.1"
+reasoning = { name = "openai/gpt-5", reasoning_effort = "max" }
+
+[model.opus]
+name = "anthropic/claude-opus-4-20250514"
+reasoning_effort = "default"
+"#;
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+
+        assert_eq!(settings.model.default.name, "openai/gpt-4.1");
+        assert_eq!(settings.model.default.reasoning_effort, None);
+        assert_eq!(settings.model.reasoning_name(), Some("openai/gpt-5"));
+        assert_eq!(
+            settings
+                .model
+                .reasoning
+                .as_ref()
+                .and_then(|alias| alias.reasoning_effort),
+            Some(ModelReasoningEffort::Max)
+        );
+        assert_eq!(
+            settings.model.opus_name(),
+            Some("anthropic/claude-opus-4-20250514")
+        );
+        assert_eq!(
+            settings
+                .model
+                .opus
+                .as_ref()
+                .and_then(|alias| alias.reasoning_effort),
+            Some(ModelReasoningEffort::Auto)
+        );
+    }
+
+    #[test]
+    fn invalid_reasoning_effort_is_rejected() {
+        let toml = r#"
+[model.default]
+name = "openai/gpt-4.1"
+reasoning_effort = "extreme"
+"#;
+        let err = Settings::from_toml(toml, Path::new("test.toml")).unwrap_err();
+
+        assert!(matches!(err, ConfigError::Parse { .. }));
+    }
+
+    #[test]
+    fn new_chatgpt_provider_defaults_are_tiered_high_without_overwriting_roles() {
+        let mut model = ModelConfig {
+            default: ModelAliasConfig::new("openai/gpt-4.1"),
+            reasoning: None,
+            opus: Some(ModelAliasConfig::new("anthropic/claude-opus-4")),
+            sonnet: Some(ModelAliasConfig::new("openai/gpt-4.1")),
+            haiku: None,
+        };
+
+        model.apply_chatgpt_56_defaults("account");
+
+        assert_eq!(model.default.name, "account/gpt-5.6-sol");
+        assert_eq!(
+            model.default.reasoning_effort,
+            Some(ModelReasoningEffort::High)
+        );
+        assert_eq!(model.reasoning_name(), Some("account/gpt-5.6-sol"));
+        assert_eq!(model.opus_name(), Some("anthropic/claude-opus-4"));
+        assert_eq!(model.sonnet_name(), Some("openai/gpt-4.1"));
+        assert_eq!(model.haiku_name(), Some("account/gpt-5.6-luna"));
+        assert_eq!(
+            model
+                .haiku
+                .as_ref()
+                .and_then(|alias| alias.reasoning_effort),
+            Some(ModelReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn test_from_toml() {
+        let toml = r#"
+[model]
+default = "openai/gpt-4.1"
+
+[server]
+host = "0.0.0.0"
+port = 9090
+auth_token = "test-token"
+"#;
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+        assert_eq!(settings.server.port, 9090);
+        assert_eq!(settings.server.auth_token, "test-token");
+        assert_eq!(settings.limits.rate_limit, 240);
+        assert_eq!(settings.limits.max_concurrency_queue, 32);
+        assert_eq!(settings.limits.provider_max_concurrency_queue, 16);
+        assert_eq!(
+            settings.limits.max_non_stream_response_bytes,
+            32 * 1024 * 1024
+        );
+        assert_eq!(settings.http.max_response_body_bytes, 16 * 1024 * 1024);
+        assert_eq!(settings.http.max_sse_frame_bytes, 1024 * 1024);
+    }
+
+    #[test]
+    fn response_payload_limits_parse_overrides() {
+        let toml = r#"
+[limits]
+max_non_stream_response_bytes = 4096
+
+[http]
+max_response_body_bytes = 2048
+max_sse_frame_bytes = 1024
+"#;
+
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+
+        assert_eq!(settings.limits.max_non_stream_response_bytes, 4096);
+        assert_eq!(settings.http.max_response_body_bytes, 2048);
+        assert_eq!(settings.http.max_sse_frame_bytes, 1024);
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_response_payload_limits_are_rejected() {
+        for toml in [
+            "[limits]\nmax_non_stream_response_bytes = 0\n",
+            "[http]\nmax_response_body_bytes = 0\n",
+            "[http]\nmax_sse_frame_bytes = 0\n",
+        ] {
+            let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+            assert!(
+                settings.validate().is_err(),
+                "TOML should be rejected: {toml}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrency_queue_limits_parse_overrides_and_allow_fail_fast() {
+        let toml = r#"
+[limits]
+max_concurrency_queue = 7
+provider_max_concurrency_queue = 0
+"#;
+
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+
+        assert_eq!(settings.limits.max_concurrency_queue, 7);
+        assert_eq!(settings.limits.provider_max_concurrency_queue, 0);
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn server_stream_safeguard_defaults_and_overrides() {
+        let settings = Settings::from_toml("", Path::new("test.toml")).unwrap();
+        assert_eq!(settings.server.sse_heartbeat_interval_seconds, 15);
+        assert_eq!(settings.server.stream_idle_timeout_seconds, 300);
+        assert_eq!(settings.server.stream_overall_timeout_seconds, 600);
+        assert_eq!(settings.server.tool_use_terminal_timeout_seconds, 120);
+
+        let toml = r#"
+[server]
+sse_heartbeat_interval_seconds = 10
+stream_idle_timeout_seconds = 90
+stream_overall_timeout_seconds = 300
+tool_use_terminal_timeout_seconds = 20
+"#;
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+        assert_eq!(settings.server.sse_heartbeat_interval_seconds, 10);
+        assert_eq!(settings.server.stream_idle_timeout_seconds, 90);
+        assert_eq!(settings.server.stream_overall_timeout_seconds, 300);
+        assert_eq!(settings.server.tool_use_terminal_timeout_seconds, 20);
+    }
+
+    #[test]
+    fn observability_defaults_enabled_with_idle_gap() {
+        let settings = Settings::from_toml("", Path::new("test.toml")).unwrap();
+
+        assert!(settings.observability.enabled);
+        assert_eq!(settings.observability.idle_gap_ms, 30_000);
+    }
+
+    #[test]
+    fn observability_config_parses_overrides() {
+        let toml = r#"
+[observability]
+enabled = false
+idle_gap_ms = 45000
+"#;
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+
+        assert!(!settings.observability.enabled);
+        assert_eq!(settings.observability.idle_gap_ms, 45_000);
+    }
+
+    #[test]
+    fn provider_runtime_config_defaults_and_parses_overrides() {
+        let default_settings = Settings::from_toml(
+            r#"
+[providers.openai]
+api_key = "sk-test"
+"#,
+            Path::new("test.toml"),
+        )
+        .unwrap();
+        let default_runtime = &default_settings.providers["openai"].runtime;
+        assert_eq!(default_runtime.retry.max_attempts, None);
+        assert_eq!(default_runtime.retry.connection_max_attempts, None);
+        assert_eq!(default_runtime.request.attempt_timeout_seconds, None);
+        assert!(default_runtime.request.extra_headers.is_empty());
+        assert!(default_runtime.request.query_params.is_empty());
+        assert_eq!(default_runtime.openai.service_tier, None);
+
+        let toml = r#"
+[providers.openai]
+api_key = "sk-test"
+
+[providers.openai.runtime.retry]
+max_attempts = 5
+base_delay_ms = 150
+connection_max_attempts = 6
+connection_base_delay_ms = 5000
+connection_max_delay_ms = 60000
+network_errors = false
+timeout_errors = true
+rate_limits = false
+transient_statuses = true
+
+[providers.openai.runtime.request]
+attempt_timeout_seconds = 45
+stream_idle_timeout_seconds = 90
+extra_headers = { "x-test" = "enabled" }
+query_params = { "api-version" = "2026-05-22" }
+
+[providers.openai.runtime.openai]
+service_tier = "flex"
+"#;
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+        let runtime = &settings.providers["openai"].runtime;
+
+        assert_eq!(runtime.retry.max_attempts, Some(5));
+        assert_eq!(runtime.retry.base_delay_ms, Some(150));
+        assert_eq!(runtime.retry.connection_max_attempts, Some(6));
+        assert_eq!(runtime.retry.connection_base_delay_ms, Some(5_000));
+        assert_eq!(runtime.retry.connection_max_delay_ms, Some(60_000));
+        assert_eq!(runtime.retry.network_errors, Some(false));
+        assert_eq!(runtime.retry.timeout_errors, Some(true));
+        assert_eq!(runtime.retry.rate_limits, Some(false));
+        assert_eq!(runtime.retry.transient_statuses, Some(true));
+        assert_eq!(runtime.request.attempt_timeout_seconds, Some(45));
+        assert_eq!(runtime.request.stream_idle_timeout_seconds, Some(90));
+        assert_eq!(runtime.request.extra_headers["x-test"], "enabled");
+        assert_eq!(runtime.request.query_params["api-version"], "2026-05-22");
+        assert_eq!(runtime.openai.service_tier.as_deref(), Some("flex"));
+    }
+
+    #[test]
+    fn chatgpt_provider_config_parses_header_overrides() {
+        let toml = r#"
+[providers.chatgpt]
+provider_type = "chatgpt"
+base_url = "https://chatgpt.com/backend-api/codex"
+
+[providers.chatgpt.chatgpt]
+originator = "codex_cli"
+user_agent = "CodexCLI/1.2.3"
+transport = "websocket"
+websocket_prewarm = true
+responses_lite = false
+standalone_tools = false
+fast_mode = true
+"#;
+
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+        let provider = settings.providers.get("chatgpt").unwrap();
+        let chatgpt = provider.chatgpt.as_ref().unwrap();
+
+        assert_eq!(chatgpt.originator, "codex_cli");
+        assert_eq!(chatgpt.user_agent, "CodexCLI/1.2.3");
+        assert_eq!(chatgpt.transport, ChatGptTransport::Websocket);
+        assert!(chatgpt.websocket_prewarm);
+        assert_eq!(chatgpt.responses_lite, ResponsesLiteMode::Off);
+        assert!(!chatgpt.standalone_tools);
+        assert!(chatgpt.fast_mode);
+        assert_eq!(chatgpt.claude_code_context, ClaudeCodeContextMode::Auto);
+        assert_eq!(
+            ChatGptProviderConfig::default().transport,
+            ChatGptTransport::Auto
+        );
+        assert!(!ChatGptProviderConfig::default().websocket_prewarm);
+        assert_eq!(
+            ChatGptProviderConfig::default().responses_lite,
+            ResponsesLiteMode::Auto
+        );
+        assert!(ChatGptProviderConfig::default().standalone_tools);
+        assert!(!ChatGptProviderConfig::default().fast_mode);
+        assert_eq!(
+            ChatGptProviderConfig::default().claude_code_context,
+            ClaudeCodeContextMode::Auto
+        );
+    }
+
+    #[test]
+    fn chatgpt_provider_config_parses_standard_claude_context_mode() {
+        let settings = Settings::from_toml(
+            r#"
+[providers.chatgpt]
+provider_type = "chatgpt"
+
+[providers.chatgpt.chatgpt]
+claude_code_context = "standard"
+"#,
+            Path::new("test.toml"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            settings.providers["chatgpt"]
+                .chatgpt
+                .as_ref()
+                .unwrap()
+                .claude_code_context,
+            ClaudeCodeContextMode::Standard
+        );
+    }
+
+    #[test]
+    fn chatgpt_provider_config_parses_responses_lite_modes_and_overrides() {
+        let toml = r#"
+[providers.chatgpt]
+provider_type = "chatgpt"
+base_url = "https://chatgpt.com/backend-api/codex"
+
+[providers.chatgpt.chatgpt]
+responses_lite = "on"
+
+[providers.chatgpt.chatgpt.model_capabilities."gpt-5.3-codex-spark"]
+responses_lite = false
+context_window = 192000
+image_input = true
+reasoning_effort_levels = ["low", "high", "xhigh"]
+"#;
+
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+        let chatgpt = settings.providers["chatgpt"].chatgpt.as_ref().unwrap();
+
+        assert_eq!(chatgpt.responses_lite, ResponsesLiteMode::On);
+        assert_eq!(
+            chatgpt.model_capabilities["gpt-5.3-codex-spark"].responses_lite,
+            Some(false)
+        );
+        assert_eq!(
+            chatgpt.model_capabilities["gpt-5.3-codex-spark"].context_window,
+            Some(192_000)
+        );
+        assert_eq!(
+            chatgpt.model_capabilities["gpt-5.3-codex-spark"].image_input,
+            Some(true)
+        );
+        assert_eq!(
+            chatgpt.model_capabilities["gpt-5.3-codex-spark"]
+                .reasoning_effort_levels
+                .as_deref(),
+            Some(["low".to_string(), "high".to_string(), "xhigh".to_string()].as_slice())
+        );
+
+        let legacy_true = Settings::from_toml(
+            r#"
+[providers.chatgpt]
+provider_type = "chatgpt"
+
+[providers.chatgpt.chatgpt]
+responses_lite = true
+"#,
+            Path::new("test.toml"),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_true.providers["chatgpt"]
+                .chatgpt
+                .as_ref()
+                .unwrap()
+                .responses_lite,
+            ResponsesLiteMode::On
+        );
+
+        let legacy_false = Settings::from_toml(
+            r#"
+[providers.chatgpt]
+provider_type = "chatgpt"
+
+[providers.chatgpt.chatgpt]
+responses_lite = false
+"#,
+            Path::new("test.toml"),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy_false.providers["chatgpt"]
+                .chatgpt
+                .as_ref()
+                .unwrap()
+                .responses_lite,
+            ResponsesLiteMode::Off
+        );
+    }
+
+    #[test]
+    fn test_provider_type_parse() {
+        assert_eq!(ProviderType::parse("openai"), ProviderType::OpenAI);
+        assert_eq!(ProviderType::parse("anthropic"), ProviderType::Anthropic);
+        assert_eq!(ProviderType::parse("copilot"), ProviderType::Copilot);
+        assert_eq!(ProviderType::parse("github-copilot"), ProviderType::Copilot);
+        assert_eq!(ProviderType::parse("chatgpt"), ProviderType::ChatGPT);
+        assert_eq!(ProviderType::parse("openai-chatgpt"), ProviderType::ChatGPT);
+        assert_eq!(ProviderType::parse("openrouter"), ProviderType::OpenRouter);
+        assert_eq!(ProviderType::parse("google"), ProviderType::Google);
+        assert!(matches!(
+            ProviderType::parse("custom-anthropic"),
+            ProviderType::CustomAnthropic(s) if s.is_empty()
+        ));
+        assert!(matches!(
+            ProviderType::parse("my-custom"),
+            ProviderType::Custom(s) if s == "my-custom"
+        ));
+    }
+
+    #[test]
+    fn test_provider_type_as_str() {
+        assert_eq!(ProviderType::OpenAI.as_str(), "openai");
+        assert_eq!(ProviderType::Anthropic.as_str(), "anthropic");
+        assert_eq!(ProviderType::Copilot.as_str(), "copilot");
+        assert_eq!(ProviderType::ChatGPT.as_str(), "chatgpt");
+        assert_eq!(ProviderType::Custom("foo".into()).as_str(), "foo");
+        assert_eq!(ProviderType::CustomAnthropic("bar".into()).as_str(), "bar");
+    }
+
+    #[test]
+    fn test_provider_type_default_base_url() {
+        assert!(
+            ProviderType::OpenAI
+                .default_base_url()
+                .contains("openai.com")
+        );
+        assert!(
+            ProviderType::Anthropic
+                .default_base_url()
+                .contains("anthropic.com")
+        );
+        assert!(
+            ProviderType::Copilot
+                .default_base_url()
+                .contains("githubcopilot.com")
+        );
+        assert!(
+            ProviderType::ChatGPT
+                .default_base_url()
+                .contains("chatgpt.com")
+        );
+        assert!(
+            ProviderType::OpenRouter
+                .default_base_url()
+                .contains("openrouter.ai")
+        );
+        assert_eq!(ProviderType::Custom("x".into()).default_base_url(), "");
+        assert_eq!(
+            ProviderType::CustomAnthropic("x".into()).default_base_url(),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_provider_type_auth_method() {
+        assert_eq!(ProviderType::OpenAI.auth_method(), AuthMethod::ApiKey);
+        assert_eq!(ProviderType::Copilot.auth_method(), AuthMethod::OAuth);
+        assert_eq!(ProviderType::ChatGPT.auth_method(), AuthMethod::OAuth);
+        assert!(ProviderType::OpenAI.needs_api_key());
+        assert!(!ProviderType::Copilot.needs_api_key());
+        assert!(!ProviderType::ChatGPT.needs_api_key());
+    }
+
+    #[test]
+    fn test_provider_type_serde_roundtrip() {
+        let cases = vec![
+            ProviderType::OpenAI,
+            ProviderType::Anthropic,
+            ProviderType::Copilot,
+            ProviderType::ChatGPT,
+            ProviderType::OpenRouter,
+            ProviderType::Google,
+            ProviderType::Custom("my-provider".into()),
+            ProviderType::CustomAnthropic("my-anthropic".into()),
+        ];
+        for pt in cases {
+            let json = serde_json::to_string(&pt).unwrap();
+            let back: ProviderType = serde_json::from_str(&json).unwrap();
+            assert_eq!(pt, back, "roundtrip failed for {pt:?} (json: {json})");
+        }
+    }
+
+    #[test]
+    fn test_infer_provider_types() {
+        let toml = r#"
+[providers.openai]
+api_key = "sk-test"
+
+[providers.copilot]
+base_url = "https://api.githubcopilot.com"
+
+[providers.custom-thing]
+api_key = "custom-key"
+base_url = "https://custom.example.com"
+"#;
+        let settings = Settings::from_toml(toml, Path::new("test.toml")).unwrap();
+        assert_eq!(
+            settings.providers.get("openai").unwrap().provider_type,
+            Some(ProviderType::OpenAI)
+        );
+        assert_eq!(
+            settings.providers.get("copilot").unwrap().provider_type,
+            Some(ProviderType::Copilot)
+        );
+        assert!(matches!(
+            settings.providers.get("custom-thing").unwrap().provider_type,
+            Some(ProviderType::Custom(ref s)) if s == "custom-thing"
+        ));
+    }
+
+    #[test]
+    fn test_custom_anthropic_provider_type_deserialize() {
+        let pt: ProviderType = serde_json::from_str("\"custom-anthropic:my-claude\"").unwrap();
+        assert!(matches!(
+            pt,
+            ProviderType::CustomAnthropic(ref s) if s == "my-claude"
+        ));
+        assert_eq!(
+            serde_json::to_string(&pt).unwrap(),
+            "\"custom-anthropic:my-claude\""
+        );
+    }
+
+    #[test]
+    fn test_known_types_count() {
+        let types = ProviderType::known_types();
+        assert_eq!(types.len(), 8);
+    }
+}

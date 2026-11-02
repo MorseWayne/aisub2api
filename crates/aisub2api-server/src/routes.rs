@@ -1,0 +1,5126 @@
+use std::convert::Infallible;
+use std::hash::Hasher;
+use std::io;
+use std::sync::{Arc, Mutex as StdMutex};
+
+use aisub2api_config::settings::{
+    ModelReasoningEffort, ProviderType, REASONING_MARKER_MODE_EXTRA_KEY, ReasoningMarkerMode,
+};
+use aisub2api_core::*;
+use aisub2api_providers::chatgpt::{CLAUDE_CODE_CONTEXT_1M_BETA, VIRTUAL_CONTEXT_1M_EXTRA_KEY};
+use aisub2api_providers::openai_request_log_info;
+use aisub2api_providers::provider::{
+    NativeResponsesRequest, NativeResponsesResponse, Provider, ProviderError, ProviderEvent,
+    ProviderRequestMetadata, ProviderRequestObserver, ProviderRequestObserverEvent,
+    ProviderRequestObserverEventKind, ProviderUsageMetadata, UpstreamErrorMetadata,
+};
+use axum::Json;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use futures::StreamExt;
+use futures::stream::BoxStream;
+use serde_json::{Value, json};
+use std::collections::hash_map::DefaultHasher;
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, broadcast};
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+use crate::app::{
+    AppState, ConcurrencyAcquireError, ConcurrencyLimiter, InflightEvent, InflightFailure,
+    RequestObservabilityEvent, RequestPayloadStats, TokenUsage,
+};
+use crate::downstream::{DownstreamProtocol, protocol_error_response, provider_error_response};
+use crate::persistence::CompletedUsageRecord;
+
+const SSE_HEARTBEAT_FRAME: &[u8] = b": ping\n\n";
+fn check_auth(headers: &HeaderMap, auth_token: &str) -> bool {
+    if auth_token.is_empty() {
+        return true;
+    }
+    if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok())
+        && key == auth_token
+    {
+        return true;
+    }
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok())
+        && let Some(token) = auth.strip_prefix("Bearer ")
+        && token == auth_token
+    {
+        return true;
+    }
+    false
+}
+
+fn attach_client_session_metadata(
+    mut request: MessagesRequest,
+    headers: &HeaderMap,
+) -> MessagesRequest {
+    if request_has_stable_client_session(&request) {
+        return request;
+    }
+    let Some(session_id) = client_session_id_from_headers(headers) else {
+        return request;
+    };
+    request
+        .extra
+        .insert("client_session_id".to_string(), json!(session_id));
+    request
+}
+
+fn attach_virtual_context_metadata(
+    mut request: MessagesRequest,
+    headers: &HeaderMap,
+) -> MessagesRequest {
+    let virtual_context = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|betas| {
+            betas
+                .split(',')
+                .map(str::trim)
+                .any(|beta| beta == CLAUDE_CODE_CONTEXT_1M_BETA)
+        });
+    if virtual_context {
+        request
+            .extra
+            .insert(VIRTUAL_CONTEXT_1M_EXTRA_KEY.to_string(), Value::Bool(true));
+    }
+    request
+}
+
+fn request_has_stable_client_session(request: &MessagesRequest) -> bool {
+    const KEYS: &[&str] = &["session_id", "client_session_id", "x-client-session-id"];
+    KEYS.iter().any(|key| {
+        request.extra.get(*key).and_then(Value::as_str).is_some()
+            || request
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(*key))
+                .and_then(Value::as_str)
+                .is_some()
+    })
+}
+
+fn client_session_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    const HEADER_NAMES: &[&str] = &[
+        "x-client-session-id",
+        "x-claude-session-id",
+        "x-session-id",
+        "session-id",
+        "session_id",
+        "x-client-conversation-id",
+        "x-claude-conversation-id",
+        "x-client-thread-id",
+        "x-claude-thread-id",
+    ];
+    HEADER_NAMES.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+/// Check authorization header against admin token.
+fn check_admin_auth(headers: &HeaderMap, admin_token: &str) -> bool {
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let provided = auth.strip_prefix("Bearer ").unwrap_or(auth);
+    provided == admin_token
+}
+
+/// GET /health
+pub async fn health() -> &'static str {
+    "ok"
+}
+
+/// POST /v1/messages — Anthropic Messages API proxy
+pub async fn messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<MessagesRequest>,
+) -> Response {
+    execute_messages_request(state, headers, request, DownstreamProtocol::anthropic()).await
+}
+
+pub(crate) async fn execute_messages_request(
+    state: AppState,
+    headers: HeaderMap,
+    request: MessagesRequest,
+    protocol: DownstreamProtocol,
+) -> Response {
+    let start = std::time::Instant::now();
+    let (observability_enabled, observability_idle_gap_ms, stream_config) = {
+        let settings = state.settings.read().await;
+        (
+            settings.observability.enabled,
+            settings.observability.idle_gap_ms,
+            StreamResponseConfig::from_settings(&settings),
+        )
+    };
+    state.metrics.record_request();
+
+    // Auth check
+    {
+        let settings = state.settings.read().await;
+        if !check_auth(&headers, &settings.server.auth_token) {
+            record_request_error(&state, start);
+            return protocol_error_response(
+                &protocol,
+                StatusCode::UNAUTHORIZED,
+                &ErrorResponse::authentication("invalid API key"),
+            );
+        }
+    }
+
+    let request = attach_virtual_context_metadata(
+        attach_client_session_metadata(request, &headers),
+        &headers,
+    );
+
+    // Concurrency limiting
+    let request_permit = match acquire_request_permit(&state, start, &protocol).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+
+    let resolved = resolve_upstream_request(&state, &request).await;
+
+    log_resolved_request(&request, &resolved);
+
+    // --- Concurrent request deduplication ---
+    // Compute a hash of the full request to identify identical inflight requests.
+    let request_hash = compute_request_hash(&resolved.request);
+
+    let broadcast_tx = match register_or_subscribe_inflight_request(&state, request_hash).await {
+        InflightRegistration::Leader(sender) => sender,
+        InflightRegistration::Follower(receiver) => {
+            let response = if request.stream {
+                join_inflight_stream(
+                    receiver,
+                    StreamPermits {
+                        _request: request_permit,
+                        _provider: None,
+                    },
+                    stream_config,
+                    protocol.clone(),
+                )
+            } else {
+                join_inflight_non_stream(receiver, request_permit, &protocol).await
+            };
+            state
+                .metrics
+                .record_latency(start.elapsed().as_millis() as u64);
+            return response;
+        }
+    };
+
+    // Get or create provider — lock is released after obtaining the Arc
+    let provider = match get_provider(&state, &resolved.provider_id).await {
+        Ok(provider) => provider,
+        Err(e) => {
+            error!("Provider error: {e}");
+            let _ = broadcast_tx.send(inflight_failure(
+                ProviderError::ServiceUnavailable(e.clone()),
+                e.clone(),
+            ));
+            let _ = broadcast_tx.send(InflightEvent::Done);
+            state.inflight.lock().await.remove(&request_hash);
+            record_request_error(&state, start);
+            return protocol_error_response(
+                &protocol,
+                StatusCode::NOT_FOUND,
+                &ErrorResponse::not_found(&format!("provider not available: {e}")),
+            );
+        }
+    };
+
+    if let Err(error) = validate_resolved_request_capabilities(&state, &resolved).await {
+        let message = error.error.message.clone();
+        let _ = broadcast_tx.send(inflight_failure(
+            ProviderError::InvalidRequest(message.clone()),
+            message,
+        ));
+        let _ = broadcast_tx.send(InflightEvent::Done);
+        state.inflight.lock().await.remove(&request_hash);
+        record_request_error(&state, start);
+        return protocol_error_response(&protocol, StatusCode::BAD_REQUEST, &error);
+    }
+
+    let provider_permit =
+        match acquire_provider_permit(&state, &resolved.provider_id, start, &protocol).await {
+            Ok(permit) => permit,
+            Err(response) => {
+                let msg = "provider concurrency limit reached";
+                let _ = broadcast_tx.send(inflight_failure(
+                    ProviderError::Overloaded {
+                        message: msg.to_string(),
+                        retry_after: None,
+                    },
+                    msg.to_string(),
+                ));
+                let _ = broadcast_tx.send(InflightEvent::Done);
+                state.inflight.lock().await.remove(&request_hash);
+                return response;
+            }
+        };
+
+    let provider_setup_ms = start.elapsed().as_millis() as u64;
+    let metrics_context = RequestMetricsContext {
+        provider_id: resolved.provider_id.clone(),
+        model: resolved.request.model.clone(),
+        initiator: resolved.initiator,
+    };
+    let payload_stats = request_payload_stats(&resolved.request);
+    let observer_state = Arc::new(StdMutex::new(RequestObserverState::default()));
+    let provider_observer = Some(provider_request_observer(observer_state.clone()));
+    let upstream_connect_start = std::time::Instant::now();
+
+    // Call provider (registry lock is no longer held)
+    match provider
+        .chat_with_observer(resolved.request, provider_observer)
+        .await
+    {
+        Ok(stream) => {
+            let upstream_connect_ms = upstream_connect_start.elapsed().as_millis() as u64;
+            let observability = observability_enabled.then(|| ObservabilityContext {
+                request_id: format!("{request_hash:016x}"),
+                provider_id: metrics_context.provider_id.clone(),
+                initiator: metrics_context.initiator,
+                model: metrics_context.model.clone(),
+                stream: request.stream,
+                start,
+                provider_setup_ms,
+                upstream_connect_ms,
+                idle_gap_ms: observability_idle_gap_ms,
+                payload_stats,
+                observer_state: observer_state.clone(),
+            });
+            if request.stream {
+                stream_leader_response(
+                    &state,
+                    &metrics_context,
+                    stream,
+                    LeaderResponseContext {
+                        request_hash,
+                        broadcast_tx,
+                        permits: StreamPermits {
+                            _request: request_permit,
+                            _provider: Some(provider_permit),
+                        },
+                        start,
+                        observer_state: observer_state.clone(),
+                        observability,
+                        stream_config,
+                        protocol: protocol.clone(),
+                    },
+                )
+                .await
+            } else {
+                collect_leader_response(
+                    &state,
+                    &metrics_context,
+                    stream,
+                    LeaderResponseContext {
+                        request_hash,
+                        broadcast_tx,
+                        permits: StreamPermits {
+                            _request: request_permit,
+                            _provider: Some(provider_permit),
+                        },
+                        start,
+                        observer_state: observer_state.clone(),
+                        observability,
+                        stream_config,
+                        protocol: protocol.clone(),
+                    },
+                )
+                .await
+            }
+        }
+        Err(e) => {
+            let upstream_connect_ms = upstream_connect_start.elapsed().as_millis() as u64;
+            let observability = observability_enabled.then(|| ObservabilityContext {
+                request_id: format!("{request_hash:016x}"),
+                provider_id: metrics_context.provider_id.clone(),
+                initiator: metrics_context.initiator,
+                model: metrics_context.model.clone(),
+                stream: request.stream,
+                start,
+                provider_setup_ms,
+                upstream_connect_ms,
+                idle_gap_ms: observability_idle_gap_ms,
+                payload_stats,
+                observer_state: observer_state.clone(),
+            });
+            handle_provider_error(
+                &state,
+                &metrics_context,
+                e,
+                ProviderErrorResponseContext {
+                    request_hash,
+                    broadcast_tx,
+                    start,
+                    observability,
+                    protocol,
+                },
+            )
+            .await
+        }
+    }
+}
+
+/// Execute a streaming OpenAI Responses request without translating its input
+/// items through the Anthropic Messages representation.
+pub(crate) async fn execute_responses_request(
+    state: AppState,
+    headers: HeaderMap,
+    mut body: Value,
+    downstream_model: String,
+) -> Response {
+    let start = std::time::Instant::now();
+    let protocol = DownstreamProtocol::responses(downstream_model.clone(), serde_json::Map::new());
+    let (observability_enabled, observability_idle_gap_ms, stream_config) = {
+        let settings = state.settings.read().await;
+        (
+            settings.observability.enabled,
+            settings.observability.idle_gap_ms,
+            StreamResponseConfig::from_settings(&settings),
+        )
+    };
+    state.metrics.record_request();
+
+    {
+        let settings = state.settings.read().await;
+        if !check_auth(&headers, &settings.server.auth_token) {
+            record_request_error(&state, start);
+            return protocol_error_response(
+                &protocol,
+                StatusCode::UNAUTHORIZED,
+                &ErrorResponse::authentication("invalid API key"),
+            );
+        }
+    }
+
+    let request_permit = match acquire_request_permit(&state, start, &protocol).await {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+
+    let intent = body
+        .get("metadata")
+        .and_then(|metadata| metadata.get("intent"))
+        .and_then(Value::as_str);
+    let (provider_id, provider_type, upstream_model, alias_reasoning_effort) = {
+        let settings = state.settings.read().await;
+        let resolved = settings.resolve_model_with_intent(&downstream_model, intent);
+        let provider_id = resolved.provider_id.clone();
+        let provider_type = settings
+            .providers
+            .get(&provider_id)
+            .map(|config| config.resolve_type(&provider_id))
+            .unwrap_or_else(|| ProviderType::parse(&provider_id));
+        (
+            provider_id,
+            provider_type,
+            resolved.upstream_model.clone(),
+            resolved.reasoning_effort,
+        )
+    };
+
+    if !matches!(provider_type, ProviderType::OpenAI | ProviderType::ChatGPT) {
+        record_request_error(&state, start);
+        return protocol_error_response(
+            &protocol,
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse::invalid_request(
+                "selected provider does not support native Responses requests",
+            ),
+        );
+    }
+
+    if let Some(object) = body.as_object_mut() {
+        object.insert("model".to_string(), Value::String(upstream_model.clone()));
+        apply_responses_alias_reasoning_effort(object, alias_reasoning_effort);
+    }
+    let initiator = responses_request_initiator(&headers, &body);
+    info!(
+        initiator,
+        model = %downstream_model,
+        provider = %provider_id,
+        upstream_model = %upstream_model,
+        "Native Responses request resolved"
+    );
+
+    let provider = match get_provider(&state, &provider_id).await {
+        Ok(provider) => provider,
+        Err(error) => {
+            record_request_error(&state, start);
+            return protocol_error_response(
+                &protocol,
+                StatusCode::NOT_FOUND,
+                &ErrorResponse::not_found(&format!("provider not available: {error}")),
+            );
+        }
+    };
+    let provider_permit =
+        match acquire_provider_permit(&state, &provider_id, start, &protocol).await {
+            Ok(permit) => permit,
+            Err(response) => return response,
+        };
+
+    let provider_setup_ms = start.elapsed().as_millis() as u64;
+    let metrics_context = RequestMetricsContext {
+        provider_id: provider_id.clone(),
+        model: upstream_model,
+        initiator,
+    };
+    let payload_stats = responses_payload_stats(&body);
+    let observer_state = Arc::new(StdMutex::new(RequestObserverState::default()));
+    let provider_observer = Some(provider_request_observer(observer_state.clone()));
+    let upstream_connect_start = std::time::Instant::now();
+    let request_id = Uuid::new_v4();
+    let request_hash = request_id.as_u128() as u64;
+    let (broadcast_tx, _) = broadcast::channel::<InflightEvent>(1);
+    let request = NativeResponsesRequest {
+        body,
+        headers: native_responses_request_headers(&headers),
+    };
+
+    match provider.responses(request, provider_observer).await {
+        Ok(NativeResponsesResponse {
+            headers: upstream_headers,
+            stream,
+        }) => {
+            let upstream_connect_ms = upstream_connect_start.elapsed().as_millis() as u64;
+            let observability = observability_enabled.then(|| ObservabilityContext {
+                request_id: request_id.to_string(),
+                provider_id: metrics_context.provider_id.clone(),
+                initiator: metrics_context.initiator,
+                model: metrics_context.model.clone(),
+                stream: true,
+                start,
+                provider_setup_ms,
+                upstream_connect_ms,
+                idle_gap_ms: observability_idle_gap_ms,
+                payload_stats,
+                observer_state: observer_state.clone(),
+            });
+            let mut response = stream_leader_response(
+                &state,
+                &metrics_context,
+                stream,
+                LeaderResponseContext {
+                    request_hash,
+                    broadcast_tx,
+                    permits: StreamPermits {
+                        _request: request_permit,
+                        _provider: Some(provider_permit),
+                    },
+                    start,
+                    observer_state,
+                    observability,
+                    stream_config,
+                    protocol,
+                },
+            )
+            .await;
+            attach_native_responses_headers(&mut response, &upstream_headers);
+            response
+        }
+        Err(error) => {
+            let upstream_connect_ms = upstream_connect_start.elapsed().as_millis() as u64;
+            let observability = observability_enabled.then(|| ObservabilityContext {
+                request_id: request_id.to_string(),
+                provider_id: metrics_context.provider_id.clone(),
+                initiator: metrics_context.initiator,
+                model: metrics_context.model.clone(),
+                stream: true,
+                start,
+                provider_setup_ms,
+                upstream_connect_ms,
+                idle_gap_ms: observability_idle_gap_ms,
+                payload_stats,
+                observer_state,
+            });
+            handle_provider_error(
+                &state,
+                &metrics_context,
+                error,
+                ProviderErrorResponseContext {
+                    request_hash,
+                    broadcast_tx,
+                    start,
+                    observability,
+                    protocol,
+                },
+            )
+            .await
+        }
+    }
+}
+
+fn apply_responses_alias_reasoning_effort(
+    object: &mut serde_json::Map<String, Value>,
+    effort: Option<ModelReasoningEffort>,
+) {
+    let Some(effort) = effort.and_then(ModelReasoningEffort::request_value) else {
+        return;
+    };
+    let reasoning = object
+        .entry("reasoning".to_string())
+        .or_insert_with(|| json!({}));
+    if !reasoning.is_object() {
+        *reasoning = json!({});
+    }
+    if let Some(reasoning) = reasoning.as_object_mut() {
+        reasoning.insert("effort".to_string(), Value::String(effort.to_string()));
+    }
+}
+
+fn responses_request_initiator(headers: &HeaderMap, body: &Value) -> &'static str {
+    let header_marks_subagent = headers
+        .get("x-openai-subagent")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.trim().is_empty());
+    let metadata_marks_subagent = body
+        .pointer("/client_metadata/x-codex-turn-metadata")
+        .and_then(Value::as_str)
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| value.get("subagent_kind").cloned())
+        .and_then(|value| value.as_str().map(str::to_string))
+        .is_some_and(|value| !value.trim().is_empty());
+    if header_marks_subagent || metadata_marks_subagent {
+        "agent"
+    } else {
+        "user"
+    }
+}
+
+fn native_responses_request_headers(headers: &HeaderMap) -> HeaderMap {
+    const FORWARDED: &[&str] = &[
+        "openai-beta",
+        "x-codex-beta-features",
+        "x-openai-internal-codex-responses-lite",
+        "x-codex-turn-state",
+        "x-codex-turn-metadata",
+        "x-codex-window-id",
+        "x-codex-installation-id",
+        "x-codex-parent-thread-id",
+        "x-openai-subagent",
+        "x-openai-memgen-request",
+        "x-responsesapi-include-timing-metrics",
+        "session-id",
+        "thread-id",
+        "traceparent",
+        "tracestate",
+    ];
+    let mut forwarded = HeaderMap::new();
+    for name in FORWARDED {
+        let name = HeaderName::from_static(name);
+        for value in headers.get_all(&name) {
+            forwarded.append(name.clone(), value.clone());
+        }
+    }
+    forwarded
+}
+
+fn attach_native_responses_headers(response: &mut Response, upstream: &HeaderMap) {
+    for (name, value) in upstream {
+        let name_text = name.as_str();
+        let allowed = matches!(
+            name_text,
+            "x-request-id"
+                | "openai-model"
+                | "x-openai-model"
+                | "x-codex-turn-state"
+                | "x-models-etag"
+                | "x-reasoning-included"
+                | "x-codex-safety-buffering-enabled"
+                | "x-codex-safety-buffering-faster-model"
+                | "retry-after"
+        ) || name_text.starts_with("x-ratelimit-")
+            || name_text.starts_with("x-codex-primary-")
+            || name_text.starts_with("x-codex-secondary-")
+            || name_text.starts_with("x-codex-credits-");
+        if allowed {
+            response.headers_mut().append(name.clone(), value.clone());
+        }
+    }
+}
+
+fn responses_payload_stats(body: &Value) -> RequestPayloadStats {
+    let input = body.get("input");
+    let items = input.and_then(Value::as_array);
+    RequestPayloadStats {
+        messages: items.map_or(0, |items| items.len() as u64),
+        content_blocks: items
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        item.get("content")
+                            .and_then(Value::as_array)
+                            .map_or(1, Vec::len)
+                    })
+                    .sum::<usize>() as u64
+            })
+            .unwrap_or_else(|| u64::from(input.is_some())),
+        tool_results: items
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|item| {
+                        item.get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|kind| kind.ends_with("_call_output"))
+                    })
+                    .count() as u64
+            })
+            .unwrap_or(0),
+        text_bytes: input.map_or(0, json_text_bytes),
+    }
+}
+
+struct ResolvedUpstreamRequest {
+    provider_id: String,
+    provider_type: ProviderType,
+    upstream_model: String,
+    initiator: &'static str,
+    request: MessagesRequest,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RequestFeatures {
+    streaming: bool,
+    system_prompt: bool,
+    tools: bool,
+    tool_choice: bool,
+    thinking: bool,
+    reasoning_effort: bool,
+    vision: bool,
+    sampling: bool,
+    stop_sequences: bool,
+    prompt_cache_key: bool,
+    fast_mode: bool,
+    structured_outputs: bool,
+    strict_tools: bool,
+    token_efficient_tools: bool,
+    context_management: bool,
+}
+
+impl RequestFeatures {
+    fn from_request(request: &MessagesRequest) -> Self {
+        Self {
+            streaming: request.stream,
+            system_prompt: request.system.is_some(),
+            tools: request
+                .tools
+                .as_ref()
+                .is_some_and(|tools| !tools.is_empty()),
+            tool_choice: request.tool_choice.is_some(),
+            thinking: request.thinking.is_some(),
+            reasoning_effort: request.extra.contains_key("reasoning_effort"),
+            vision: request_uses_vision(request),
+            sampling: request.temperature.is_some()
+                || request.top_p.is_some()
+                || request.top_k.is_some(),
+            stop_sequences: request
+                .stop_sequences
+                .as_ref()
+                .is_some_and(|sequences| !sequences.is_empty()),
+            prompt_cache_key: request.extra.contains_key("prompt_cache_key"),
+            fast_mode: request.extra.contains_key("service_tier")
+                || request.extra.contains_key("fast_mode"),
+            structured_outputs: request.extra.contains_key("output_config")
+                || request.extra.contains_key("response_format"),
+            strict_tools: request.extra.get("strict_tools").and_then(Value::as_bool) == Some(true),
+            token_efficient_tools: request.extra.contains_key("token_efficient_tools"),
+            context_management: request.extra.contains_key("context_management"),
+        }
+    }
+}
+
+fn request_uses_vision(request: &MessagesRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .any(|message| match &message.content {
+            MessageContent::Blocks(blocks) => blocks.iter().any(content_is_image),
+            MessageContent::Text(_) => false,
+        })
+}
+
+fn content_is_image(content: &Content) -> bool {
+    match content {
+        Content::Unknown(value) => value.get("type").and_then(Value::as_str) == Some("image"),
+        _ => false,
+    }
+}
+
+fn validate_request_capabilities(
+    provider_id: &str,
+    model: &str,
+    capabilities: &ModelCapabilities,
+    features: &RequestFeatures,
+) -> Result<(), ErrorResponse> {
+    reject_unsupported(
+        provider_id,
+        model,
+        "streaming",
+        features.streaming,
+        capabilities.features.streaming,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "system prompt",
+        features.system_prompt,
+        capabilities.features.system_prompt,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "tools",
+        features.tools,
+        capabilities.features.tools,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "tool_choice",
+        features.tool_choice,
+        capabilities.features.tool_choice,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "thinking",
+        features.thinking,
+        capabilities.features.thinking,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "reasoning_effort",
+        features.reasoning_effort,
+        capabilities.features.reasoning_effort,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "prompt cache key",
+        features.prompt_cache_key,
+        prompt_cache_state(capabilities),
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "fast mode",
+        features.fast_mode,
+        capabilities.quality.fast_mode,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "structured outputs",
+        features.structured_outputs,
+        capabilities.quality.structured_outputs,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "strict tools",
+        features.strict_tools,
+        capabilities.quality.strict_tools,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "token-efficient tools",
+        features.token_efficient_tools,
+        capabilities.quality.token_efficient_tools,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "context management",
+        features.context_management,
+        context_management_state(capabilities),
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "vision input",
+        features.vision,
+        capabilities.modalities.input.image,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "sampling parameters",
+        features.sampling,
+        capabilities.features.sampling,
+    )?;
+    reject_unsupported(
+        provider_id,
+        model,
+        "stop_sequences",
+        features.stop_sequences,
+        capabilities.features.stop_sequences,
+    )
+}
+
+fn prompt_cache_state(capabilities: &ModelCapabilities) -> CapabilityState {
+    if capabilities.quality.prompt_cache.state == CapabilityState::Unknown {
+        capabilities.features.prompt_cache
+    } else {
+        capabilities.quality.prompt_cache.state
+    }
+}
+
+fn context_management_state(capabilities: &ModelCapabilities) -> CapabilityState {
+    match (
+        capabilities
+            .quality
+            .context_management
+            .thinking_preservation,
+        capabilities.quality.context_management.tool_result_clearing,
+    ) {
+        (CapabilityState::Unsupported, _) | (_, CapabilityState::Unsupported) => {
+            CapabilityState::Unsupported
+        }
+        (CapabilityState::Supported, CapabilityState::Supported) => CapabilityState::Supported,
+        _ => CapabilityState::Unknown,
+    }
+}
+
+fn reject_unsupported(
+    provider_id: &str,
+    model: &str,
+    feature: &str,
+    requested: bool,
+    state: CapabilityState,
+) -> Result<(), ErrorResponse> {
+    if requested && state == CapabilityState::Unsupported {
+        return Err(ErrorResponse::invalid_request(&format!(
+            "model {model} via provider {provider_id} does not support {feature}"
+        )));
+    }
+    Ok(())
+}
+
+async fn validate_resolved_request_capabilities(
+    state: &AppState,
+    resolved: &ResolvedUpstreamRequest,
+) -> Result<(), ErrorResponse> {
+    let features = RequestFeatures::from_request(&resolved.request);
+    let registry = state.provider_registry.read().await;
+    let Some(model) = registry
+        .cached_models(&resolved.provider_id)
+        .and_then(|models| {
+            models
+                .iter()
+                .find(|model| model.model_id == resolved.upstream_model)
+        })
+    else {
+        return Ok(());
+    };
+
+    validate_request_capabilities(
+        &resolved.provider_id,
+        &resolved.upstream_model,
+        &model.capabilities,
+        &features,
+    )
+}
+
+#[derive(Clone)]
+struct RequestMetricsContext {
+    provider_id: String,
+    model: String,
+    initiator: &'static str,
+}
+
+#[derive(Clone)]
+struct ObservabilityContext {
+    request_id: String,
+    provider_id: String,
+    initiator: &'static str,
+    model: String,
+    stream: bool,
+    start: std::time::Instant,
+    provider_setup_ms: u64,
+    upstream_connect_ms: u64,
+    idle_gap_ms: u64,
+    payload_stats: RequestPayloadStats,
+    observer_state: Arc<StdMutex<RequestObserverState>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RequestObserverState {
+    prompt_too_long_retries: u64,
+    prompt_too_long_original_body_bytes: u64,
+    prompt_too_long_shrunk_body_bytes: u64,
+    prompt_too_long_dropped_items: u64,
+    stream_usage: TokenUsage,
+    request_metadata: ProviderRequestMetadata,
+}
+
+impl RequestObserverState {
+    fn record(&mut self, event: &ProviderRequestObserverEvent) {
+        match event.event {
+            ProviderRequestObserverEventKind::PromptTooLongRetry
+            | ProviderRequestObserverEventKind::PromptTooLongRetryExhausted
+            | ProviderRequestObserverEventKind::PromptTooLongRetryUnshrinkable => {
+                self.prompt_too_long_retries = self
+                    .prompt_too_long_retries
+                    .max(event.prompt_too_long_retries);
+                self.prompt_too_long_original_body_bytes = self
+                    .prompt_too_long_original_body_bytes
+                    .max(event.original_body_bytes);
+                self.prompt_too_long_shrunk_body_bytes = self
+                    .prompt_too_long_shrunk_body_bytes
+                    .max(event.shrunk_body_bytes);
+                self.prompt_too_long_dropped_items =
+                    self.prompt_too_long_dropped_items.max(event.dropped_items);
+            }
+            ProviderRequestObserverEventKind::StreamMetadata => {
+                if let Some(usage) = event
+                    .stream_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.usage.as_ref())
+                {
+                    merge_provider_usage_metadata(usage, &mut self.stream_usage);
+                }
+            }
+            ProviderRequestObserverEventKind::RequestMetadata => {
+                if let Some(metadata) = event.request_metadata.as_ref() {
+                    merge_provider_request_metadata(metadata, &mut self.request_metadata);
+                }
+            }
+        }
+    }
+}
+
+fn merge_provider_request_metadata(
+    metadata: &ProviderRequestMetadata,
+    target: &mut ProviderRequestMetadata,
+) {
+    if metadata.transport.is_some() {
+        target.transport = metadata.transport.clone();
+    }
+    if metadata.responses_lite.is_some() {
+        target.responses_lite = metadata.responses_lite;
+    }
+    if metadata.prompt_cache_key_present.is_some() {
+        target.prompt_cache_key_present = metadata.prompt_cache_key_present;
+    }
+    if metadata.prompt_cache_key_source.is_some() {
+        target.prompt_cache_key_source = metadata.prompt_cache_key_source.clone();
+    }
+    if metadata.stable_client_conversation_id_present.is_some() {
+        target.stable_client_conversation_id_present =
+            metadata.stable_client_conversation_id_present;
+    }
+    if metadata.synthetic_stable_client_conversation_id.is_some() {
+        target.synthetic_stable_client_conversation_id =
+            metadata.synthetic_stable_client_conversation_id;
+    }
+    if metadata.websocket_reused.is_some() {
+        target.websocket_reused = metadata.websocket_reused;
+    }
+    if metadata.continuation_used.is_some() {
+        target.continuation_used = metadata.continuation_used;
+    }
+    if metadata.continuation_disabled_reason.is_some() {
+        target.continuation_disabled_reason = metadata.continuation_disabled_reason.clone();
+    }
+    if metadata.continuation_fallback_used.is_some() {
+        target.continuation_fallback_used = metadata.continuation_fallback_used;
+    }
+    if metadata.fallback_reason.is_some() {
+        target.fallback_reason = metadata.fallback_reason.clone();
+    }
+    if metadata.request_body_bytes.is_some() {
+        target.request_body_bytes = metadata.request_body_bytes;
+    }
+    if metadata.upstream_send_body_bytes.is_some() {
+        target.upstream_send_body_bytes = metadata.upstream_send_body_bytes;
+    }
+    if metadata.virtual_context_1m.is_some() {
+        target.virtual_context_1m = metadata.virtual_context_1m;
+    }
+    if metadata.context_estimated_tokens.is_some() {
+        target.context_estimated_tokens = metadata.context_estimated_tokens;
+    }
+    if metadata.context_safe_input_limit.is_some() {
+        target.context_safe_input_limit = metadata.context_safe_input_limit;
+    }
+    if metadata.context_model_window.is_some() {
+        target.context_model_window = metadata.context_model_window;
+    }
+    if metadata.context_estimator_source.is_some() {
+        target.context_estimator_source = metadata.context_estimator_source.clone();
+    }
+    if metadata.context_compact_kind.is_some() {
+        target.context_compact_kind = metadata.context_compact_kind.clone();
+    }
+    if metadata.context_compressible_history.is_some() {
+        target.context_compressible_history = metadata.context_compressible_history;
+    }
+    if metadata.context_local_blocked.is_some() {
+        target.context_local_blocked = metadata.context_local_blocked;
+    }
+    if metadata.context_upstream_overflow.is_some() {
+        target.context_upstream_overflow = metadata.context_upstream_overflow;
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ObservabilityTiming {
+    stream_duration_ms: u64,
+    first_event_ms: Option<u64>,
+    last_event_gap_ms: u64,
+    max_event_gap_ms: u64,
+    idle_gap_count: u64,
+    event_count: u64,
+    last_event_at: Option<std::time::Instant>,
+}
+
+impl ObservabilityTiming {
+    fn record_event(
+        &mut self,
+        request_start: std::time::Instant,
+        event_at: std::time::Instant,
+        idle_gap_ms: u64,
+    ) {
+        self.event_count += 1;
+        self.first_event_ms
+            .get_or_insert_with(|| event_at.duration_since(request_start).as_millis() as u64);
+        if let Some(last_event_at) = self.last_event_at {
+            let gap_ms = event_at.duration_since(last_event_at).as_millis() as u64;
+            self.last_event_gap_ms = gap_ms;
+            self.max_event_gap_ms = self.max_event_gap_ms.max(gap_ms);
+            if idle_gap_ms > 0 && gap_ms >= idle_gap_ms {
+                self.idle_gap_count += 1;
+            }
+        }
+        self.last_event_at = Some(event_at);
+    }
+}
+
+fn provider_request_observer(
+    state: Arc<StdMutex<RequestObserverState>>,
+) -> ProviderRequestObserver {
+    Arc::new(move |event| {
+        if let Ok(mut state) = state.lock() {
+            state.record(&event);
+        }
+    })
+}
+
+fn build_observability_event(
+    context: ObservabilityContext,
+    timing: ObservabilityTiming,
+    is_error: bool,
+    terminal_reason: &str,
+    error_metadata: Option<&UpstreamErrorMetadata>,
+) -> RequestObservabilityEvent {
+    let observer_state = context
+        .observer_state
+        .lock()
+        .map(|state| state.clone())
+        .unwrap_or_default();
+    let request_body_bytes = observer_state
+        .request_metadata
+        .request_body_bytes
+        .unwrap_or(0);
+    let upstream_send_body_bytes = observer_state
+        .request_metadata
+        .upstream_send_body_bytes
+        .unwrap_or(0);
+    RequestObservabilityEvent {
+        request_id: context.request_id,
+        provider: context.provider_id,
+        initiator: context.initiator.to_string(),
+        model: context.model,
+        stream: context.stream,
+        is_error,
+        terminal_reason: terminal_reason.to_string(),
+        total_latency_ms: context.start.elapsed().as_millis() as u64,
+        provider_setup_ms: context.provider_setup_ms,
+        upstream_connect_ms: context.upstream_connect_ms,
+        stream_duration_ms: timing.stream_duration_ms,
+        first_event_ms: timing.first_event_ms,
+        last_event_gap_ms: timing.last_event_gap_ms,
+        max_event_gap_ms: timing.max_event_gap_ms,
+        idle_gap_count: timing.idle_gap_count,
+        event_count: timing.event_count,
+        transport: observer_state.request_metadata.transport,
+        websocket_reused: observer_state.request_metadata.websocket_reused,
+        continuation_used: observer_state.request_metadata.continuation_used,
+        continuation_disabled_reason: observer_state.request_metadata.continuation_disabled_reason,
+        continuation_fallback_used: observer_state.request_metadata.continuation_fallback_used,
+        fallback_reason: observer_state.request_metadata.fallback_reason,
+        upstream_error_status: error_metadata.map(|metadata| metadata.status as u64),
+        upstream_error_code: upstream_error_code(error_metadata),
+        upstream_error_message_class: upstream_error_message_class(error_metadata),
+        request_body_bytes,
+        upstream_send_body_bytes,
+        continuation_saved_bytes: request_body_bytes.saturating_sub(upstream_send_body_bytes),
+        responses_lite: observer_state.request_metadata.responses_lite,
+        prompt_cache_key_present: observer_state.request_metadata.prompt_cache_key_present,
+        prompt_cache_key_source: observer_state.request_metadata.prompt_cache_key_source,
+        stable_client_conversation_id_present: observer_state
+            .request_metadata
+            .stable_client_conversation_id_present,
+        synthetic_stable_client_conversation_id: observer_state
+            .request_metadata
+            .synthetic_stable_client_conversation_id,
+        virtual_context_1m: observer_state.request_metadata.virtual_context_1m,
+        context_estimated_tokens: observer_state.request_metadata.context_estimated_tokens,
+        context_safe_input_limit: observer_state.request_metadata.context_safe_input_limit,
+        context_model_window: observer_state.request_metadata.context_model_window,
+        context_estimator_source: observer_state.request_metadata.context_estimator_source,
+        context_compact_kind: observer_state.request_metadata.context_compact_kind,
+        context_compressible_history: observer_state.request_metadata.context_compressible_history,
+        context_local_blocked: observer_state.request_metadata.context_local_blocked,
+        context_upstream_overflow: observer_state.request_metadata.context_upstream_overflow,
+        prompt_too_long_retries: observer_state.prompt_too_long_retries,
+        prompt_too_long_original_body_bytes: observer_state.prompt_too_long_original_body_bytes,
+        prompt_too_long_shrunk_body_bytes: observer_state.prompt_too_long_shrunk_body_bytes,
+        prompt_too_long_dropped_items: observer_state.prompt_too_long_dropped_items,
+        request_messages: context.payload_stats.messages,
+        request_content_blocks: context.payload_stats.content_blocks,
+        request_tool_results: context.payload_stats.tool_results,
+        request_text_bytes: context.payload_stats.text_bytes,
+    }
+}
+
+fn upstream_error_code(error_metadata: Option<&UpstreamErrorMetadata>) -> Option<String> {
+    let metadata = error_metadata?;
+    metadata
+        .body_preview
+        .as_deref()
+        .and_then(|body| serde_json::from_str::<Value>(body).ok())
+        .and_then(|value| {
+            ["/error/code", "/error/type", "/code", "/type"]
+                .iter()
+                .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+                .map(str::to_string)
+        })
+}
+
+fn upstream_error_message_class(error_metadata: Option<&UpstreamErrorMetadata>) -> Option<String> {
+    let metadata = error_metadata?;
+    if let Some(code) = upstream_error_code(Some(metadata)) {
+        return Some(code);
+    }
+
+    let text = [
+        metadata.message.as_deref(),
+        metadata.body_preview.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n")
+    .to_ascii_lowercase();
+    if text.contains("previous response") && text.contains("not found") {
+        return Some("previous_response_not_found".to_string());
+    }
+    if text.contains("context_length_exceeded")
+        || text.contains("prompt is too long")
+        || text.contains("context window")
+    {
+        return Some("context_length_exceeded".to_string());
+    }
+    if text.contains("rate limit") || text.contains("too many requests") {
+        return Some("rate_limited".to_string());
+    }
+    if text.contains("overloaded") || text.contains("server_error") {
+        return Some("upstream_overloaded".to_string());
+    }
+
+    Some("other".to_string())
+}
+
+fn request_payload_stats(request: &MessagesRequest) -> RequestPayloadStats {
+    let mut stats = RequestPayloadStats {
+        messages: request.messages.len() as u64,
+        ..RequestPayloadStats::default()
+    };
+    if let Some(system) = &request.system {
+        match system {
+            SystemPrompt::Text(text) => {
+                stats.content_blocks += 1;
+                stats.text_bytes += text.len() as u64;
+            }
+            SystemPrompt::Blocks(blocks) => {
+                for block in blocks {
+                    add_content_stats(block, &mut stats);
+                }
+            }
+        }
+    }
+    for message in &request.messages {
+        match &message.content {
+            MessageContent::Text(text) => {
+                stats.content_blocks += 1;
+                stats.text_bytes += text.len() as u64;
+            }
+            MessageContent::Blocks(blocks) => {
+                for block in blocks {
+                    add_content_stats(block, &mut stats);
+                }
+            }
+        }
+    }
+    stats
+}
+
+fn add_content_stats(content: &Content, stats: &mut RequestPayloadStats) {
+    stats.content_blocks += 1;
+    match content {
+        Content::Text { text } => {
+            stats.text_bytes += text.len() as u64;
+        }
+        Content::Thinking { thinking, .. } => {
+            stats.text_bytes += thinking.len() as u64;
+        }
+        Content::ToolResult { content, .. } => {
+            stats.tool_results += 1;
+            if let Some(content) = content {
+                stats.text_bytes += json_text_bytes(content);
+            }
+        }
+        Content::Unknown(value) => {
+            stats.text_bytes += json_text_bytes(value);
+        }
+        Content::WebSearchToolResult { content, .. } => {
+            stats.text_bytes += json_text_bytes(content);
+        }
+        Content::ToolUse { .. } | Content::ServerToolUse { .. } => {}
+    }
+}
+
+fn json_text_bytes(value: &Value) -> u64 {
+    match value {
+        Value::String(text) => text.len() as u64,
+        Value::Array(values) => values.iter().map(json_text_bytes).sum(),
+        Value::Object(object) => object
+            .iter()
+            .filter(|(key, _)| key.as_str() != "type")
+            .map(|(_, value)| json_text_bytes(value))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn log_resolved_request(original_request: &MessagesRequest, resolved: &ResolvedUpstreamRequest) {
+    if openai_compatible_reasoning_log(&resolved.provider_type) {
+        let info = openai_request_log_info(&resolved.request);
+        if let Some(reasoning_effort) = info.reasoning_effort {
+            if info.thinking_type.is_some() || info.thinking_budget_tokens.is_some() {
+                info!(
+                    "Request: initiator={} model={} → {}/{} reasoning_effort={} reasoning_source={} thinking_type={} thinking_budget_tokens={}",
+                    resolved.initiator,
+                    original_request.model,
+                    resolved.provider_id,
+                    info.model,
+                    reasoning_effort,
+                    info.reasoning_source,
+                    info.thinking_type.as_deref().unwrap_or("unset"),
+                    info.thinking_budget_tokens
+                        .map(|tokens| tokens.to_string())
+                        .unwrap_or_else(|| "unset".to_string())
+                );
+                return;
+            }
+            info!(
+                "Request: initiator={} model={} → {}/{} reasoning_effort={} reasoning_source={}",
+                resolved.initiator,
+                original_request.model,
+                resolved.provider_id,
+                info.model,
+                reasoning_effort,
+                info.reasoning_source
+            );
+            return;
+        }
+    }
+
+    info!(
+        "Request: initiator={} model={} → {}/{}",
+        resolved.initiator, original_request.model, resolved.provider_id, resolved.upstream_model
+    );
+}
+
+fn openai_compatible_reasoning_log(provider_type: &ProviderType) -> bool {
+    matches!(
+        provider_type,
+        ProviderType::OpenAI
+            | ProviderType::ChatGPT
+            | ProviderType::OpenRouter
+            | ProviderType::Google
+            | ProviderType::Custom(_)
+    )
+}
+
+async fn resolve_upstream_request(
+    state: &AppState,
+    request: &MessagesRequest,
+) -> ResolvedUpstreamRequest {
+    let settings = state.settings.read().await;
+    let intent = request_intent(request);
+    let resolved_model = settings.resolve_model_with_intent(&request.model, intent);
+    let provider_id = resolved_model.provider_id.clone();
+    let upstream_model = resolved_model.upstream_model.clone();
+    let provider_config = settings.providers.get(&provider_id);
+    let provider_type = provider_config
+        .map(|config| config.resolve_type(&provider_id))
+        .unwrap_or_else(|| ProviderType::parse(&provider_id));
+    let reasoning_marker_mode = resolved_model
+        .reasoning_marker_mode
+        .or_else(|| provider_config.map(|config| config.reasoning_markers))
+        .unwrap_or_default();
+    let initiator = resolve_request_initiator(&settings, &provider_id, request);
+
+    let mut request = request.clone();
+    request.model = upstream_model.clone();
+    if provider_type != ProviderType::ChatGPT {
+        request.extra.remove(VIRTUAL_CONTEXT_1M_EXTRA_KEY);
+    }
+    apply_alias_reasoning_effort(&mut request, resolved_model.reasoning_effort);
+    apply_reasoning_marker_mode(&mut request, &provider_type, reasoning_marker_mode);
+
+    ResolvedUpstreamRequest {
+        provider_id,
+        provider_type,
+        upstream_model,
+        initiator,
+        request,
+    }
+}
+
+fn request_intent(request: &MessagesRequest) -> Option<&str> {
+    request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("intent"))
+        .and_then(Value::as_str)
+}
+
+fn apply_alias_reasoning_effort(
+    request: &mut MessagesRequest,
+    effort: Option<ModelReasoningEffort>,
+) {
+    if let Some(value) = effort.and_then(ModelReasoningEffort::request_value) {
+        request.extra.remove("reasoning");
+        request
+            .extra
+            .insert("reasoning_effort".to_string(), json!(value));
+        request.thinking = None;
+    }
+}
+
+fn apply_reasoning_marker_mode(
+    request: &mut MessagesRequest,
+    provider_type: &ProviderType,
+    mode: ReasoningMarkerMode,
+) {
+    if !openai_compatible_marker_mode(provider_type) {
+        return;
+    }
+    request.extra.insert(
+        REASONING_MARKER_MODE_EXTRA_KEY.to_string(),
+        json!(mode.as_config_value()),
+    );
+}
+
+fn openai_compatible_marker_mode(provider_type: &ProviderType) -> bool {
+    matches!(
+        provider_type,
+        ProviderType::OpenAI
+            | ProviderType::Copilot
+            | ProviderType::ChatGPT
+            | ProviderType::OpenRouter
+            | ProviderType::Google
+            | ProviderType::Custom(_)
+    )
+}
+
+fn resolve_request_initiator(
+    settings: &aisub2api_config::Settings,
+    provider_id: &str,
+    request: &MessagesRequest,
+) -> &'static str {
+    let agent_marking_enabled = settings
+        .providers
+        .get(provider_id)
+        .map(|config| match config.resolve_type(provider_id) {
+            ProviderType::Copilot => config
+                .copilot
+                .as_ref()
+                .is_none_or(|copilot| copilot.enable_agent_marking),
+            ProviderType::ChatGPT => true,
+            _ => false,
+        })
+        .unwrap_or(false);
+
+    if agent_marking_enabled && has_subagent_marker(&request.system) {
+        "agent"
+    } else {
+        "user"
+    }
+}
+
+fn has_subagent_marker(system: &Option<SystemPrompt>) -> bool {
+    let text = match system {
+        Some(SystemPrompt::Text(text)) => text.as_str(),
+        Some(SystemPrompt::Blocks(blocks)) => blocks.first().map_or("", |block| match block {
+            Content::Text { text } => text.as_str(),
+            _ => "",
+        }),
+        None => return false,
+    };
+
+    text.contains("__SUBAGENT_MARKER__")
+}
+
+async fn get_provider(state: &AppState, provider_id: &str) -> Result<Arc<dyn Provider>, String> {
+    state.get_or_create_provider(provider_id).await
+}
+
+fn record_request_error(state: &AppState, start: std::time::Instant) {
+    state.metrics.record_error();
+    state
+        .metrics
+        .record_latency(start.elapsed().as_millis() as u64);
+}
+
+struct StreamPermits {
+    _request: OwnedSemaphorePermit,
+    _provider: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StreamResponseConfig {
+    heartbeat_interval: Duration,
+    idle_timeout: Duration,
+    overall_timeout: Duration,
+    tool_use_terminal_timeout: Duration,
+    max_non_stream_response_bytes: u64,
+}
+
+impl StreamResponseConfig {
+    fn from_settings(settings: &aisub2api_config::Settings) -> Self {
+        Self {
+            heartbeat_interval: seconds_duration(settings.server.sse_heartbeat_interval_seconds),
+            idle_timeout: seconds_duration(settings.server.stream_idle_timeout_seconds),
+            overall_timeout: seconds_duration(settings.server.stream_overall_timeout_seconds),
+            tool_use_terminal_timeout: seconds_duration(
+                settings.server.tool_use_terminal_timeout_seconds,
+            ),
+            max_non_stream_response_bytes: settings.limits.max_non_stream_response_bytes,
+        }
+    }
+}
+
+fn seconds_duration(seconds: u64) -> Duration {
+    Duration::from_secs(seconds.max(1))
+}
+
+struct LeaderResponseContext {
+    request_hash: u64,
+    broadcast_tx: broadcast::Sender<InflightEvent>,
+    permits: StreamPermits,
+    start: std::time::Instant,
+    observer_state: Arc<StdMutex<RequestObserverState>>,
+    observability: Option<ObservabilityContext>,
+    stream_config: StreamResponseConfig,
+    protocol: DownstreamProtocol,
+}
+
+fn concurrency_queue_full_response(protocol: &DownstreamProtocol, message: &str) -> Response {
+    let mut response = protocol_error_response(
+        protocol,
+        StatusCode::TOO_MANY_REQUESTS,
+        &ErrorResponse::rate_limit(message),
+    );
+    response
+        .headers_mut()
+        .insert("x-should-retry", HeaderValue::from_static("false"));
+    response
+}
+
+fn concurrency_closed_response(protocol: &DownstreamProtocol) -> Response {
+    let mut response = protocol_error_response(
+        protocol,
+        StatusCode::SERVICE_UNAVAILABLE,
+        &ErrorResponse::api_error("concurrency controller unavailable"),
+    );
+    response
+        .headers_mut()
+        .insert("x-should-retry", HeaderValue::from_static("false"));
+    response
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "HTTP admission returns a ready-to-send protocol rejection directly"
+)]
+async fn acquire_request_permit(
+    state: &AppState,
+    start: std::time::Instant,
+    protocol: &DownstreamProtocol,
+) -> Result<OwnedSemaphorePermit, Response> {
+    let limiter = state.concurrency_limiter.read().await.clone();
+    match limiter.acquire().await {
+        Ok(permit) => Ok(permit),
+        Err(ConcurrencyAcquireError::Closed) => {
+            error!("Semaphore closed unexpectedly");
+            record_request_error(state, start);
+            Err(concurrency_closed_response(protocol))
+        }
+        Err(ConcurrencyAcquireError::QueueFull) => {
+            warn!("Global concurrency queue is full");
+            record_request_error(state, start);
+            Err(concurrency_queue_full_response(
+                protocol,
+                "too many requests waiting for local concurrency",
+            ))
+        }
+    }
+}
+
+#[allow(
+    clippy::result_large_err,
+    reason = "HTTP admission returns a ready-to-send protocol rejection directly"
+)]
+async fn acquire_provider_permit(
+    state: &AppState,
+    provider_id: &str,
+    start: std::time::Instant,
+    protocol: &DownstreamProtocol,
+) -> Result<OwnedSemaphorePermit, Response> {
+    let (max_concurrency, max_queue) = {
+        let settings = state.settings.read().await;
+        (
+            settings.limits.provider_max_concurrency as usize,
+            settings.limits.provider_max_concurrency_queue as usize,
+        )
+    };
+    let limiter = {
+        let mut limiters = state.provider_concurrency_limiters.lock().await;
+        limiters
+            .entry(provider_id.to_string())
+            .or_insert_with(|| Arc::new(ConcurrencyLimiter::new(max_concurrency, max_queue)))
+            .clone()
+    };
+
+    match limiter.acquire().await {
+        Ok(permit) => Ok(permit),
+        Err(ConcurrencyAcquireError::Closed) => {
+            error!("Provider semaphore closed unexpectedly");
+            record_request_error(state, start);
+            Err(concurrency_closed_response(protocol))
+        }
+        Err(ConcurrencyAcquireError::QueueFull) => {
+            warn!("Provider concurrency queue is full for {provider_id}");
+            record_request_error(state, start);
+            Err(concurrency_queue_full_response(
+                protocol,
+                "too many requests waiting for provider concurrency",
+            ))
+        }
+    }
+}
+
+enum InflightRegistration {
+    Leader(broadcast::Sender<InflightEvent>),
+    Follower(broadcast::Receiver<InflightEvent>),
+}
+
+fn inflight_failure(error: ProviderError, message: String) -> InflightEvent {
+    InflightEvent::Error(InflightFailure { error, message })
+}
+
+async fn register_or_subscribe_inflight_request(
+    state: &AppState,
+    request_hash: u64,
+) -> InflightRegistration {
+    let mut inflight = state.inflight.lock().await;
+    if let Some(sender) = inflight.get(&request_hash) {
+        let receiver = sender.subscribe();
+        debug!("Dedup: joining existing inflight request (hash={request_hash:016x})");
+        return InflightRegistration::Follower(receiver);
+    }
+
+    let (sender, _) = broadcast::channel::<InflightEvent>(256);
+    inflight.insert(request_hash, sender.clone());
+    debug!("Dedup: registered new inflight request (hash={request_hash:016x})");
+    InflightRegistration::Leader(sender)
+}
+
+fn join_inflight_stream(
+    mut receiver: broadcast::Receiver<InflightEvent>,
+    permits: StreamPermits,
+    stream_config: StreamResponseConfig,
+    protocol: DownstreamProtocol,
+) -> Response {
+    let (tx, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
+    tokio::spawn(async move {
+        let _permits = permits;
+        let mut encoder = protocol.stream_encoder();
+        let mut heartbeat = tokio::time::interval(stream_config.heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        loop {
+            tokio::select! {
+                _ = tx.closed() => break,
+                event = receiver.recv() => {
+                    match event {
+                        Ok(InflightEvent::Event(event)) => {
+                            if try_send_stream_frames(&tx, encoder.encode_event(&event)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(InflightEvent::Done) | Err(broadcast::error::RecvError::Closed) => {
+                            let _ = try_send_stream_frames(&tx, encoder.finish());
+                            break;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            let frames = encoder.encode_error(format!(
+                                "duplicate request stream fell behind and missed {skipped} event(s); please retry"
+                            ));
+                            let _ = try_send_stream_frames(&tx, frames);
+                            break;
+                        }
+                        Ok(InflightEvent::Error(failure)) => {
+                            let frames = encoder.encode_error(failure.message);
+                            let _ = try_send_stream_frames(&tx, frames);
+                            break;
+                        }
+                    }
+                }
+                _ = heartbeat.tick() => {
+                    if try_send_stream_frames(&tx, vec![SSE_HEARTBEAT_FRAME.to_vec()]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    sse_body_response(body)
+}
+
+async fn join_inflight_non_stream(
+    mut receiver: broadcast::Receiver<InflightEvent>,
+    _request_permit: OwnedSemaphorePermit,
+    protocol: &DownstreamProtocol,
+) -> Response {
+    let mut events = Vec::new();
+    loop {
+        match receiver.recv().await {
+            Ok(InflightEvent::Event(event)) => events.push(event),
+            Ok(InflightEvent::Done) | Err(broadcast::error::RecvError::Closed) => break,
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                return protocol_error_response(
+                    protocol,
+                    StatusCode::BAD_GATEWAY,
+                    &ErrorResponse::api_error(&format!(
+                        "duplicate request stream fell behind and missed {skipped} event(s); please retry"
+                    )),
+                );
+            }
+            Ok(InflightEvent::Error(failure)) => {
+                return provider_error_for_protocol(protocol, &failure.error);
+            }
+        }
+    }
+
+    protocol.non_stream_response(events)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamSendError {
+    Full,
+    Closed,
+}
+
+fn try_send_stream_frames(
+    sender: &tokio::sync::mpsc::Sender<Result<Vec<u8>, Infallible>>,
+    mut frames: Vec<Vec<u8>>,
+) -> Result<(), StreamSendError> {
+    let batch = match frames.len() {
+        0 => return Ok(()),
+        1 => frames.pop().unwrap(),
+        _ => {
+            let total_len = frames.iter().map(Vec::len).sum();
+            let mut batch = Vec::with_capacity(total_len);
+            for frame in frames {
+                batch.extend_from_slice(&frame);
+            }
+            batch
+        }
+    };
+
+    sender.try_send(Ok(batch)).map_err(|error| match error {
+        tokio::sync::mpsc::error::TrySendError::Full(_) => StreamSendError::Full,
+        tokio::sync::mpsc::error::TrySendError::Closed(_) => StreamSendError::Closed,
+    })
+}
+
+async fn stream_leader_response(
+    state: &AppState,
+    request: &RequestMetricsContext,
+    mut stream: BoxStream<'static, Result<ProviderEvent, ProviderError>>,
+    context: LeaderResponseContext,
+) -> Response {
+    let LeaderResponseContext {
+        request_hash,
+        broadcast_tx,
+        permits,
+        start: _,
+        observer_state,
+        observability,
+        stream_config,
+        protocol,
+    } = context;
+    let (sender, body) = tokio::sync::mpsc::channel::<Result<Vec<u8>, Infallible>>(64);
+
+    let metrics = state.metrics.clone();
+    let health_state = state.clone();
+    let provider_id = request.provider_id.clone();
+    let initiator = request.initiator;
+    let model_name = request.model.clone();
+    let inflight_map = state.inflight.clone();
+    let request_id = Uuid::new_v4().to_string();
+    metrics
+        .register_active_stream(
+            request_id.clone(),
+            provider_id.clone(),
+            initiator.to_string(),
+            model_name.clone(),
+        )
+        .await;
+    tokio::spawn(async move {
+        let _permits = permits;
+        let mut encoder = protocol.stream_encoder();
+        let task_start = std::time::Instant::now();
+        let mut timing = ObservabilityTiming::default();
+        let mut usage = TokenUsage::default();
+        let mut had_error = false;
+        let mut terminal_reason = "completed";
+        let mut last_error = None;
+        let mut last_error_metadata = None;
+        let mut leader_tx_open = true;
+        let mut heartbeat = tokio::time::interval(stream_config.heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        let mut idle_deadline = Box::pin(tokio::time::sleep(stream_config.idle_timeout));
+        let mut overall_deadline = Box::pin(tokio::time::sleep(stream_config.overall_timeout));
+        let mut tool_use_deadline =
+            Box::pin(tokio::time::sleep(stream_config.tool_use_terminal_timeout));
+        let mut tool_use_pending = false;
+
+        loop {
+            tokio::select! {
+                _ = sender.closed(), if leader_tx_open => {
+                    leader_tx_open = false;
+                    terminal_reason = "client_disconnected";
+                    if broadcast_tx.receiver_count() == 0 {
+                        break;
+                    }
+                }
+                _ = broadcast_tx.closed(), if !leader_tx_open => break,
+                event_result = stream.next() => {
+                    let Some(event_result) = event_result else {
+                        if tool_use_pending {
+                            let error_message = "upstream stream ended before tool_use reached message_stop".to_string();
+                            warn!(
+                                request_id = %request_id,
+                                provider_id = %provider_id,
+                                model = %model_name,
+                                "tool_use stream ended without terminal event"
+                            );
+                            had_error = true;
+                            terminal_reason = "tool_use_missing_terminal_event";
+                            last_error = Some(error_message.clone());
+                            let _ = broadcast_tx.send(inflight_failure(ProviderError::Timeout, error_message.clone()));
+                            if leader_tx_open {
+                                let frames = encoder.encode_error(error_message);
+                                if try_send_stream_frames(&sender, frames).is_err() {
+                                    leader_tx_open = false;
+                                }
+                            }
+                        }
+                        break;
+                    };
+                    idle_deadline
+                        .as_mut()
+                        .reset(TokioInstant::now() + stream_config.idle_timeout);
+                    match event_result {
+                        Ok(event) => {
+                            let now = std::time::Instant::now();
+                            if let Some(context) = &observability {
+                                timing.record_event(context.start, now, context.idle_gap_ms);
+                            }
+                            for normalized in event.normalized_events() {
+                                extract_usage_from_event(&normalized.data, &mut usage);
+                            }
+                            if let Some(message) = native_response_failure_message(&event) {
+                                had_error = true;
+                                terminal_reason = "response_failed";
+                                last_error = Some(message);
+                            }
+                            if provider_event_starts_tool_use(&event) {
+                                tool_use_pending = true;
+                                tool_use_deadline.as_mut().reset(
+                                    TokioInstant::now() + stream_config.tool_use_terminal_timeout,
+                                );
+                            } else if provider_event_finishes_message(&event) {
+                                tool_use_pending = false;
+                            } else if tool_use_pending {
+                                tool_use_deadline.as_mut().reset(
+                                    TokioInstant::now() + stream_config.tool_use_terminal_timeout,
+                                );
+                            }
+                            metrics
+                                .update_active_stream(
+                                    &request_id,
+                                    provider_event_type(&event),
+                                    tool_use_pending,
+                                )
+                                .await;
+                            let frames = if leader_tx_open {
+                                encoder.encode_event(&event)
+                            } else {
+                                Vec::new()
+                            };
+                            let _ = broadcast_tx.send(InflightEvent::Event(event));
+                            if leader_tx_open
+                                && let Err(send_error) = try_send_stream_frames(&sender, frames)
+                            {
+                                leader_tx_open = false;
+                                terminal_reason = match send_error {
+                                    StreamSendError::Full => "downstream_backpressure",
+                                    StreamSendError::Closed => "client_disconnected",
+                                };
+                            }
+                            if !leader_tx_open && broadcast_tx.receiver_count() == 0 {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let error_message = e.to_string();
+                            error!(
+                                provider_id = %provider_id,
+                                model = %model_name,
+                                error = %error_message,
+                                "stream error from provider"
+                            );
+                            had_error = true;
+                            terminal_reason = "stream_error";
+                            last_error = Some(error_message.clone());
+                            last_error_metadata = e.upstream_metadata().cloned();
+                            let _ = broadcast_tx.send(inflight_failure(e, error_message.clone()));
+                            if leader_tx_open {
+                                let frames = encoder.encode_error(error_message);
+                                let _ = try_send_stream_frames(&sender, frames);
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ = heartbeat.tick(), if leader_tx_open => {
+                    if let Err(send_error) = try_send_stream_frames(
+                        &sender,
+                        vec![SSE_HEARTBEAT_FRAME.to_vec()],
+                    ) {
+                        leader_tx_open = false;
+                        terminal_reason = match send_error {
+                            StreamSendError::Full => "downstream_backpressure",
+                            StreamSendError::Closed => "client_disconnected",
+                        };
+                    }
+                    if !leader_tx_open && broadcast_tx.receiver_count() == 0 {
+                        break;
+                    }
+                }
+                _ = &mut idle_deadline => {
+                    let error_message = format!(
+                        "upstream stream idle for {}s",
+                        stream_config.idle_timeout.as_secs()
+                    );
+                    warn!(
+                        request_id = %request_id,
+                        provider_id = %provider_id,
+                        model = %model_name,
+                        timeout_seconds = stream_config.idle_timeout.as_secs(),
+                        "stream idle watchdog fired"
+                    );
+                    had_error = true;
+                    terminal_reason = "stream_idle_timeout";
+                    last_error = Some(error_message.clone());
+                    let _ = broadcast_tx.send(inflight_failure(ProviderError::Timeout, error_message.clone()));
+                    if leader_tx_open {
+                        let frames = encoder.encode_error(error_message);
+                        let _ = try_send_stream_frames(&sender, frames);
+                    }
+                    break;
+                }
+                _ = &mut tool_use_deadline, if tool_use_pending => {
+                    let error_message = format!(
+                        "tool_use stream did not reach message_stop within {}",
+                        format_timeout_duration(stream_config.tool_use_terminal_timeout)
+                    );
+                    warn!(
+                        request_id = %request_id,
+                        provider_id = %provider_id,
+                        model = %model_name,
+                        timeout_seconds = stream_config.tool_use_terminal_timeout.as_secs(),
+                        "tool_use terminal watchdog fired"
+                    );
+                    had_error = true;
+                    terminal_reason = "tool_use_terminal_timeout";
+                    last_error = Some(error_message.clone());
+                    let _ = broadcast_tx.send(inflight_failure(ProviderError::Timeout, error_message.clone()));
+                    if leader_tx_open {
+                        let frames = encoder.encode_error(error_message);
+                        let _ = try_send_stream_frames(&sender, frames);
+                    }
+                    break;
+                }
+                _ = &mut overall_deadline => {
+                    let error_message = format!(
+                        "upstream stream exceeded overall timeout of {}s",
+                        stream_config.overall_timeout.as_secs()
+                    );
+                    warn!(
+                        request_id = %request_id,
+                        provider_id = %provider_id,
+                        model = %model_name,
+                        timeout_seconds = stream_config.overall_timeout.as_secs(),
+                        "stream overall watchdog fired"
+                    );
+                    had_error = true;
+                    terminal_reason = "stream_overall_timeout";
+                    last_error = Some(error_message.clone());
+                    let _ = broadcast_tx.send(inflight_failure(ProviderError::Timeout, error_message.clone()));
+                    if leader_tx_open {
+                        let frames = encoder.encode_error(error_message);
+                        let _ = try_send_stream_frames(&sender, frames);
+                    }
+                    break;
+                }
+            }
+        }
+        if !had_error && leader_tx_open {
+            let frames = encoder.finish();
+            if let Err(send_error) = try_send_stream_frames(&sender, frames) {
+                terminal_reason = match send_error {
+                    StreamSendError::Full => "downstream_backpressure",
+                    StreamSendError::Closed => "client_disconnected",
+                };
+            }
+        }
+        let _ = broadcast_tx.send(InflightEvent::Done);
+        inflight_map.lock().await.remove(&request_hash);
+        metrics.remove_active_stream(&request_id).await;
+        let latency_ms = task_start.elapsed().as_millis() as u64;
+        timing.stream_duration_ms = latency_ms;
+        if had_error {
+            metrics.record_error();
+        }
+        if let Some(error) = last_error {
+            health_state
+                .record_provider_error(&provider_id, &error)
+                .await;
+        } else {
+            health_state.record_provider_success(&provider_id).await;
+        }
+        merge_observer_usage(&observer_state, &mut usage);
+        metrics.record_latency(latency_ms);
+        metrics
+            .record_completed_request(CompletedUsageRecord {
+                provider: &provider_id,
+                initiator,
+                model: &model_name,
+                usage: &usage,
+                is_error: had_error,
+                latency_ms,
+                terminal_reason,
+                error_kind: if had_error { "stream" } else { "" },
+            })
+            .await;
+        if let Some(context) = observability {
+            metrics
+                .record_observability(
+                    build_observability_event(
+                        context,
+                        timing,
+                        had_error,
+                        terminal_reason,
+                        last_error_metadata.as_ref(),
+                    ),
+                    true,
+                )
+                .await;
+        }
+    });
+
+    sse_body_response(body)
+}
+
+struct NonStreamFailureContext<'a> {
+    state: &'a AppState,
+    request: &'a RequestMetricsContext,
+    request_hash: u64,
+    broadcast_tx: &'a broadcast::Sender<InflightEvent>,
+    start: std::time::Instant,
+    stream_start: std::time::Instant,
+    observer_state: &'a Arc<StdMutex<RequestObserverState>>,
+    observability: Option<ObservabilityContext>,
+    protocol: &'a DownstreamProtocol,
+}
+
+struct NonStreamFailure {
+    error: ProviderError,
+    message: String,
+    terminal_reason: &'static str,
+}
+
+async fn finish_non_stream_failure(
+    context: NonStreamFailureContext<'_>,
+    mut timing: ObservabilityTiming,
+    mut usage: TokenUsage,
+    failure: NonStreamFailure,
+) -> Response {
+    let NonStreamFailureContext {
+        state,
+        request,
+        request_hash,
+        broadcast_tx,
+        start,
+        stream_start,
+        observer_state,
+        observability,
+        protocol,
+    } = context;
+    let NonStreamFailure {
+        error,
+        message,
+        terminal_reason,
+    } = failure;
+    let response = provider_error_for_protocol(protocol, &error);
+    let _ = broadcast_tx.send(inflight_failure(error.clone(), message.clone()));
+    let _ = broadcast_tx.send(InflightEvent::Done);
+    state.inflight.lock().await.remove(&request_hash);
+    state
+        .record_provider_error_with_metadata(
+            &request.provider_id,
+            &message,
+            error.upstream_metadata().cloned(),
+        )
+        .await;
+
+    let latency_ms = start.elapsed().as_millis() as u64;
+    state.metrics.record_error();
+    state.metrics.record_latency(latency_ms);
+    merge_observer_usage(observer_state, &mut usage);
+    state
+        .metrics
+        .record_completed_request(CompletedUsageRecord {
+            provider: &request.provider_id,
+            initiator: request.initiator,
+            model: &request.model,
+            usage: &usage,
+            is_error: true,
+            latency_ms,
+            terminal_reason,
+            error_kind: provider_error_kind(&error),
+        })
+        .await;
+    if let Some(context) = observability {
+        timing.stream_duration_ms = stream_start.elapsed().as_millis() as u64;
+        state
+            .metrics
+            .record_observability(
+                build_observability_event(
+                    context,
+                    timing,
+                    true,
+                    terminal_reason,
+                    error.upstream_metadata(),
+                ),
+                true,
+            )
+            .await;
+    }
+    response
+}
+
+async fn collect_leader_response(
+    state: &AppState,
+    request: &RequestMetricsContext,
+    mut stream: BoxStream<'static, Result<ProviderEvent, ProviderError>>,
+    context: LeaderResponseContext,
+) -> Response {
+    let LeaderResponseContext {
+        request_hash,
+        broadcast_tx,
+        permits: _permits,
+        start,
+        observer_state,
+        observability,
+        stream_config,
+        protocol,
+    } = context;
+    let stream_start = std::time::Instant::now();
+    let mut timing = ObservabilityTiming::default();
+    let mut events = Vec::new();
+    let mut retained_response_bytes = 0_u64;
+    let mut usage = TokenUsage::default();
+    let mut idle_deadline = Box::pin(tokio::time::sleep(stream_config.idle_timeout));
+    let mut overall_deadline = Box::pin(tokio::time::sleep(stream_config.overall_timeout));
+    let mut tool_use_deadline =
+        Box::pin(tokio::time::sleep(stream_config.tool_use_terminal_timeout));
+    let mut tool_use_pending = false;
+
+    loop {
+        let failure = tokio::select! {
+            event_result = stream.next() => {
+                match event_result {
+                    None if tool_use_pending => {
+                        Some((
+                            ProviderError::Timeout,
+                            "upstream stream ended before tool_use reached message_stop".to_string(),
+                            "tool_use_missing_terminal_event",
+                        ))
+                    }
+                    None => None,
+                    Some(Ok(event)) => {
+                        idle_deadline
+                            .as_mut()
+                            .reset(TokioInstant::now() + stream_config.idle_timeout);
+                        if let Some(context) = &observability {
+                            timing.record_event(
+                                context.start,
+                                std::time::Instant::now(),
+                                context.idle_gap_ms,
+                            );
+                        }
+                        for normalized in event.normalized_events() {
+                            extract_usage_from_event(&normalized.data, &mut usage);
+                        }
+                        if provider_event_starts_tool_use(&event) {
+                            tool_use_pending = true;
+                            tool_use_deadline.as_mut().reset(
+                                TokioInstant::now() + stream_config.tool_use_terminal_timeout,
+                            );
+                        } else if provider_event_finishes_message(&event) {
+                            tool_use_pending = false;
+                        } else if tool_use_pending {
+                            tool_use_deadline.as_mut().reset(
+                                TokioInstant::now() + stream_config.tool_use_terminal_timeout,
+                            );
+                        }
+                        let event_size = event.retained_size_bytes();
+                        let next_retained_size = event_size.and_then(|event_size| {
+                            retained_response_bytes.checked_add(event_size)
+                        });
+                        if next_retained_size.is_none_or(|size| {
+                            size > stream_config.max_non_stream_response_bytes
+                        }) {
+                            let limit = stream_config.max_non_stream_response_bytes;
+                            let error = ProviderError::ResponseTooLarge(format!(
+                                "non-stream response exceeds configured limit of {limit} bytes"
+                            ));
+                            let message = error.to_string();
+                            warn!(
+                                provider_id = %request.provider_id,
+                                model = %request.model,
+                                limit_bytes = limit,
+                                "non-stream response budget exceeded"
+                            );
+                            Some((error, message, "response_too_large"))
+                        } else {
+                            retained_response_bytes = next_retained_size.unwrap();
+                            let _ = broadcast_tx.send(InflightEvent::Event(event.clone()));
+                            events.push(event);
+                            continue;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        let terminal_reason = provider_stream_error_terminal_reason(&error);
+                        let error_message = error.to_string();
+                        Some((error, error_message, terminal_reason))
+                    }
+                }
+            }
+            _ = &mut idle_deadline => {
+                let error_message = format!(
+                    "upstream stream idle for {}s",
+                    stream_config.idle_timeout.as_secs()
+                );
+                warn!(
+                    provider_id = %request.provider_id,
+                    model = %request.model,
+                    timeout_seconds = stream_config.idle_timeout.as_secs(),
+                    "non-stream idle watchdog fired"
+                );
+                Some((ProviderError::Timeout, error_message, "stream_idle_timeout"))
+            }
+            _ = &mut tool_use_deadline, if tool_use_pending => {
+                let error_message = format!(
+                    "tool_use stream did not reach message_stop within {}",
+                    format_timeout_duration(stream_config.tool_use_terminal_timeout)
+                );
+                warn!(
+                    provider_id = %request.provider_id,
+                    model = %request.model,
+                    timeout_seconds = stream_config.tool_use_terminal_timeout.as_secs(),
+                    "non-stream tool_use terminal watchdog fired"
+                );
+                Some((ProviderError::Timeout, error_message, "tool_use_terminal_timeout"))
+            }
+            _ = &mut overall_deadline => {
+                let error_message = format!(
+                    "upstream stream exceeded overall timeout of {}s",
+                    stream_config.overall_timeout.as_secs()
+                );
+                warn!(
+                    provider_id = %request.provider_id,
+                    model = %request.model,
+                    timeout_seconds = stream_config.overall_timeout.as_secs(),
+                    "non-stream overall watchdog fired"
+                );
+                Some((ProviderError::Timeout, error_message, "stream_overall_timeout"))
+            }
+        };
+
+        let Some((error, error_message, terminal_reason)) = failure else {
+            break;
+        };
+        return finish_non_stream_failure(
+            NonStreamFailureContext {
+                state,
+                request,
+                request_hash,
+                broadcast_tx: &broadcast_tx,
+                start,
+                stream_start,
+                observer_state: &observer_state,
+                observability,
+                protocol: &protocol,
+            },
+            timing,
+            usage,
+            NonStreamFailure {
+                error,
+                message: error_message,
+                terminal_reason,
+            },
+        )
+        .await;
+    }
+
+    let _ = broadcast_tx.send(InflightEvent::Done);
+    state.inflight.lock().await.remove(&request_hash);
+
+    let latency_ms = start.elapsed().as_millis() as u64;
+    merge_observer_usage(&observer_state, &mut usage);
+    state
+        .metrics
+        .record_completed_request(CompletedUsageRecord {
+            provider: &request.provider_id,
+            initiator: request.initiator,
+            model: &request.model,
+            usage: &usage,
+            is_error: false,
+            latency_ms,
+            terminal_reason: "completed",
+            error_kind: "",
+        })
+        .await;
+
+    state.record_provider_success(&request.provider_id).await;
+    state.metrics.record_latency(latency_ms);
+    if let Some(context) = observability {
+        timing.stream_duration_ms = stream_start.elapsed().as_millis() as u64;
+        state
+            .metrics
+            .record_observability(
+                build_observability_event(context, timing, false, "completed", None),
+                true,
+            )
+            .await;
+    }
+    protocol.non_stream_response(events)
+}
+
+struct ProviderErrorResponseContext {
+    request_hash: u64,
+    broadcast_tx: broadcast::Sender<InflightEvent>,
+    start: std::time::Instant,
+    observability: Option<ObservabilityContext>,
+    protocol: DownstreamProtocol,
+}
+
+async fn handle_provider_error(
+    state: &AppState,
+    request: &RequestMetricsContext,
+    error: ProviderError,
+    context: ProviderErrorResponseContext,
+) -> Response {
+    let ProviderErrorResponseContext {
+        request_hash,
+        broadcast_tx,
+        start,
+        observability,
+        protocol,
+    } = context;
+    let _ = broadcast_tx.send(inflight_failure(error.clone(), error.to_string()));
+    let _ = broadcast_tx.send(InflightEvent::Done);
+    state.inflight.lock().await.remove(&request_hash);
+
+    error!("Provider error: {error}");
+    state
+        .record_provider_error_with_metadata(
+            &request.provider_id,
+            &error.to_string(),
+            error.upstream_metadata().cloned(),
+        )
+        .await;
+    state.metrics.record_error();
+    let latency_ms = start.elapsed().as_millis() as u64;
+    state.metrics.record_latency(latency_ms);
+    state
+        .metrics
+        .record_completed_request(CompletedUsageRecord {
+            provider: &request.provider_id,
+            initiator: request.initiator,
+            model: &request.model,
+            usage: &TokenUsage::default(),
+            is_error: true,
+            latency_ms,
+            terminal_reason: "provider_error",
+            error_kind: provider_error_kind(&error),
+        })
+        .await;
+    if let Some(context) = observability {
+        state
+            .metrics
+            .record_observability(
+                build_observability_event(
+                    context,
+                    ObservabilityTiming::default(),
+                    true,
+                    "provider_error",
+                    error.upstream_metadata(),
+                ),
+                true,
+            )
+            .await;
+    }
+    provider_error_for_protocol(&protocol, &error)
+}
+
+fn provider_error_for_protocol(protocol: &DownstreamProtocol, error: &ProviderError) -> Response {
+    if matches!(protocol, DownstreamProtocol::Anthropic) {
+        provider_error_to_response(error)
+    } else {
+        provider_error_response(protocol, error)
+    }
+}
+
+fn sse_body_response(body: tokio::sync::mpsc::Receiver<Result<Vec<u8>, Infallible>>) -> Response {
+    let stream_body = tokio_stream::wrappers::ReceiverStream::new(body);
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache, no-transform")
+        .header("connection", "keep-alive")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(stream_body))
+        .unwrap()
+}
+
+/// GET /v1/models — list available models
+pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
+    refresh_missing_model_caches(&state).await;
+
+    let registry = state.provider_registry.read().await;
+    let models = registry.all_cached_models_with_provider();
+
+    let data: Vec<Value> = models
+        .iter()
+        .map(|(provider_id, m)| {
+            json!({
+                "id": m.model_id,
+                "object": "model",
+                "provider": provider_id,
+                "qualified_id": format!("{provider_id}/{}", m.model_id),
+                "vendor": m.vendor,
+                "is_chat_default": m.is_chat_default,
+                "supported_endpoints": m.capabilities.endpoints.supported_paths(),
+                "capabilities": m.capabilities,
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "data": data,
+        "object": "list"
+    }))
+}
+
+async fn refresh_missing_model_caches(state: &AppState) {
+    let provider_ids: Vec<String> = {
+        let settings = state.settings.read().await;
+        settings.providers.keys().cloned().collect()
+    };
+
+    for provider_id in provider_ids {
+        if let Err(error) = state.get_or_refresh_models(&provider_id).await {
+            warn!("{error}");
+        }
+    }
+}
+
+/// GET /admin/config — get current config (keys masked)
+pub async fn admin_get_config(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let settings = state.settings.read().await;
+    if !check_admin_auth(&headers, settings.admin_auth_token()) {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            &ErrorResponse::authentication("invalid admin token"),
+        );
+    }
+    let toml_str = settings.to_toml();
+    let masked = mask_toml_keys(&toml_str);
+    Json(json!({"config": masked})).into_response()
+}
+
+/// PUT /admin/config — update config
+pub async fn admin_update_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(update): Json<Value>,
+) -> Response {
+    let settings = state.settings.read().await;
+    if !check_admin_auth(&headers, settings.admin_auth_token()) {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            &ErrorResponse::authentication("invalid admin token"),
+        );
+    }
+    drop(settings);
+
+    let toml_str = match update.get("config").and_then(|c| c.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorResponse::invalid_request("expected {\"config\": \"<toml>\"}"),
+            );
+        }
+    };
+
+    match aisub2api_config::Settings::from_toml(&toml_str, std::path::Path::new("admin-update")) {
+        Ok(new_settings) => {
+            if let Err(e) = new_settings.validate() {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorResponse::invalid_request(&format!("validation failed: {e}")),
+                );
+            }
+
+            let config_toml = new_settings.to_toml();
+            state.apply_settings(new_settings).await;
+
+            if let Some(path) = aisub2api_config::Settings::config_file_path()
+                && let Err(e) = std::fs::write(&path, config_toml)
+            {
+                error!("Failed to write config to disk: {e}");
+            }
+
+            info!("Config updated via admin API");
+            Json(json!({"status": "ok"})).into_response()
+        }
+        Err(e) => error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse::invalid_request(&format!("invalid config: {e}")),
+        ),
+    }
+}
+
+/// POST /admin/restart — trigger config reload
+pub async fn admin_restart(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let settings = state.settings.read().await;
+    if !check_admin_auth(&headers, settings.admin_auth_token()) {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            &ErrorResponse::authentication("invalid admin token"),
+        );
+    }
+    drop(settings);
+
+    if let Some(path) = aisub2api_config::Settings::config_file_path() {
+        match aisub2api_config::Settings::load(&path) {
+            Ok(new_settings) => {
+                if let Err(e) = new_settings.validate() {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        &ErrorResponse::invalid_request(&format!("validation failed: {e}")),
+                    );
+                }
+                state.apply_settings(new_settings).await;
+                info!("Config reloaded via admin restart");
+                Json(json!({"status": "reloaded"})).into_response()
+            }
+            Err(e) => {
+                error!("Config reload failed: {e}");
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &ErrorResponse::api_error(&format!("reload failed: {e}")),
+                )
+            }
+        }
+    } else {
+        error_response(
+            StatusCode::NOT_FOUND,
+            &ErrorResponse::not_found("no config file found"),
+        )
+    }
+}
+
+/// GET /admin/metrics
+pub async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let settings = state.settings.read().await;
+    if !check_admin_auth(&headers, settings.admin_auth_token()) {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            &ErrorResponse::authentication("invalid admin token"),
+        );
+    }
+    let provider_ids = settings.providers.keys().cloned().collect::<Vec<_>>();
+    let rate_limit_provider_ids = settings
+        .providers
+        .iter()
+        .filter(|(provider_id, config)| config.resolve_type(provider_id) == ProviderType::ChatGPT)
+        .map(|(provider_id, _)| provider_id.clone())
+        .collect::<Vec<_>>();
+    drop(settings);
+
+    let (model_capabilities, model_cache) = {
+        let registry = state.provider_registry.read().await;
+        (
+            registry.model_capabilities(),
+            registry.model_cache_status(&provider_ids),
+        )
+    };
+    let provider_rate_limits = provider_rate_limit_snapshots(&state, rate_limit_provider_ids).await;
+    let provider_health = state.provider_health_snapshot(provider_ids).await;
+    let mut metrics = state.metrics.to_json().await;
+    if let Some(object) = metrics.as_object_mut() {
+        object.insert("model_capabilities".to_string(), model_capabilities);
+        object.insert(
+            "model_cache".to_string(),
+            serde_json::to_value(model_cache).unwrap_or_default(),
+        );
+        object.insert(
+            "provider_rate_limits".to_string(),
+            serde_json::to_value(provider_rate_limits).unwrap_or_default(),
+        );
+        object.insert(
+            "provider_health".to_string(),
+            serde_json::to_value(provider_health).unwrap_or_default(),
+        );
+    }
+    Json(metrics).into_response()
+}
+
+/// POST /admin/models/refresh — force refresh model caches for all configured providers
+pub async fn admin_refresh_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let settings = state.settings.read().await;
+    if !check_admin_auth(&headers, settings.admin_auth_token()) {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            &ErrorResponse::authentication("invalid admin token"),
+        );
+    }
+    let provider_ids = settings.providers.keys().cloned().collect::<Vec<_>>();
+    drop(settings);
+
+    let mut refreshed = serde_json::Map::new();
+    let mut errors = serde_json::Map::new();
+    for provider_id in &provider_ids {
+        match state.refresh_models(provider_id).await {
+            Ok(models) => {
+                refreshed.insert(provider_id.clone(), json!(models.len()));
+            }
+            Err(error) => {
+                warn!("{error}");
+                errors.insert(provider_id.clone(), json!(error));
+            }
+        }
+    }
+
+    let model_cache = state
+        .provider_registry
+        .read()
+        .await
+        .model_cache_status(&provider_ids);
+    let status = if errors.is_empty() { "ok" } else { "partial" };
+
+    Json(json!({
+        "status": status,
+        "refreshed": refreshed,
+        "errors": errors,
+        "model_cache": model_cache,
+    }))
+    .into_response()
+}
+
+async fn provider_rate_limit_snapshots(
+    state: &AppState,
+    provider_ids: Vec<String>,
+) -> std::collections::HashMap<String, Vec<aisub2api_providers::provider::RateLimitSnapshot>> {
+    let mut snapshots = std::collections::HashMap::new();
+    for provider_id in provider_ids {
+        let Ok(provider) = state.get_or_create_provider(&provider_id).await else {
+            continue;
+        };
+        if let Ok(provider_snapshots) = provider.rate_limit_snapshots().await
+            && !provider_snapshots.is_empty()
+        {
+            snapshots.insert(provider_id, provider_snapshots);
+        }
+    }
+    snapshots
+}
+
+#[cfg(test)]
+fn stream_api_error_event(message: impl Into<String>) -> SseEvent {
+    SseEvent {
+        event: "error".to_string(),
+        data: json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": message.into()
+            }
+        }),
+    }
+}
+
+fn sse_event_starts_tool_use(event: &SseEvent) -> bool {
+    event.event == "content_block_start"
+        && event.data["content_block"]["type"].as_str() == Some("tool_use")
+}
+
+fn provider_event_starts_tool_use(event: &ProviderEvent) -> bool {
+    event
+        .normalized_events()
+        .iter()
+        .any(sse_event_starts_tool_use)
+}
+
+fn sse_event_finishes_message(event: &SseEvent) -> bool {
+    event.event == "message_stop" || event.data["type"].as_str() == Some("message_stop")
+}
+
+fn provider_event_finishes_message(event: &ProviderEvent) -> bool {
+    event
+        .normalized_events()
+        .iter()
+        .any(sse_event_finishes_message)
+}
+
+fn sse_event_type(event: &SseEvent) -> String {
+    event
+        .data
+        .get("type")
+        .and_then(Value::as_str)
+        .or_else(|| (!event.event.is_empty()).then_some(event.event.as_str()))
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn provider_event_type(event: &ProviderEvent) -> String {
+    match event.native_event() {
+        Some(aisub2api_providers::NativeProviderEvent::OpenAiResponses(event)) => {
+            sse_event_type(event)
+        }
+        None => event
+            .normalized_events()
+            .last()
+            .map(sse_event_type)
+            .unwrap_or_else(|| "unknown".to_string()),
+    }
+}
+
+fn native_response_failure_message(event: &ProviderEvent) -> Option<String> {
+    let aisub2api_providers::NativeProviderEvent::OpenAiResponses(event) = event.native_event()?;
+    if event.data.get("type").and_then(Value::as_str) != Some("response.failed") {
+        return None;
+    }
+    Some(
+        event
+            .data
+            .pointer("/response/error/message")
+            .and_then(Value::as_str)
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or("upstream response failed")
+            .to_string(),
+    )
+}
+
+fn format_timeout_duration(duration: Duration) -> String {
+    if duration.as_millis().is_multiple_of(1000) {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{}ms", duration.as_millis())
+    }
+}
+
+fn overloaded_status() -> StatusCode {
+    StatusCode::from_u16(529).unwrap_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+fn overloaded_error(message: &str) -> ErrorResponse {
+    ErrorResponse {
+        r#type: "error".to_string(),
+        error: AnthropicError {
+            error_type: "overloaded_error".to_string(),
+            message: message.to_string(),
+        },
+    }
+}
+
+fn overloaded_response(message: &str, retry_after: Option<u64>) -> Response {
+    let mut response = error_response(overloaded_status(), &overloaded_error(message));
+    response
+        .headers_mut()
+        .insert("x-should-retry", HeaderValue::from_static("true"));
+    if let Some(secs) = retry_after
+        && let Ok(header_value) = HeaderValue::from_str(&secs.to_string())
+    {
+        response.headers_mut().insert("retry-after", header_value);
+    }
+    response
+}
+
+fn is_retryable_upstream_error_status(status: u16) -> bool {
+    matches!(status, 408 | 409 | 500..=599)
+}
+
+fn provider_stream_error_terminal_reason(error: &ProviderError) -> &'static str {
+    match error.without_upstream_metadata() {
+        ProviderError::InvalidRequest(_) | ProviderError::RequestTooLarge(_) => "provider_error",
+        _ => "stream_error",
+    }
+}
+
+fn provider_error_kind(error: &ProviderError) -> &'static str {
+    match error.without_upstream_metadata() {
+        ProviderError::Authentication(_) => "authentication",
+        ProviderError::RateLimited { .. } => "rate_limited",
+        ProviderError::InvalidRequest(_) => "invalid_request",
+        ProviderError::RequestTooLarge(_) => "request_too_large",
+        ProviderError::ResponseTooLarge(_) => "response_too_large",
+        ProviderError::Overloaded { .. } => "overloaded",
+        ProviderError::ModelNotFound(_) => "model_not_found",
+        ProviderError::Timeout => "timeout",
+        ProviderError::UpstreamError { .. } => "upstream",
+        ProviderError::ServiceUnavailable(_) => "service_unavailable",
+        ProviderError::FlexUnavailable(_) => "flex_unavailable",
+        ProviderError::Network(_) => "network",
+        ProviderError::WithUpstreamMetadata { .. } => unreachable!(),
+    }
+}
+
+fn provider_error_to_response(error: &ProviderError) -> Response {
+    let metadata = error.upstream_metadata();
+    let mut response = match error.without_upstream_metadata() {
+        ProviderError::Authentication(msg) => error_response(
+            StatusCode::UNAUTHORIZED,
+            &ErrorResponse::authentication(msg),
+        ),
+        ProviderError::RateLimited { retry_after } => {
+            let mut response = error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                &ErrorResponse::rate_limit("rate limited by upstream"),
+            );
+            if let Some(secs) = retry_after
+                && let Ok(header_value) = axum::http::HeaderValue::from_str(&secs.to_string())
+            {
+                response.headers_mut().insert("retry-after", header_value);
+            }
+            response
+        }
+        ProviderError::InvalidRequest(msg) => error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse::invalid_request(msg),
+        ),
+        ProviderError::RequestTooLarge(msg) => error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &ErrorResponse::invalid_request(msg),
+        ),
+        ProviderError::ResponseTooLarge(msg) => {
+            error_response(StatusCode::BAD_GATEWAY, &ErrorResponse::api_error(msg))
+        }
+        ProviderError::Overloaded {
+            message,
+            retry_after,
+        } => overloaded_response(message, *retry_after),
+        ProviderError::ModelNotFound(msg) => {
+            error_response(StatusCode::NOT_FOUND, &ErrorResponse::not_found(msg))
+        }
+        ProviderError::Timeout => error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            &ErrorResponse::timeout("upstream request timed out"),
+        ),
+        ProviderError::UpstreamError { status, body } => {
+            error!("Upstream error (HTTP {status}): {body}");
+            upstream_error_to_response(*status, body)
+        }
+        ProviderError::FlexUnavailable(msg) => {
+            let mut response = error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &ErrorResponse::api_error(msg),
+            );
+            response
+                .headers_mut()
+                .insert("x-should-retry", HeaderValue::from_static("false"));
+            response
+        }
+        ProviderError::ServiceUnavailable(msg) => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorResponse::api_error(msg),
+        ),
+        ProviderError::Network(msg) => error_response(
+            StatusCode::BAD_GATEWAY,
+            &ErrorResponse::api_error(&format!("network error: {msg}")),
+        ),
+        ProviderError::WithUpstreamMetadata { .. } => unreachable!(),
+    };
+    attach_upstream_error_headers(&mut response, metadata);
+    response
+}
+
+fn upstream_error_to_response(status: u16, body: &str) -> Response {
+    let message = extract_upstream_error_message(body);
+    match status {
+        400 => error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorResponse::invalid_request(&message),
+        ),
+        413 => error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &ErrorResponse::invalid_request(&message),
+        ),
+        status if is_retryable_upstream_error_status(status) => overloaded_response(&message, None),
+        _ => error_response(StatusCode::BAD_GATEWAY, &ErrorResponse::api_error(&message)),
+    }
+}
+
+fn attach_upstream_error_headers(
+    response: &mut Response,
+    metadata: Option<&UpstreamErrorMetadata>,
+) {
+    let Some(metadata) = metadata else {
+        return;
+    };
+    if let Ok(header_value) = HeaderValue::from_str(&metadata.status.to_string()) {
+        response
+            .headers_mut()
+            .insert("x-upstream-status", header_value);
+    }
+    if let Some(request_id) = metadata.request_id.as_deref()
+        && let Ok(header_value) = HeaderValue::from_str(request_id)
+    {
+        response
+            .headers_mut()
+            .insert("x-upstream-request-id", header_value);
+    }
+    if let Some(secs) = metadata.retry_after
+        && !response.headers().contains_key("retry-after")
+        && let Ok(header_value) = HeaderValue::from_str(&secs.to_string())
+    {
+        response.headers_mut().insert("retry-after", header_value);
+    }
+}
+
+fn extract_upstream_error_message(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|message| !message.is_empty())
+        .unwrap_or_else(|| {
+            if body.trim().is_empty() {
+                "upstream unavailable".to_string()
+            } else {
+                body.to_string()
+            }
+        })
+}
+
+fn error_response(status: StatusCode, error: &ErrorResponse) -> Response {
+    let body = serde_json::to_string(error).unwrap_or_default();
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn mask_toml_keys(toml_str: &str) -> String {
+    let mut result = String::new();
+    for line in toml_str.lines() {
+        let trimmed = line.trim();
+        if (trimmed.starts_with("api_key") || trimmed.starts_with("auth_token"))
+            && trimmed.contains('=')
+            && let Some((key, _)) = trimmed.split_once('=')
+        {
+            result.push_str(&format!("{} = \"***\"", key.trim()));
+            result.push('\n');
+            continue;
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+    result
+}
+
+/// Extract token usage from a streaming SSE event.
+fn extract_usage_from_event(data: &Value, usage: &mut TokenUsage) {
+    if let Some(message) = data.get("message")
+        && let Some(u) = message.get("usage")
+    {
+        update_usage_snapshot(u, usage);
+    }
+
+    if let Some(u) = data.get("usage") {
+        update_usage_snapshot(u, usage);
+    }
+}
+
+fn update_usage_snapshot(u: &Value, usage: &mut TokenUsage) {
+    if let Some(v) = u.get("input_tokens").and_then(|v| v.as_u64()) {
+        usage.input_tokens = usage.input_tokens.max(v);
+    }
+    if let Some(v) = u.get("output_tokens").and_then(|v| v.as_u64()) {
+        usage.output_tokens = usage.output_tokens.max(v);
+    }
+    if let Some(v) = u
+        .get("reasoning_output_tokens")
+        .or_else(|| u.get("reasoning_tokens"))
+        .and_then(|v| v.as_u64())
+    {
+        usage.reasoning_output_tokens = usage.reasoning_output_tokens.max(v);
+    }
+    if let Some(v) = u
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+    {
+        usage.cache_creation_input_tokens = usage.cache_creation_input_tokens.max(v);
+    }
+    if let Some(v) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
+        usage.cache_read_input_tokens = usage.cache_read_input_tokens.max(v);
+    }
+}
+
+fn merge_observer_usage(state: &Arc<StdMutex<RequestObserverState>>, usage: &mut TokenUsage) {
+    if let Ok(state) = state.lock() {
+        merge_usage_snapshot(&state.stream_usage, usage);
+    }
+}
+
+fn merge_provider_usage_metadata(provider_usage: &ProviderUsageMetadata, usage: &mut TokenUsage) {
+    usage.input_tokens = usage.input_tokens.max(provider_usage.input_tokens);
+    usage.output_tokens = usage.output_tokens.max(provider_usage.output_tokens);
+    usage.reasoning_output_tokens = usage
+        .reasoning_output_tokens
+        .max(provider_usage.reasoning_output_tokens);
+    usage.cache_creation_input_tokens = usage
+        .cache_creation_input_tokens
+        .max(provider_usage.cache_creation_input_tokens);
+    usage.cache_read_input_tokens = usage
+        .cache_read_input_tokens
+        .max(provider_usage.cache_read_input_tokens);
+}
+
+fn merge_usage_snapshot(snapshot: &TokenUsage, usage: &mut TokenUsage) {
+    usage.input_tokens = usage.input_tokens.max(snapshot.input_tokens);
+    usage.output_tokens = usage.output_tokens.max(snapshot.output_tokens);
+    usage.reasoning_output_tokens = usage
+        .reasoning_output_tokens
+        .max(snapshot.reasoning_output_tokens);
+    usage.cache_creation_input_tokens = usage
+        .cache_creation_input_tokens
+        .max(snapshot.cache_creation_input_tokens);
+    usage.cache_read_input_tokens = usage
+        .cache_read_input_tokens
+        .max(snapshot.cache_read_input_tokens);
+}
+
+/// Compute a hash of the request for deduplication purposes.
+/// Two requests with the same model, messages, system, tools, and parameters
+/// will produce the same hash.
+fn compute_request_hash(request: &MessagesRequest) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let mut writer = HashWriter(&mut hasher);
+    let _ = serde_json::to_writer(&mut writer, request);
+    hasher.finish()
+}
+
+struct HashWriter<'a, H>(&'a mut H);
+
+impl<H: Hasher> io::Write for HashWriter<'_, H> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use aisub2api_config::settings::{
+        AdminConfig, HttpConfig, LimitsConfig, LogConfig, ModelAliasConfig, ModelConfig,
+        ObservabilityConfig, ProviderConfig, ProviderType, ServerConfig,
+    };
+    use axum::body::to_bytes;
+
+    use super::*;
+
+    fn settings_with_provider(provider_type: ProviderType) -> aisub2api_config::Settings {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "test".to_string(),
+            ProviderConfig {
+                api_key: String::new(),
+                base_url: String::new(),
+                proxy: String::new(),
+                provider_type: Some(provider_type),
+                copilot: None,
+                chatgpt: None,
+                runtime: Default::default(),
+                reasoning_markers: Default::default(),
+            },
+        );
+
+        aisub2api_config::Settings {
+            providers,
+            model: ModelConfig {
+                default: ModelAliasConfig::new("test/model"),
+                reasoning: None,
+                opus: None,
+                sonnet: None,
+                haiku: None,
+            },
+            server: ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: 0,
+                auth_token: String::new(),
+                ..ServerConfig::default()
+            },
+            admin: AdminConfig { auth_token: None },
+            limits: LimitsConfig::default(),
+            http: HttpConfig::default(),
+            log: LogConfig::default(),
+            observability: ObservabilityConfig::default(),
+        }
+    }
+
+    fn test_stream_config() -> StreamResponseConfig {
+        StreamResponseConfig {
+            heartbeat_interval: Duration::from_secs(15),
+            idle_timeout: Duration::from_secs(120),
+            overall_timeout: Duration::from_secs(600),
+            tool_use_terminal_timeout: Duration::from_millis(50),
+            max_non_stream_response_bytes: 32 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn stream_frame_batches_are_atomic() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        try_send_stream_frames(&tx, vec![b"first".to_vec(), b"second".to_vec()]).unwrap();
+        assert_eq!(rx.try_recv().unwrap().unwrap(), b"firstsecond");
+
+        tx.try_send(Ok(b"occupied".to_vec())).unwrap();
+        assert_eq!(
+            try_send_stream_frames(&tx, vec![b"third".to_vec(), b"fourth".to_vec()]),
+            Err(StreamSendError::Full)
+        );
+        assert_eq!(rx.try_recv().unwrap().unwrap(), b"occupied");
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_stream_idle_watchdog_returns_504_and_finishes_followers() {
+        let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+        let request = RequestMetricsContext {
+            provider_id: "test".to_string(),
+            model: "model".to_string(),
+            initiator: "user",
+        };
+        let (broadcast_tx, mut follower) = broadcast::channel::<InflightEvent>(16);
+        let (_event_tx, event_rx) =
+            tokio::sync::mpsc::channel::<Result<ProviderEvent, ProviderError>>(1);
+        let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let stream_config = StreamResponseConfig {
+            idle_timeout: Duration::from_millis(20),
+            overall_timeout: Duration::from_secs(1),
+            ..test_stream_config()
+        };
+
+        let response = collect_leader_response(
+            &state,
+            &request,
+            tokio_stream::wrappers::ReceiverStream::new(event_rx).boxed(),
+            LeaderResponseContext {
+                request_hash: 0x1111,
+                broadcast_tx,
+                permits: StreamPermits {
+                    _request: request_permit,
+                    _provider: None,
+                },
+                start: std::time::Instant::now(),
+                observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
+                observability: None,
+                stream_config,
+                protocol: DownstreamProtocol::anthropic(),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(matches!(
+            follower.recv().await.unwrap(),
+            InflightEvent::Error(failure) if failure.message.contains("idle")
+        ));
+        assert!(matches!(
+            follower.recv().await.unwrap(),
+            InflightEvent::Done
+        ));
+        assert_eq!(
+            state
+                .metrics
+                .errors_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn non_stream_eof_with_unfinished_tool_use_returns_504() {
+        let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+        let request = RequestMetricsContext {
+            provider_id: "test".to_string(),
+            model: "model".to_string(),
+            initiator: "user",
+        };
+        let (broadcast_tx, mut follower) = broadcast::channel::<InflightEvent>(16);
+        let (event_tx, event_rx) =
+            tokio::sync::mpsc::channel::<Result<ProviderEvent, ProviderError>>(1);
+        event_tx
+            .send(Ok(SseEvent {
+                event: "content_block_start".to_string(),
+                data: json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "Read",
+                        "input": {}
+                    }
+                }),
+            }
+            .into()))
+            .await
+            .unwrap();
+        drop(event_tx);
+        let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let response = collect_leader_response(
+            &state,
+            &request,
+            tokio_stream::wrappers::ReceiverStream::new(event_rx).boxed(),
+            LeaderResponseContext {
+                request_hash: 0x2222,
+                broadcast_tx,
+                permits: StreamPermits {
+                    _request: request_permit,
+                    _provider: None,
+                },
+                start: std::time::Instant::now(),
+                observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
+                observability: None,
+                stream_config: test_stream_config(),
+                protocol: DownstreamProtocol::anthropic(),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(matches!(
+            follower.recv().await.unwrap(),
+            InflightEvent::Event(_)
+        ));
+        assert!(matches!(
+            follower.recv().await.unwrap(),
+            InflightEvent::Error(failure) if failure.message.contains("ended before tool_use")
+        ));
+        assert!(matches!(
+            follower.recv().await.unwrap(),
+            InflightEvent::Done
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_stream_response_budget_rejects_single_oversize_event() {
+        let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+        let request = RequestMetricsContext {
+            provider_id: "test".to_string(),
+            model: "model".to_string(),
+            initiator: "user",
+        };
+        let event = ProviderEvent::from(SseEvent {
+            event: "content_block_delta".to_string(),
+            data: json!({
+                "type": "content_block_delta",
+                "delta": {"text": "oversize"}
+            }),
+        });
+        let (broadcast_tx, mut follower) = broadcast::channel::<InflightEvent>(16);
+        let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let stream_config = StreamResponseConfig {
+            max_non_stream_response_bytes: 1,
+            ..test_stream_config()
+        };
+
+        let response = collect_leader_response(
+            &state,
+            &request,
+            futures::stream::iter([Ok(event)]).boxed(),
+            LeaderResponseContext {
+                request_hash: 0x2233,
+                broadcast_tx,
+                permits: StreamPermits {
+                    _request: request_permit,
+                    _provider: None,
+                },
+                start: std::time::Instant::now(),
+                observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
+                observability: None,
+                stream_config,
+                protocol: DownstreamProtocol::anthropic(),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(matches!(
+            follower.recv().await.unwrap(),
+            InflightEvent::Error(InflightFailure {
+                error: ProviderError::ResponseTooLarge(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            follower.recv().await.unwrap(),
+            InflightEvent::Done
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_stream_response_budget_counts_cumulative_events() {
+        let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+        let request = RequestMetricsContext {
+            provider_id: "test".to_string(),
+            model: "model".to_string(),
+            initiator: "user",
+        };
+        let event = ProviderEvent::from(SseEvent {
+            event: "content_block_delta".to_string(),
+            data: json!({
+                "type": "content_block_delta",
+                "delta": {"text": "small"}
+            }),
+        });
+        let event_size = event.retained_size_bytes().unwrap();
+        let (broadcast_tx, mut follower) = broadcast::channel::<InflightEvent>(16);
+        let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let stream_config = StreamResponseConfig {
+            max_non_stream_response_bytes: event_size,
+            ..test_stream_config()
+        };
+
+        let response = collect_leader_response(
+            &state,
+            &request,
+            futures::stream::iter([Ok(event.clone()), Ok(event)]).boxed(),
+            LeaderResponseContext {
+                request_hash: 0x2244,
+                broadcast_tx,
+                permits: StreamPermits {
+                    _request: request_permit,
+                    _provider: None,
+                },
+                start: std::time::Instant::now(),
+                observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
+                observability: None,
+                stream_config,
+                protocol: DownstreamProtocol::anthropic(),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(matches!(
+            follower.recv().await.unwrap(),
+            InflightEvent::Event(_)
+        ));
+        assert!(matches!(
+            follower.recv().await.unwrap(),
+            InflightEvent::Error(InflightFailure {
+                error: ProviderError::ResponseTooLarge(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            follower.recv().await.unwrap(),
+            InflightEvent::Done
+        ));
+    }
+
+    #[tokio::test]
+    async fn non_stream_tool_terminal_watchdog_returns_504() {
+        let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+        let request = RequestMetricsContext {
+            provider_id: "test".to_string(),
+            model: "model".to_string(),
+            initiator: "user",
+        };
+        let (broadcast_tx, _follower) = broadcast::channel::<InflightEvent>(16);
+        let (event_tx, event_rx) =
+            tokio::sync::mpsc::channel::<Result<ProviderEvent, ProviderError>>(1);
+        event_tx
+            .send(Ok(SseEvent {
+                event: "content_block_start".to_string(),
+                data: json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "Read",
+                        "input": {}
+                    }
+                }),
+            }
+            .into()))
+            .await
+            .unwrap();
+        let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let stream_config = StreamResponseConfig {
+            idle_timeout: Duration::from_secs(1),
+            overall_timeout: Duration::from_secs(1),
+            tool_use_terminal_timeout: Duration::from_millis(20),
+            ..test_stream_config()
+        };
+
+        let response = collect_leader_response(
+            &state,
+            &request,
+            tokio_stream::wrappers::ReceiverStream::new(event_rx).boxed(),
+            LeaderResponseContext {
+                request_hash: 0x3333,
+                broadcast_tx,
+                permits: StreamPermits {
+                    _request: request_permit,
+                    _provider: None,
+                },
+                start: std::time::Instant::now(),
+                observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
+                observability: None,
+                stream_config,
+                protocol: DownstreamProtocol::anthropic(),
+            },
+        )
+        .await;
+        drop(event_tx);
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn non_stream_overall_watchdog_fires_while_events_continue() {
+        let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+        let request = RequestMetricsContext {
+            provider_id: "test".to_string(),
+            model: "model".to_string(),
+            initiator: "user",
+        };
+        let (broadcast_tx, _follower) = broadcast::channel::<InflightEvent>(32);
+        let stream = tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(
+            Duration::from_millis(5),
+        ))
+        .map(|_| {
+            Ok(SseEvent {
+                event: String::new(),
+                data: json!({
+                    "type": "content_block_delta",
+                    "delta": {"text": "still running"}
+                }),
+            }
+            .into())
+        })
+        .boxed();
+        let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        let stream_config = StreamResponseConfig {
+            idle_timeout: Duration::from_millis(20),
+            overall_timeout: Duration::from_millis(50),
+            tool_use_terminal_timeout: Duration::from_secs(1),
+            ..test_stream_config()
+        };
+
+        let response = collect_leader_response(
+            &state,
+            &request,
+            stream,
+            LeaderResponseContext {
+                request_hash: 0x4444,
+                broadcast_tx,
+                permits: StreamPermits {
+                    _request: request_permit,
+                    _provider: None,
+                },
+                start: std::time::Instant::now(),
+                observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
+                observability: None,
+                stream_config,
+                protocol: DownstreamProtocol::anthropic(),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn concurrency_queue_full_response_is_not_retryable_for_all_protocols() {
+        let protocols = [
+            DownstreamProtocol::anthropic(),
+            DownstreamProtocol::chat_completions("model", false),
+            DownstreamProtocol::responses("model", serde_json::Map::new()),
+        ];
+
+        for protocol in protocols {
+            let response = concurrency_queue_full_response(
+                &protocol,
+                "too many requests waiting for local concurrency",
+            );
+
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert!(response.headers().get("retry-after").is_none());
+            assert_eq!(
+                response.headers().get("x-should-retry").unwrap(),
+                HeaderValue::from_static("false")
+            );
+
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "rate_limit_error");
+            assert_eq!(
+                body["error"]["message"],
+                "too many requests waiting for local concurrency"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrency_limiter_queues_until_capacity_is_available() {
+        let limiter = ConcurrencyLimiter::new(1, 1);
+        let active = limiter.acquire().await.unwrap();
+        let waiting = limiter.acquire();
+        tokio::pin!(waiting);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert_eq!(limiter.available_queue_slots(), 0);
+        assert_eq!(
+            limiter.acquire().await.unwrap_err(),
+            ConcurrencyAcquireError::QueueFull
+        );
+
+        drop(active);
+        let admitted = tokio::time::timeout(Duration::from_secs(1), &mut waiting)
+            .await
+            .expect("queued request should be admitted")
+            .unwrap();
+        assert_eq!(limiter.available_queue_slots(), 1);
+        drop(admitted);
+        assert_eq!(limiter.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_queued_acquire_releases_queue_slot() {
+        let limiter = ConcurrencyLimiter::new(1, 1);
+        let active = limiter.acquire().await.unwrap();
+        let mut waiting = Box::pin(limiter.acquire());
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert_eq!(limiter.available_queue_slots(), 0);
+        drop(waiting);
+        assert_eq!(limiter.available_queue_slots(), 1);
+        drop(active);
+    }
+
+    #[test]
+    fn sse_body_response_disables_intermediary_buffering() {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let response = sse_body_response(rx);
+        let headers = response.headers();
+
+        assert_eq!(headers["content-type"], "text/event-stream");
+        assert_eq!(headers["cache-control"], "no-cache, no-transform");
+        assert_eq!(headers["connection"], "keep-alive");
+        assert_eq!(headers["x-accel-buffering"], "no");
+    }
+
+    #[test]
+    fn stream_api_error_event_uses_anthropic_error_shape() {
+        let event = stream_api_error_event("upstream stream was malformed");
+
+        assert_eq!(event.event, "error");
+        assert_eq!(event.data["type"], "error");
+        assert_eq!(event.data["error"]["type"], "api_error");
+        assert_eq!(
+            event.data["error"]["message"],
+            "upstream stream was malformed"
+        );
+    }
+
+    fn model_capability_fixture(model_id: &str) -> ModelInfo {
+        ModelInfo {
+            model_id: model_id.to_string(),
+            vendor: Some("openai".to_string()),
+            is_chat_default: None,
+            capabilities: ModelCapabilities {
+                endpoints: EndpointCapabilities {
+                    anthropic_messages: CapabilityState::Unsupported,
+                    openai_chat_completions: CapabilityState::Unsupported,
+                    openai_responses: CapabilityState::Supported,
+                },
+                features: FeatureCapabilities {
+                    thinking: CapabilityState::Supported,
+                    reasoning_effort: CapabilityState::Supported,
+                    ..Default::default()
+                },
+                limits: ModelLimits {
+                    max_output_tokens: Some(128_000),
+                    context_window: Some(400_000),
+                    reasoning_effort_levels: vec!["low".to_string(), "high".to_string()],
+                    ..Default::default()
+                },
+                quality: QualityGateCapabilities {
+                    prompt_cache: PromptCacheCapability::basic(),
+                    token_counting: TokenCountingCapability::rough(),
+                    ..Default::default()
+                },
+                responses: Some(ResponsesCapabilities {
+                    unsupported_parameters: vec!["max_output_tokens".to_string()],
+                    ..ResponsesCapabilities::streaming_stateless(CapabilityState::Supported)
+                }),
+                supported_parameters: vec!["messages".to_string(), "thinking".to_string()],
+                ..Default::default()
+            },
+        }
+    }
+
+    fn request_with_system(system: Option<SystemPrompt>) -> MessagesRequest {
+        MessagesRequest {
+            model: "test/model".to_string(),
+            system,
+            messages: vec![],
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            metadata: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn alias_reasoning_effort_injects_fixed_request_value() {
+        let mut request = request_with_system(None);
+
+        apply_alias_reasoning_effort(&mut request, Some(ModelReasoningEffort::High));
+
+        assert_eq!(
+            request
+                .extra
+                .get("reasoning_effort")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn alias_reasoning_effort_accepts_max_request_value() {
+        let mut request = request_with_system(None);
+
+        apply_alias_reasoning_effort(&mut request, Some(ModelReasoningEffort::Max));
+
+        assert_eq!(
+            request
+                .extra
+                .get("reasoning_effort")
+                .and_then(Value::as_str),
+            Some("max")
+        );
+    }
+
+    #[test]
+    fn alias_reasoning_effort_default_preserves_intent_behavior() {
+        let mut request = request_with_system(None);
+
+        apply_alias_reasoning_effort(&mut request, Some(ModelReasoningEffort::Auto));
+
+        assert!(!request.extra.contains_key("reasoning_effort"));
+    }
+
+    #[test]
+    fn alias_reasoning_effort_overrides_request_reasoning_fields() {
+        let mut request = request_with_system(None);
+        request.thinking = Some(ThinkingConfig {
+            r#type: Some("adaptive".to_string()),
+            budget_tokens: None,
+        });
+        request
+            .extra
+            .insert("reasoning".to_string(), json!({"effort": "low"}));
+        request
+            .extra
+            .insert("reasoning_effort".to_string(), json!("medium"));
+
+        apply_alias_reasoning_effort(&mut request, Some(ModelReasoningEffort::High));
+
+        assert_eq!(
+            request
+                .extra
+                .get("reasoning_effort")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+        assert!(!request.extra.contains_key("reasoning"));
+        assert!(request.thinking.is_none());
+    }
+
+    #[test]
+    fn native_responses_alias_effort_preserves_other_reasoning_controls() {
+        let mut body = json!({
+            "reasoning": {
+                "effort": "low",
+                "summary": "auto",
+                "context": "all_turns"
+            }
+        });
+
+        apply_responses_alias_reasoning_effort(
+            body.as_object_mut().unwrap(),
+            Some(ModelReasoningEffort::High),
+        );
+
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["summary"], "auto");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+    }
+
+    #[test]
+    fn native_responses_headers_keep_protocol_metadata_and_drop_credentials() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer downstream".parse().unwrap());
+        headers.insert("x-api-key", "downstream".parse().unwrap());
+        headers.insert("cookie", "secret=true".parse().unwrap());
+        headers.insert("x-client-request-id", "client-owned".parse().unwrap());
+        headers.insert("x-codex-turn-state", "state-1".parse().unwrap());
+        headers.insert("x-codex-beta-features", "feature-1".parse().unwrap());
+
+        let forwarded = native_responses_request_headers(&headers);
+
+        assert_eq!(forwarded["x-codex-turn-state"], "state-1");
+        assert_eq!(forwarded["x-codex-beta-features"], "feature-1");
+        for name in [
+            "authorization",
+            "x-api-key",
+            "cookie",
+            "x-client-request-id",
+        ] {
+            assert!(forwarded.get(name).is_none(), "unexpected header: {name}");
+        }
+    }
+
+    #[test]
+    fn reasoning_marker_mode_is_internal_to_openai_compatible_providers() {
+        let mut request = request_with_system(None);
+
+        apply_reasoning_marker_mode(
+            &mut request,
+            &ProviderType::OpenAI,
+            ReasoningMarkerMode::LegacyTags,
+        );
+
+        assert_eq!(
+            request
+                .extra
+                .get(REASONING_MARKER_MODE_EXTRA_KEY)
+                .and_then(Value::as_str),
+            Some("legacy_tags")
+        );
+
+        let mut anthropic_request = request_with_system(None);
+        apply_reasoning_marker_mode(
+            &mut anthropic_request,
+            &ProviderType::Anthropic,
+            ReasoningMarkerMode::LegacyTags,
+        );
+        assert!(
+            !anthropic_request
+                .extra
+                .contains_key(REASONING_MARKER_MODE_EXTRA_KEY)
+        );
+    }
+
+    #[test]
+    fn request_intent_reads_metadata_intent() {
+        let mut request = request_with_system(None);
+        request.metadata = Some(json!({"intent": "deep_think"}));
+
+        assert_eq!(request_intent(&request), Some("deep_think"));
+    }
+
+    #[test]
+    fn client_session_metadata_uses_safe_headers_when_missing() {
+        let request = request_with_system(None);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-session-id",
+            HeaderValue::from_static("session-123"),
+        );
+
+        let request = attach_client_session_metadata(request, &headers);
+
+        assert_eq!(
+            request
+                .extra
+                .get("client_session_id")
+                .and_then(Value::as_str),
+            Some("session-123")
+        );
+    }
+
+    #[test]
+    fn client_session_metadata_preserves_explicit_request_value() {
+        let mut request = request_with_system(None);
+        request
+            .extra
+            .insert("client_session_id".to_string(), json!("explicit-session"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-session-id",
+            HeaderValue::from_static("header-session"),
+        );
+
+        let request = attach_client_session_metadata(request, &headers);
+
+        assert_eq!(
+            request
+                .extra
+                .get("client_session_id")
+                .and_then(Value::as_str),
+            Some("explicit-session")
+        );
+    }
+
+    #[test]
+    fn client_session_metadata_attaches_session_alongside_thread_scope() {
+        let mut request = request_with_system(None);
+        request
+            .extra
+            .insert("thread_id".to_string(), json!("thread-123"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-claude-thread-id",
+            HeaderValue::from_static("header-thread"),
+        );
+        headers.insert(
+            "x-claude-session-id",
+            HeaderValue::from_static("session-456"),
+        );
+
+        let request = attach_client_session_metadata(request, &headers);
+
+        assert_eq!(
+            request
+                .extra
+                .get("client_session_id")
+                .and_then(Value::as_str),
+            Some("session-456")
+        );
+        assert_eq!(
+            request.extra.get("thread_id").and_then(Value::as_str),
+            Some("thread-123")
+        );
+    }
+
+    #[test]
+    fn claude_context_beta_header_marks_virtual_one_million_request() {
+        let request = request_with_system(None);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("other-beta, context-1m-2025-08-07"),
+        );
+
+        let request = attach_virtual_context_metadata(request, &headers);
+
+        assert_eq!(
+            request.extra.get(VIRTUAL_CONTEXT_1M_EXTRA_KEY),
+            Some(&Value::Bool(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_context_marker_is_scoped_to_chatgpt_provider() {
+        let mut request = request_with_system(None);
+        request
+            .extra
+            .insert(VIRTUAL_CONTEXT_1M_EXTRA_KEY.to_string(), Value::Bool(true));
+
+        let chatgpt = resolve_upstream_request(
+            &AppState::new(settings_with_provider(ProviderType::ChatGPT), None),
+            &request,
+        )
+        .await;
+        assert_eq!(
+            chatgpt.request.extra.get(VIRTUAL_CONTEXT_1M_EXTRA_KEY),
+            Some(&Value::Bool(true))
+        );
+
+        let openai = resolve_upstream_request(
+            &AppState::new(settings_with_provider(ProviderType::OpenAI), None),
+            &request,
+        )
+        .await;
+        assert!(
+            !openai
+                .request
+                .extra
+                .contains_key(VIRTUAL_CONTEXT_1M_EXTRA_KEY)
+        );
+    }
+
+    #[test]
+    fn chatgpt_subagent_marker_resolves_agent_initiator() {
+        let settings = settings_with_provider(ProviderType::ChatGPT);
+        let request = request_with_system(Some(SystemPrompt::Text(
+            "prefix __SUBAGENT_MARKER__ suffix".to_string(),
+        )));
+
+        assert_eq!(
+            resolve_request_initiator(&settings, "test", &request),
+            "agent"
+        );
+    }
+
+    #[test]
+    fn openai_subagent_marker_stays_user_initiator() {
+        let settings = settings_with_provider(ProviderType::OpenAI);
+        let request = request_with_system(Some(SystemPrompt::Text(
+            "prefix __SUBAGENT_MARKER__ suffix".to_string(),
+        )));
+
+        assert_eq!(
+            resolve_request_initiator(&settings, "test", &request),
+            "user"
+        );
+    }
+
+    #[test]
+    fn extracts_anthropic_upstream_error_message() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad thinking block"}}"#;
+
+        assert_eq!(extract_upstream_error_message(body), "bad thinking block");
+    }
+
+    #[test]
+    fn upstream_400_maps_to_invalid_request_response() {
+        let response = upstream_error_to_response(
+            400,
+            r#"{"error":{"type":"invalid_request_error","message":"bad request"}}"#,
+        );
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn concurrent_inflight_registration_produces_single_leader() {
+        let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+        let request_hash = 0xfeed_f00d;
+        let tasks = (0..32)
+            .map(|_| {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    matches!(
+                        register_or_subscribe_inflight_request(&state, request_hash).await,
+                        InflightRegistration::Leader(_)
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let results = futures::future::join_all(tasks).await;
+        let leader_count = results
+            .into_iter()
+            .filter(|result| *result.as_ref().unwrap())
+            .count();
+
+        assert_eq!(leader_count, 1);
+        assert_eq!(state.inflight.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn responses_disconnect_releases_idle_stream_after_last_consumer() {
+        for with_follower in [false, true] {
+            let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+            let request = RequestMetricsContext {
+                provider_id: "test".to_string(),
+                model: "model".to_string(),
+                initiator: "user",
+            };
+            let (broadcast_tx, follower) = broadcast::channel::<InflightEvent>(16);
+            let mut follower = with_follower.then_some(follower);
+            let (event_tx, event_rx) = tokio::sync::mpsc::channel(2);
+            let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+            let response = stream_leader_response(
+                &state,
+                &request,
+                tokio_stream::wrappers::ReceiverStream::new(event_rx).boxed(),
+                LeaderResponseContext {
+                    request_hash: 0xdead_beef,
+                    broadcast_tx,
+                    permits: StreamPermits {
+                        _request: limiter.clone().acquire_owned().await.unwrap(),
+                        _provider: None,
+                    },
+                    start: std::time::Instant::now(),
+                    observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
+                    observability: None,
+                    stream_config: test_stream_config(),
+                    protocol: DownstreamProtocol::responses("model", Default::default()),
+                },
+            )
+            .await;
+            drop(response);
+            if let Some(follower) = follower.as_mut() {
+                event_tx
+                    .send(Ok(SseEvent {
+                        event: "content_block_delta".to_string(),
+                        data: json!({"type":"content_block_delta", "delta":{"text":"still here"}}),
+                    }
+                    .into()))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(2), follower.recv())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    InflightEvent::Event(_)
+                ));
+            }
+            drop(follower);
+            tokio::time::timeout(Duration::from_secs(2), event_tx.closed())
+                .await
+                .expect("last consumer disconnect must drop the idle provider stream");
+            let _permit = tokio::time::timeout(Duration::from_secs(2), limiter.acquire())
+                .await
+                .expect("request permit must be released")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_follower_disconnect_unsubscribes_without_heartbeat() {
+        let (broadcast_tx, receiver) = broadcast::channel::<InflightEvent>(16);
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let response = join_inflight_stream(
+            receiver,
+            StreamPermits {
+                _request: limiter.clone().acquire_owned().await.unwrap(),
+                _provider: None,
+            },
+            test_stream_config(),
+            DownstreamProtocol::responses("model", Default::default()),
+        );
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(2), broadcast_tx.closed())
+            .await
+            .expect("idle follower must unsubscribe when its response is dropped");
+        assert_eq!(limiter.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_leader_continues_for_followers_after_leader_disconnect() {
+        let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+        let request = RequestMetricsContext {
+            provider_id: "test".to_string(),
+            model: "model".to_string(),
+            initiator: "user",
+        };
+        let (broadcast_tx, mut follower) = broadcast::channel::<InflightEvent>(16);
+        let (event_tx, event_rx) =
+            tokio::sync::mpsc::channel::<Result<ProviderEvent, ProviderError>>(2);
+        let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let response = stream_leader_response(
+            &state,
+            &request,
+            tokio_stream::wrappers::ReceiverStream::new(event_rx).boxed(),
+            LeaderResponseContext {
+                request_hash: 0xdead_beef,
+                broadcast_tx,
+                permits: StreamPermits {
+                    _request: request_permit,
+                    _provider: None,
+                },
+                start: std::time::Instant::now(),
+                observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
+                observability: None,
+                stream_config: test_stream_config(),
+                protocol: DownstreamProtocol::anthropic(),
+            },
+        )
+        .await;
+        drop(response);
+
+        for text in ["first", "second"] {
+            event_tx
+                .send(Ok(SseEvent {
+                    event: String::new(),
+                    data: json!({
+                        "type": "content_block_delta",
+                        "delta": {"text": text}
+                    }),
+                }
+                .into()))
+                .await
+                .unwrap();
+        }
+        drop(event_tx);
+
+        let mut received = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), follower.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event {
+                InflightEvent::Event(event) => {
+                    received.push(
+                        event.normalized_events()[0].data["delta"]["text"]
+                            .as_str()
+                            .unwrap()
+                            .to_string(),
+                    );
+                }
+                InflightEvent::Done => break,
+                InflightEvent::Error(failure) => {
+                    panic!("unexpected error event: {}", failure.message)
+                }
+            }
+        }
+
+        assert_eq!(received, ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn stream_leader_continues_for_follower_after_downstream_backpressure() {
+        let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+        let request = RequestMetricsContext {
+            provider_id: "test".to_string(),
+            model: "model".to_string(),
+            initiator: "user",
+        };
+        let (broadcast_tx, mut follower) = broadcast::channel::<InflightEvent>(128);
+        let (event_tx, event_rx) =
+            tokio::sync::mpsc::channel::<Result<ProviderEvent, ProviderError>>(128);
+        let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let response = stream_leader_response(
+            &state,
+            &request,
+            tokio_stream::wrappers::ReceiverStream::new(event_rx).boxed(),
+            LeaderResponseContext {
+                request_hash: 0xfeed_beef,
+                broadcast_tx,
+                permits: StreamPermits {
+                    _request: request_permit,
+                    _provider: None,
+                },
+                start: std::time::Instant::now(),
+                observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
+                observability: None,
+                stream_config: test_stream_config(),
+                protocol: DownstreamProtocol::anthropic(),
+            },
+        )
+        .await;
+
+        for index in 0..70 {
+            event_tx
+                .send(Ok(SseEvent {
+                    event: String::new(),
+                    data: json!({
+                        "type": "content_block_delta",
+                        "delta": {"text": index.to_string()}
+                    }),
+                }
+                .into()))
+                .await
+                .unwrap();
+        }
+        drop(event_tx);
+
+        let mut received = 0;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1), follower.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                InflightEvent::Event(_) => received += 1,
+                InflightEvent::Done => break,
+                InflightEvent::Error(failure) => {
+                    panic!("unexpected error event: {}", failure.message)
+                }
+            }
+        }
+
+        assert_eq!(received, 70);
+        drop(response);
+    }
+
+    #[tokio::test]
+    async fn slow_inflight_follower_releases_request_permit() {
+        let (broadcast_tx, receiver) = broadcast::channel::<InflightEvent>(128);
+        let limiter = Arc::new(tokio::sync::Semaphore::new(1));
+        let request_permit = limiter.clone().acquire_owned().await.unwrap();
+        let response = join_inflight_stream(
+            receiver,
+            StreamPermits {
+                _request: request_permit,
+                _provider: None,
+            },
+            test_stream_config(),
+            DownstreamProtocol::anthropic(),
+        );
+
+        let mut follower_closed = false;
+        for index in 0..70 {
+            if broadcast_tx
+                .send(InflightEvent::Event(
+                    SseEvent {
+                        event: String::new(),
+                        data: json!({
+                            "type": "content_block_delta",
+                            "delta": {"text": index.to_string()}
+                        }),
+                    }
+                    .into(),
+                ))
+                .is_err()
+            {
+                follower_closed = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while broadcast_tx.receiver_count() != 0 || limiter.available_permits() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("slow follower should exit and release its request permit");
+        assert!(follower_closed || broadcast_tx.receiver_count() == 0);
+        drop(response);
+    }
+
+    #[tokio::test]
+    async fn stream_leader_times_out_unfinished_tool_use() {
+        let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+        let request = RequestMetricsContext {
+            provider_id: "test".to_string(),
+            model: "model".to_string(),
+            initiator: "user",
+        };
+        let (broadcast_tx, _follower) = broadcast::channel::<InflightEvent>(16);
+        let (event_tx, event_rx) =
+            tokio::sync::mpsc::channel::<Result<ProviderEvent, ProviderError>>(2);
+        let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let response = stream_leader_response(
+            &state,
+            &request,
+            tokio_stream::wrappers::ReceiverStream::new(event_rx).boxed(),
+            LeaderResponseContext {
+                request_hash: 0xbeef_dead,
+                broadcast_tx,
+                permits: StreamPermits {
+                    _request: request_permit,
+                    _provider: None,
+                },
+                start: std::time::Instant::now(),
+                observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
+                observability: None,
+                stream_config: test_stream_config(),
+                protocol: DownstreamProtocol::anthropic(),
+            },
+        )
+        .await;
+
+        event_tx
+            .send(Ok(SseEvent {
+                event: "content_block_start".to_string(),
+                data: json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "Read",
+                        "input": {}
+                    }
+                }),
+            }
+            .into()))
+            .await
+            .unwrap();
+
+        let body = tokio::time::timeout(
+            Duration::from_secs(1),
+            to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("tool_use watchdog should finish the response")
+        .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+
+        assert!(body.contains("content_block_start"));
+        assert!(body.contains("event: error"));
+        assert!(body.contains("tool_use stream did not reach message_stop"));
+        assert_eq!(
+            state
+                .metrics
+                .errors_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn inflight_stream_follower_reports_lagged_broadcast() {
+        let (broadcast_tx, receiver) = broadcast::channel::<InflightEvent>(1);
+        let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        for text in ["first", "second"] {
+            broadcast_tx
+                .send(InflightEvent::Event(
+                    SseEvent {
+                        event: String::new(),
+                        data: json!({
+                            "type": "content_block_delta",
+                            "delta": {"text": text}
+                        }),
+                    }
+                    .into(),
+                ))
+                .unwrap();
+        }
+
+        let response = join_inflight_stream(
+            receiver,
+            StreamPermits {
+                _request: request_permit,
+                _provider: None,
+            },
+            test_stream_config(),
+            DownstreamProtocol::anthropic(),
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+
+        assert!(body.contains("event: error"));
+        assert!(body.contains("missed 1 event"));
+    }
+
+    #[tokio::test]
+    async fn inflight_non_stream_follower_reports_lagged_broadcast() {
+        let (broadcast_tx, receiver) = broadcast::channel::<InflightEvent>(1);
+        let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        for text in ["first", "second"] {
+            broadcast_tx
+                .send(InflightEvent::Event(
+                    SseEvent {
+                        event: String::new(),
+                        data: json!({
+                            "type": "content_block_delta",
+                            "delta": {"text": text}
+                        }),
+                    }
+                    .into(),
+                ))
+                .unwrap();
+        }
+
+        let response =
+            join_inflight_non_stream(receiver, request_permit, &DownstreamProtocol::anthropic())
+                .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("missed 1 event")
+        );
+    }
+
+    #[tokio::test]
+    async fn inflight_non_stream_follower_preserves_response_too_large_mapping() {
+        let protocols = [
+            DownstreamProtocol::anthropic(),
+            DownstreamProtocol::chat_completions("client-model", false),
+            DownstreamProtocol::responses("client-model", Default::default()),
+        ];
+
+        for protocol in protocols {
+            let (broadcast_tx, receiver) = broadcast::channel::<InflightEvent>(4);
+            let request_permit = Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .unwrap();
+            broadcast_tx
+                .send(inflight_failure(
+                    ProviderError::ResponseTooLarge("response budget exceeded".to_string()),
+                    "upstream response too large: response budget exceeded".to_string(),
+                ))
+                .unwrap();
+            broadcast_tx.send(InflightEvent::Done).unwrap();
+
+            let response = join_inflight_non_stream(receiver, request_permit, &protocol).await;
+
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("response budget exceeded")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn flex_capacity_errors_are_terminal_for_all_downstream_protocols() {
+        let error = ProviderError::FlexUnavailable("no Flex capacity".to_string());
+        for response in [
+            provider_error_to_response(&error),
+            crate::downstream::provider_error_response(
+                &DownstreamProtocol::chat_completions("model", false),
+                &error,
+            ),
+            crate::downstream::provider_error_response(
+                &DownstreamProtocol::responses("model", serde_json::Map::new()),
+                &error,
+            ),
+        ] {
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(response.headers()["x-should-retry"], "false");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["message"], "no Flex capacity");
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_overloaded_maps_to_retryable_529_response() {
+        let response = provider_error_to_response(&ProviderError::Overloaded {
+            message: "upstream overloaded".to_string(),
+            retry_after: Some(3),
+        });
+
+        assert_eq!(response.status().as_u16(), 529);
+        assert_eq!(
+            response.headers().get("retry-after").unwrap(),
+            HeaderValue::from_static("3")
+        );
+        assert_eq!(
+            response.headers().get("x-should-retry").unwrap(),
+            HeaderValue::from_static("true")
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        assert_eq!(body["error"]["message"], "upstream overloaded");
+    }
+
+    #[test]
+    fn request_too_large_stream_error_uses_provider_error_reason() {
+        let error = ProviderError::RequestTooLarge("too long".to_string());
+
+        assert_eq!(
+            provider_stream_error_terminal_reason(&error),
+            "provider_error"
+        );
+        assert_eq!(provider_error_kind(&error), "request_too_large");
+    }
+
+    #[tokio::test]
+    async fn request_too_large_provider_error_maps_to_413() {
+        let response =
+            provider_error_to_response(&ProviderError::RequestTooLarge("too long".to_string()));
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["message"], "too long");
+    }
+
+    #[tokio::test]
+    async fn provider_error_response_exposes_safe_upstream_headers() {
+        let response = provider_error_to_response(
+            &ProviderError::RateLimited {
+                retry_after: Some(5),
+            }
+            .with_upstream_metadata(UpstreamErrorMetadata {
+                status: 429,
+                retry_after: Some(5),
+                request_id: Some("req_abc".to_string()),
+                message: Some("slow down".to_string()),
+                body_preview: None,
+                headers: Vec::new(),
+            }),
+        );
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get("retry-after").unwrap(),
+            HeaderValue::from_static("5")
+        );
+        assert_eq!(
+            response.headers().get("x-upstream-status").unwrap(),
+            HeaderValue::from_static("429")
+        );
+        assert_eq!(
+            response.headers().get("x-upstream-request-id").unwrap(),
+            HeaderValue::from_static("req_abc")
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["message"], "rate limited by upstream");
+    }
+
+    #[tokio::test]
+    async fn upstream_529_maps_to_overloaded_error_response() {
+        let response = upstream_error_to_response(
+            529,
+            r#"{"error":{"type":"overloaded_error","message":"too busy"}}"#,
+        );
+
+        assert_eq!(response.status().as_u16(), 529);
+        assert_eq!(
+            response.headers().get("x-should-retry").unwrap(),
+            HeaderValue::from_static("true")
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["type"], "overloaded_error");
+        assert_eq!(body["error"]["message"], "too busy");
+    }
+
+    #[tokio::test]
+    async fn retryable_upstream_errors_map_to_overloaded_response() {
+        for status in [408, 409, 500, 502, 503, 504] {
+            let response = upstream_error_to_response(
+                status,
+                r#"{"error":{"type":"upstream_error","message":"temporary upstream failure"}}"#,
+            );
+
+            assert_eq!(response.status().as_u16(), 529);
+            assert_eq!(
+                response.headers().get("x-should-retry").unwrap(),
+                HeaderValue::from_static("true")
+            );
+
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "overloaded_error");
+            assert_eq!(body["error"]["message"], "temporary upstream failure");
+        }
+    }
+
+    #[test]
+    fn request_payload_stats_counts_blocks_without_storing_content() {
+        let mut request = request_with_system(Some(SystemPrompt::Blocks(vec![Content::Text {
+            text: "system".to_string(),
+        }])));
+        request.messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![
+                Content::Text {
+                    text: "hello".to_string(),
+                },
+                Content::ToolResult {
+                    tool_use_id: "toolu_1".to_string(),
+                    content: Some(json!([{"type": "text", "text": "tool output"}])),
+                    is_error: None,
+                },
+            ]),
+        }];
+
+        let stats = request_payload_stats(&request);
+
+        assert_eq!(stats.messages, 1);
+        assert_eq!(stats.content_blocks, 3);
+        assert_eq!(stats.tool_results, 1);
+        assert_eq!(
+            stats.text_bytes,
+            "system".len() as u64 + "hello".len() as u64 + "tool output".len() as u64
+        );
+    }
+
+    #[test]
+    fn provider_request_observer_keeps_prompt_too_long_max_stats() {
+        let state = Arc::new(StdMutex::new(RequestObserverState::default()));
+        let observer = provider_request_observer(state.clone());
+
+        observer(ProviderRequestObserverEvent {
+            event: ProviderRequestObserverEventKind::PromptTooLongRetry,
+            prompt_too_long_retries: 1,
+            original_body_bytes: 300,
+            shrunk_body_bytes: 200,
+            dropped_items: 1,
+            ..ProviderRequestObserverEvent::default()
+        });
+        observer(ProviderRequestObserverEvent {
+            event: ProviderRequestObserverEventKind::PromptTooLongRetry,
+            prompt_too_long_retries: 2,
+            original_body_bytes: 280,
+            shrunk_body_bytes: 150,
+            dropped_items: 3,
+            ..ProviderRequestObserverEvent::default()
+        });
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.prompt_too_long_retries, 2);
+        assert_eq!(state.prompt_too_long_original_body_bytes, 300);
+        assert_eq!(state.prompt_too_long_shrunk_body_bytes, 200);
+        assert_eq!(state.prompt_too_long_dropped_items, 3);
+    }
+
+    #[test]
+    fn provider_request_observer_merges_request_metadata() {
+        let state = Arc::new(StdMutex::new(RequestObserverState::default()));
+        let observer = provider_request_observer(state.clone());
+
+        observer(ProviderRequestObserverEvent {
+            event: ProviderRequestObserverEventKind::RequestMetadata,
+            request_metadata: Some(ProviderRequestMetadata {
+                continuation_fallback_used: Some(true),
+                fallback_reason: Some("previous_response_not_found".to_string()),
+                context_upstream_overflow: Some(true),
+                ..ProviderRequestMetadata::default()
+            }),
+            ..ProviderRequestObserverEvent::default()
+        });
+        observer(ProviderRequestObserverEvent {
+            event: ProviderRequestObserverEventKind::RequestMetadata,
+            request_metadata: Some(ProviderRequestMetadata {
+                transport: Some("sse".to_string()),
+                request_body_bytes: Some(1_000),
+                upstream_send_body_bytes: Some(800),
+                prompt_cache_key_present: Some(true),
+                prompt_cache_key_source: Some("client".to_string()),
+                stable_client_conversation_id_present: Some(true),
+                synthetic_stable_client_conversation_id: Some(false),
+                virtual_context_1m: Some(true),
+                context_estimated_tokens: Some(340_000),
+                context_safe_input_limit: Some(339_000),
+                context_model_window: Some(372_000),
+                context_estimator_source: Some("full_rough".to_string()),
+                context_compact_kind: Some("none".to_string()),
+                context_compressible_history: Some(true),
+                context_local_blocked: Some(true),
+                ..ProviderRequestMetadata::default()
+            }),
+            ..ProviderRequestObserverEvent::default()
+        });
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.request_metadata.transport.as_deref(), Some("sse"));
+        assert_eq!(
+            state.request_metadata.continuation_fallback_used,
+            Some(true)
+        );
+        assert_eq!(
+            state.request_metadata.fallback_reason.as_deref(),
+            Some("previous_response_not_found")
+        );
+        assert_eq!(state.request_metadata.request_body_bytes, Some(1_000));
+        assert_eq!(state.request_metadata.upstream_send_body_bytes, Some(800));
+        assert_eq!(state.request_metadata.prompt_cache_key_present, Some(true));
+        assert_eq!(
+            state.request_metadata.prompt_cache_key_source.as_deref(),
+            Some("client")
+        );
+        assert_eq!(
+            state.request_metadata.stable_client_conversation_id_present,
+            Some(true)
+        );
+        assert_eq!(
+            state
+                .request_metadata
+                .synthetic_stable_client_conversation_id,
+            Some(false)
+        );
+        assert_eq!(state.request_metadata.virtual_context_1m, Some(true));
+        assert_eq!(
+            state.request_metadata.context_estimated_tokens,
+            Some(340_000)
+        );
+        assert_eq!(state.request_metadata.context_local_blocked, Some(true));
+        assert_eq!(state.request_metadata.context_upstream_overflow, Some(true));
+    }
+
+    #[test]
+    fn provider_request_observer_merges_stream_usage_metadata() {
+        let state = Arc::new(StdMutex::new(RequestObserverState::default()));
+        let observer = provider_request_observer(state.clone());
+
+        observer(ProviderRequestObserverEvent {
+            event: ProviderRequestObserverEventKind::StreamMetadata,
+            stream_metadata: Some(aisub2api_providers::provider::ProviderStreamMetadata {
+                usage: Some(ProviderUsageMetadata {
+                    input_tokens: 42,
+                    output_tokens: 9,
+                    reasoning_output_tokens: 4,
+                    cache_creation_input_tokens: 3,
+                    cache_read_input_tokens: 5,
+                }),
+                model: Some("gpt-4".to_string()),
+                request_id: Some("chatcmpl-1".to_string()),
+                stop_reason: Some("stop".to_string()),
+            }),
+            ..ProviderRequestObserverEvent::default()
+        });
+
+        let mut usage = TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            reasoning_output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+        merge_observer_usage(&state, &mut usage);
+
+        assert_eq!(usage.input_tokens, 42);
+        assert_eq!(usage.output_tokens, 9);
+        assert_eq!(usage.reasoning_output_tokens, 4);
+        assert_eq!(usage.cache_creation_input_tokens, 3);
+        assert_eq!(usage.cache_read_input_tokens, 5);
+    }
+
+    #[test]
+    fn usage_extraction_keeps_final_token_snapshot() {
+        let mut usage = TokenUsage::default();
+        extract_usage_from_event(
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "usage": {
+                        "input_tokens": 12,
+                        "output_tokens": 0
+                    }
+                }
+            }),
+            &mut usage,
+        );
+        extract_usage_from_event(
+            &json!({
+                "type": "message_delta",
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 7,
+                    "reasoning_output_tokens": 3
+                }
+            }),
+            &mut usage,
+        );
+        extract_usage_from_event(
+            &json!({
+                "type": "message_delta",
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 7
+                }
+            }),
+            &mut usage,
+        );
+
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 7);
+        assert_eq!(usage.reasoning_output_tokens, 3);
+    }
+
+    #[test]
+    fn usage_extraction_keeps_cache_token_snapshot() {
+        let mut usage = TokenUsage::default();
+        extract_usage_from_event(
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "usage": {
+                        "input_tokens": 30,
+                        "cache_creation_input_tokens": 5,
+                        "cache_read_input_tokens": 10
+                    }
+                }
+            }),
+            &mut usage,
+        );
+        extract_usage_from_event(
+            &json!({
+                "type": "message_delta",
+                "usage": {
+                    "input_tokens": 30,
+                    "output_tokens": 4,
+                    "cache_creation_input_tokens": 5,
+                    "cache_read_input_tokens": 10
+                }
+            }),
+            &mut usage,
+        );
+
+        assert_eq!(usage.input_tokens, 30);
+        assert_eq!(usage.output_tokens, 4);
+        assert_eq!(usage.cache_creation_input_tokens, 5);
+        assert_eq!(usage.cache_read_input_tokens, 10);
+    }
+
+    #[test]
+    fn request_features_detects_used_capabilities() {
+        let mut request = request_with_system(Some(SystemPrompt::Text("system".to_string())));
+        request.stream = true;
+        request.temperature = Some(0.2);
+        request.stop_sequences = Some(vec!["stop".to_string()]);
+        request.thinking = Some(ThinkingConfig {
+            r#type: Some("enabled".to_string()),
+            budget_tokens: Some(1024),
+        });
+        request.tools = Some(vec![Tool {
+            name: "read".to_string(),
+            description: None,
+            input_schema: json!({"type": "object"}),
+            extra: Default::default(),
+        }]);
+        request.tool_choice = Some(json!({"type": "auto"}));
+        request
+            .extra
+            .insert("reasoning_effort".to_string(), json!("high"));
+        request
+            .extra
+            .insert("prompt_cache_key".to_string(), json!("session-key"));
+        request
+            .extra
+            .insert("service_tier".to_string(), json!("priority"));
+        request.extra.insert(
+            "response_format".to_string(),
+            json!({"type": "json_object"}),
+        );
+        request
+            .extra
+            .insert("strict_tools".to_string(), json!(true));
+        request
+            .extra
+            .insert("token_efficient_tools".to_string(), json!(true));
+        request
+            .extra
+            .insert("context_management".to_string(), json!({"edits": []}));
+        request.messages = vec![Message {
+            role: Role::User,
+            content: MessageContent::Blocks(vec![Content::Unknown(json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "..."}
+            }))]),
+        }];
+
+        let features = RequestFeatures::from_request(&request);
+
+        assert!(features.streaming);
+        assert!(features.system_prompt);
+        assert!(features.tools);
+        assert!(features.tool_choice);
+        assert!(features.thinking);
+        assert!(features.reasoning_effort);
+        assert!(features.vision);
+        assert!(features.sampling);
+        assert!(features.stop_sequences);
+        assert!(features.prompt_cache_key);
+        assert!(features.fast_mode);
+        assert!(features.structured_outputs);
+        assert!(features.strict_tools);
+        assert!(features.token_efficient_tools);
+        assert!(features.context_management);
+    }
+
+    #[test]
+    fn capability_validation_rejects_explicitly_unsupported_features() {
+        let capabilities = ModelCapabilities {
+            features: FeatureCapabilities {
+                tools: CapabilityState::Unsupported,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let features = RequestFeatures {
+            tools: true,
+            ..Default::default()
+        };
+
+        let error = validate_request_capabilities("openai", "gpt-x", &capabilities, &features)
+            .expect_err("unsupported tools should fail");
+
+        assert_eq!(error.error.error_type, "invalid_request_error");
+        assert!(error.error.message.contains("does not support tools"));
+    }
+
+    #[test]
+    fn capability_validation_rejects_explicitly_unsupported_quality_gates() {
+        let capabilities = ModelCapabilities {
+            quality: QualityGateCapabilities {
+                strict_tools: CapabilityState::Unsupported,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let features = RequestFeatures {
+            strict_tools: true,
+            ..Default::default()
+        };
+
+        let error = validate_request_capabilities("openai", "gpt-x", &capabilities, &features)
+            .expect_err("unsupported strict tools should fail");
+
+        assert_eq!(error.error.error_type, "invalid_request_error");
+        assert!(
+            error
+                .error
+                .message
+                .contains("does not support strict tools")
+        );
+    }
+
+    #[test]
+    fn capability_validation_allows_unknown_features() {
+        let capabilities = ModelCapabilities::default();
+        let features = RequestFeatures {
+            tools: true,
+            thinking: true,
+            vision: true,
+            structured_outputs: true,
+            strict_tools: true,
+            ..Default::default()
+        };
+
+        validate_request_capabilities("custom", "model", &capabilities, &features).unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_refresh_models_requires_admin_auth() {
+        let mut settings = settings_with_provider(ProviderType::OpenAI);
+        settings.admin.auth_token = Some("admin-secret".to_string());
+        let state = AppState::new(settings, None);
+
+        let response = admin_refresh_models(State(state), HeaderMap::new()).await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_metrics_includes_model_capabilities() {
+        let settings = settings_with_provider(ProviderType::ChatGPT);
+        let state = AppState::new(settings, None);
+        state
+            .provider_registry
+            .write()
+            .await
+            .cache_models("test", vec![model_capability_fixture("gpt-5.5")]);
+        state
+            .record_provider_error("chatgpt", "token refresh failed")
+            .await;
+
+        let response = admin_metrics(State(state), HeaderMap::new()).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            body["model_capabilities"]["test/gpt-5.5"]["capabilities"]["limits"]["max_output_tokens"],
+            128_000
+        );
+        assert_eq!(
+            body["model_capabilities"]["test/gpt-5.5"]["capabilities"]["limits"]["context_window"],
+            400_000
+        );
+        assert_eq!(
+            body["model_capabilities"]["test/gpt-5.5"]["capabilities"]["endpoints"]["openai_responses"],
+            "supported"
+        );
+        assert_eq!(
+            body["model_capabilities"]["test/gpt-5.5"]["capabilities"]["quality"]["prompt_cache"]["scope"],
+            "basic"
+        );
+        assert_eq!(body["model_cache"][0]["provider"], "test");
+        assert_eq!(body["model_cache"][0]["cached"], true);
+        assert_eq!(body["model_cache"][0]["model_count"], 1);
+        assert_eq!(body["model_cache"][0]["fresh"], true);
+        assert!(body["model_cache"][0]["ttl_secs"].as_u64().unwrap() > 0);
+        assert!(body["model_cache"][0]["age_secs"].as_u64().is_some());
+        assert!(body["model_cache"][0]["expires_in_secs"].as_u64().is_some());
+        assert_eq!(body["provider_health"]["chatgpt"]["status"], "unhealthy");
+        assert_eq!(
+            body["provider_health"]["chatgpt"]["last_error"],
+            "token refresh failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_exposes_provider_scoped_responses_contract() {
+        let settings = settings_with_provider(ProviderType::ChatGPT);
+        let state = AppState::new(settings, None);
+        state
+            .provider_registry
+            .write()
+            .await
+            .cache_models("test", vec![model_capability_fixture("gpt-5.5")]);
+
+        let Json(body) = list_models(State(state)).await;
+        let model = &body["data"][0];
+
+        assert_eq!(model["id"], "gpt-5.5");
+        assert_eq!(model["provider"], "test");
+        assert_eq!(model["qualified_id"], "test/gpt-5.5");
+        assert_eq!(model["capabilities"]["responses"]["streaming"], "required");
+        assert_eq!(
+            model["capabilities"]["responses"]["stateful"],
+            "unsupported"
+        );
+        assert_eq!(
+            model["capabilities"]["responses"]["unsupported_parameters"][0],
+            "max_output_tokens"
+        );
+    }
+}

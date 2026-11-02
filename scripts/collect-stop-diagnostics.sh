@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -u
 
-PID_FILE="${PID_FILE:-$HOME/.config/claude-proxy/claude-proxy.pid}"
-CONFIG_LOG="${CONFIG_LOG:-$HOME/.config/claude-proxy/claude-proxy.log}"
-TRACING_LOG="${TRACING_LOG:-$HOME/.config/claude-proxy/logs/claude-proxy.log}"
-OUT_DIR="${OUT_DIR:-/tmp/claude-proxy-stop-diagnostics-$(date +%Y%m%d-%H%M%S)}"
-STOP_CMD="${STOP_CMD:-claude-proxy server stop}"
+PID_FILE="${PID_FILE:-$HOME/.config/aisub2api/aisub2api.pid}"
+CONFIG_LOG="${CONFIG_LOG:-$HOME/.config/aisub2api/aisub2api.log}"
+TRACING_LOG="${TRACING_LOG:-$HOME/.config/aisub2api/logs/aisub2api.log}"
+OUT_DIR="${OUT_DIR:-/tmp/aisub2api-stop-diagnostics-$(date +%Y%m%d-%H%M%S)}"
+STOP_CMD="${STOP_CMD:-aisub2api server stop}"
 STRACE_SECONDS="${STRACE_SECONDS:-8}"
 
 RUN_STOP=1
@@ -15,7 +15,7 @@ usage() {
     cat <<EOF
 Usage: $0 [--no-stop] [--strace]
 
-Collect claude-proxy stop diagnostics into a timestamped directory.
+Collect aisub2api stop diagnostics into a timestamped directory.
 
 Options:
   --no-stop   Collect snapshots without running: $STOP_CMD
@@ -23,8 +23,8 @@ Options:
 
 Environment:
   OUT_DIR=/path/to/output
-  PID_FILE=/path/to/claude-proxy.pid
-  STOP_CMD='claude-proxy server stop'
+  PID_FILE=/path/to/aisub2api.pid
+  STOP_CMD='aisub2api server stop'
 EOF
 }
 

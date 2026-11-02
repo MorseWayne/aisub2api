@@ -7,7 +7,7 @@
 - 本次 fetch 后同步到：`e790ce271749ce431e446a9e2cc66485fe60f931`，`Use a synchronous mutex for remote metadata request tracking (#54475)`。
 - 实际审查范围：`0d46c252b..e790ce271`，共 1,820 个提交。通过提交历史、文件差异及最终请求实现筛选网络协议相关变化，不逐个审查 UI、沙箱和本地执行实现。
 - 参考仓库执行 `git reset --hard <fetched_sha>`、`git clean -fd`；同步前没有本地改动或未跟踪文件，无本地工作被删除。同步后 HEAD 与 fetch 结果一致且工作区干净。上游在此范围内删除了根 `AGENTS.md`，没有重新添加本地版本。
-- claude-proxy：工作从 `c885f6d2063030ed6cbae033656615d756c634b9`、版本 `4.0.2` 开始。本次对齐纳入 `v4.0.3`（2026-10-17）发布。原有 `.cargo/`、`.claude/settings.json` 未修改。
+- aisub2api：工作从 `c885f6d2063030ed6cbae033656615d756c634b9`、版本 `4.0.2` 开始。本次对齐纳入 `v4.0.3`（2026-10-17）发布。原有 `.cargo/`、`.claude/settings.json` 未修改。
 
 ## 契约边界
 

@@ -1,18 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/claude-proxy-config",
-    "crates/claude-proxy-core",
-    "crates/claude-proxy-providers",
-    "crates/claude-proxy-server",
-    "crates/claude-proxy-cli",
+    "crates/aisub2api-config",
+    "crates/aisub2api-core",
+    "crates/aisub2api-providers",
+    "crates/aisub2api-server",
+    "crates/aisub2api-cli",
 ]
 
 [workspace.package]
-version = "4.0.3"
+version = "5.0.0"
 edition = "2024"
+description = "Turn AI subscriptions into Anthropic- and OpenAI-compatible APIs"
 license = "MIT"
-repository = "https://github.com/MorseWayne/claude-proxy"
+repository = "https://github.com/MorseWayne/aisub2api"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

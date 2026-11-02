@@ -4,7 +4,7 @@ Date: 2026-06-02
 
 ## Goal
 
-Improve ChatGPT/Codex reliability and observability after log and metrics review without moving conversation compaction into `claude-proxy`.
+Improve ChatGPT/Codex reliability and observability after log and metrics review without moving conversation compaction into `aisub2api`.
 
 ## Approved scope
 
@@ -14,7 +14,7 @@ Improve ChatGPT/Codex reliability and observability after log and metrics review
 
 ## Non-goals
 
-- Do not proactively compress, shrink, drop, or truncate conversation history in `claude-proxy`.
+- Do not proactively compress, shrink, drop, or truncate conversation history in `aisub2api`.
 - Do not replay a stream once any downstream SSE item has been emitted.
 - Do not add broad routing or model-selection changes in this slice.
 

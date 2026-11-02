@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="MorseWayne/claude-proxy"
-INSTALL_DIR="${CLP_INSTALL_DIR:-$HOME/.local/bin}"
+REPO="MorseWayne/aisub2api"
+INSTALL_DIR="${AISUB2API_INSTALL_DIR:-$HOME/.local/bin}"
 SERVICE_BINARY=""
 SERVICE_WAS_RUNNING=0
 
@@ -34,7 +34,11 @@ detect_platform() {
 }
 
 find_existing_binary() {
-    if [[ -x "${INSTALL_DIR}/claude-proxy" ]]; then
+    if [[ -x "${INSTALL_DIR}/aisub2api" ]]; then
+        echo "${INSTALL_DIR}/aisub2api"
+    elif command -v aisub2api >/dev/null 2>&1; then
+        command -v aisub2api
+    elif [[ -x "${INSTALL_DIR}/claude-proxy" ]]; then
         echo "${INSTALL_DIR}/claude-proxy"
     elif command -v claude-proxy >/dev/null 2>&1; then
         command -v claude-proxy
@@ -50,7 +54,30 @@ daemon_is_running() {
     fi
 
     status="$("$binary" server status 2>/dev/null || true)"
-    grep -q "claude-proxy is running" <<<"$status"
+    grep -Eq "(aisub2api|claude-proxy) is running" <<<"$status"
+}
+
+find_running_binary() {
+    local candidate
+    local candidates=(
+        "${INSTALL_DIR}/aisub2api"
+        "${INSTALL_DIR}/claude-proxy"
+    )
+
+    if command -v aisub2api >/dev/null 2>&1; then
+        candidates+=("$(command -v aisub2api)")
+    fi
+    if command -v claude-proxy >/dev/null 2>&1; then
+        candidates+=("$(command -v claude-proxy)")
+    fi
+
+    for candidate in "${candidates[@]}"; do
+        if [[ -x "$candidate" ]] && daemon_is_running "$candidate"; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
 }
 
 confirm_prompt() {
@@ -72,15 +99,15 @@ confirm_prompt() {
 }
 
 prepare_existing_service() {
-    SERVICE_BINARY="$(find_existing_binary || true)"
+    SERVICE_BINARY="$(find_running_binary || find_existing_binary || true)"
 
     if daemon_is_running "$SERVICE_BINARY"; then
         SERVICE_WAS_RUNNING=1
-        echo "A running claude-proxy daemon was detected."
+        echo "A running aisub2api or legacy daemon was detected."
         echo "Continuing installation will stop it before replacing the binary."
     fi
 
-    if ! confirm_prompt "Continue installing claude-proxy?"; then
+    if ! confirm_prompt "Continue installing aisub2api?"; then
         echo "Installation cancelled."
         exit 1
     fi
@@ -92,29 +119,29 @@ stop_existing_service() {
     fi
 
     if daemon_is_running "$SERVICE_BINARY"; then
-        echo "Stopping existing claude-proxy daemon..."
+        echo "Stopping existing aisub2api daemon..."
         "$SERVICE_BINARY" server stop
     else
-        echo "claude-proxy daemon is no longer running."
+        echo "aisub2api daemon is no longer running."
     fi
 
     if daemon_is_running "$SERVICE_BINARY"; then
-        echo "Failed to stop the existing claude-proxy daemon." >&2
+        echo "Failed to stop the existing aisub2api daemon." >&2
         exit 1
     fi
 }
 
 start_installed_service() {
-    if ! confirm_prompt "Start claude-proxy now?"; then
+    if ! confirm_prompt "Start aisub2api now?"; then
         return
     fi
 
-    if confirm_prompt "Run claude-proxy in the background?"; then
-        echo "Starting claude-proxy daemon..."
-        "${INSTALL_DIR}/claude-proxy" server start --daemon
+    if confirm_prompt "Run aisub2api in the background?"; then
+        echo "Starting aisub2api daemon..."
+        "${INSTALL_DIR}/aisub2api" server start --daemon
     else
-        echo "Starting claude-proxy in the foreground..."
-        "${INSTALL_DIR}/claude-proxy" server start
+        echo "Starting aisub2api in the foreground..."
+        "${INSTALL_DIR}/aisub2api" server start
     fi
 }
 
@@ -129,12 +156,12 @@ trap cleanup EXIT
 main() {
     local platform
     platform="$(detect_platform)"
-    local archive="claude-proxy-${platform}.tar.gz"
+    local archive="aisub2api-${platform}.tar.gz"
     local url="https://github.com/${REPO}/releases/latest/download/${archive}"
 
     prepare_existing_service
 
-    echo "Downloading claude-proxy for ${platform}..."
+    echo "Downloading aisub2api for ${platform}..."
     echo "  URL: ${url}"
 
     TMP_DIR="$(mktemp -d)"
@@ -145,11 +172,11 @@ main() {
     stop_existing_service
 
     mkdir -p "$INSTALL_DIR"
-    mv "${TMP_DIR}/claude-proxy" "${INSTALL_DIR}/claude-proxy"
-    chmod +x "${INSTALL_DIR}/claude-proxy"
+    mv "${TMP_DIR}/aisub2api" "${INSTALL_DIR}/aisub2api"
+    chmod +x "${INSTALL_DIR}/aisub2api"
 
     echo ""
-    echo "Installed to ${INSTALL_DIR}/claude-proxy"
+    echo "Installed to ${INSTALL_DIR}/aisub2api"
     echo ""
 
     # Check if INSTALL_DIR is in PATH
@@ -160,7 +187,7 @@ main() {
         echo ""
     fi
 
-    "${INSTALL_DIR}/claude-proxy" --version
+    "${INSTALL_DIR}/aisub2api" --version
 
     start_installed_service
 }

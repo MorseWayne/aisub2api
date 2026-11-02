@@ -1,23 +1,24 @@
-# claude-proxy
+# aisub2api
 
-**Use Claude Code with ChatGPT/Codex, OpenAI, GitHub Copilot, Gemini, OpenRouter, Anthropic, or your own models.**
+**Turn ChatGPT/Codex, GitHub Copilot, and other AI subscriptions into compatible APIs.**
 
-> Bring the model accounts you already have. Route them through one fast, observable gateway.
+> Turn the AI subscriptions you already pay for into local Anthropic- and OpenAI-compatible APIs.
 
-[![CI](https://github.com/MorseWayne/claude-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/MorseWayne/claude-proxy/actions/workflows/ci.yml)
-[![Release](https://github.com/MorseWayne/claude-proxy/actions/workflows/release.yml/badge.svg)](https://github.com/MorseWayne/claude-proxy/actions/workflows/release.yml)
-[![GitHub Release](https://img.shields.io/github/v/release/MorseWayne/claude-proxy?display_name=tag)](https://github.com/MorseWayne/claude-proxy/releases/latest)
+[![CI](https://github.com/MorseWayne/aisub2api/actions/workflows/ci.yml/badge.svg)](https://github.com/MorseWayne/aisub2api/actions/workflows/ci.yml)
+[![Release](https://github.com/MorseWayne/aisub2api/actions/workflows/release.yml/badge.svg)](https://github.com/MorseWayne/aisub2api/actions/workflows/release.yml)
+[![GitHub Release](https://img.shields.io/github/v/release/MorseWayne/aisub2api?display_name=tag)](https://github.com/MorseWayne/aisub2api/releases/latest)
 [![Rust](https://img.shields.io/badge/built_with-Rust-dca282.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 
 [中文](README_ZH.md) · [Install](#install) · [Quick Start](#quick-start) · [Configuration](#configuration)
 
-`claude-proxy` is a multi-model gateway for Claude Code and other Anthropic Messages API clients. It ships as a single native binary with zero runtime dependencies and provides one CLI/TUI for routing, authentication, and production observability.
+`aisub2api` is a local subscription-to-API tool. It signs in to ChatGPT/Codex and GitHub Copilot with OAuth and exposes Anthropic Messages, OpenAI Chat Completions, and streaming Responses APIs. API-key providers and multi-model routing remain available as supporting capabilities. It ships as one native Rust binary with zero runtime dependencies.
 
-## Why claude-proxy
+## Why aisub2api
 
-- **Use existing accounts**: Sign in to ChatGPT and GitHub Copilot with OAuth instead of maintaining API keys.
-- **Route across providers**: Mix OpenAI, Anthropic, Copilot, ChatGPT, OpenRouter, Google, and private compatible services in one configuration.
+- **Convert subscriptions into APIs**: Use existing ChatGPT/Codex and GitHub Copilot subscriptions through OAuth without maintaining another API key for the same access.
+- **Preserve agent protocol semantics**: Handle Anthropic Messages, OpenAI Chat Completions/Responses, tool calls, thinking, streaming events, and Codex request behavior instead of merely forwarding HTTP.
+- **Route across providers**: The same endpoint can also use OpenAI, Anthropic, OpenRouter, Google, and private compatible services.
 - **Extend Claude Code context**: Eligible ChatGPT models get virtual 1M projection, an 872K GPT-5.6 default upstream window, local context preflight, and automatic compaction signals.
 - **Respect model capabilities**: Model aliases and reasoning-effort choices follow real capability metadata instead of sending unsupported values.
 - **Operate with confidence**: Built-in TUI dashboard, persistent SQLite metrics, rate limits, concurrency controls, hot reload, daemon mode, and request deduplication.
@@ -28,31 +29,35 @@
 Linux / macOS:
 
 ```bash
-curl -fsSL https://github.com/MorseWayne/claude-proxy/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/MorseWayne/aisub2api/releases/latest/download/install.sh | bash
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://github.com/MorseWayne/claude-proxy/releases/latest/download/install.ps1 | iex
+irm https://github.com/MorseWayne/aisub2api/releases/latest/download/install.ps1 | iex
 ```
 
-Or download from [GitHub Releases](https://github.com/MorseWayne/claude-proxy/releases). On Linux x86_64, the installer downloads the statically linked `x86_64-unknown-linux-musl` build by default; the `x86_64-unknown-linux-gnu` build remains available for manual download from Releases.
+Or download from [GitHub Releases](https://github.com/MorseWayne/aisub2api/releases). On Linux x86_64, the installer downloads the statically linked `x86_64-unknown-linux-musl` build by default; the `x86_64-unknown-linux-gnu` build remains available for manual download from Releases.
+
+### Upgrading from the old name
+
+On first startup, `aisub2api` atomically moves the configuration, OAuth tokens, metrics, logs, and model capability cache from the legacy state directories when the new directories do not exist. Stop the old daemon before upgrading. If both old and new directories exist, the program does not merge or overwrite either directory and prints a warning.
 
 ## Quick Start
 
 ```bash
 # Add a provider (auto-fetches available models for default selection)
-claude-proxy provider add openai
+aisub2api provider add openai
 
 # Add GitHub Copilot (auto OAuth authentication)
-claude-proxy provider add copilot
+aisub2api provider add copilot
 
 # Add ChatGPT (OAuth with a ChatGPT Pro/Plus account)
-claude-proxy provider add chatgpt
+aisub2api provider add chatgpt
 
 # Start the server
-claude-proxy server start
+aisub2api server start
 
 # Point Claude Code at the proxy
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8082
@@ -64,60 +69,60 @@ export ANTHROPIC_API_KEY=freecc
 ### Provider Management
 
 ```bash
-claude-proxy provider list              # List configured providers
-claude-proxy provider current           # Show current default model
-claude-proxy provider add [id]          # Add a provider (interactive if ID omitted)
-claude-proxy provider edit <id>         # Edit provider config
-claude-proxy provider delete <id>       # Delete a provider
-claude-proxy provider switch <id>       # Set default model
-claude-proxy provider test <id>         # Test API key
-claude-proxy provider speedtest <id>    # Latency test
-claude-proxy provider fetch-models <id> # Fetch and cache model list
+aisub2api provider list              # List configured providers
+aisub2api provider current           # Show current default model
+aisub2api provider add [id]          # Add a provider (interactive if ID omitted)
+aisub2api provider edit <id>         # Edit provider config
+aisub2api provider delete <id>       # Delete a provider
+aisub2api provider switch <id>       # Set default model
+aisub2api provider test <id>         # Test API key
+aisub2api provider speedtest <id>    # Latency test
+aisub2api provider fetch-models <id> # Fetch and cache model list
 ```
 
 ### Configuration
 
 ```bash
-claude-proxy config show                # Show config (keys masked)
-claude-proxy config edit                # Open config in $EDITOR
-claude-proxy config validate            # Validate config
-claude-proxy config path                # Print config file path
-claude-proxy config export [path]       # Export config (stdout if no path)
-claude-proxy config import <path>       # Import config from file
+aisub2api config show                # Show config (keys masked)
+aisub2api config edit                # Open config in $EDITOR
+aisub2api config validate            # Validate config
+aisub2api config path                # Print config file path
+aisub2api config export [path]       # Export config (stdout if no path)
+aisub2api config import <path>       # Import config from file
 ```
 
 ### Server
 
 ```bash
-claude-proxy server start               # Start proxy server (foreground)
-claude-proxy server start --daemon      # Start as daemon (Unix only)
-claude-proxy server stop                # Stop daemon (Unix only)
-claude-proxy server restart             # Graceful config reload via SIGUSR1 (Unix only)
-claude-proxy server status              # Check if daemon is running
+aisub2api server start               # Start proxy server (foreground)
+aisub2api server start --daemon      # Start as daemon (Unix only)
+aisub2api server stop                # Stop daemon (Unix only)
+aisub2api server restart             # Graceful config reload via SIGUSR1 (Unix only)
+aisub2api server status              # Check if daemon is running
 ```
 
 ### Local Maintenance
 
 ```bash
-claude-proxy logs                       # Stream the active log file in real time
-claude-proxy logs --file /path/app.log  # Stream a specific log file
-claude-proxy clean --yes                # Clear local logs and metrics.db (stop the server first, or pass --force)
+aisub2api logs                       # Stream the active log file in real time
+aisub2api logs --file /path/app.log  # Stream a specific log file
+aisub2api clean --yes                # Clear local logs and metrics.db (stop the server first, or pass --force)
 ```
 
 
 ### TUI Configuration
 
 ```bash
-claude-proxy tui                        # Launch interactive terminal UI config interface
+aisub2api tui                        # Launch interactive terminal UI config interface
 ```
 
 Keyboard-navigable TUI for configuration management, provider management, and model list browsing.
 
-![TUI Model Selection](images/tui-model-selection.png)
+![TUI Model Selection](images/tui-chatgpt-model-aliases.svg)
 
 ## Configuration
 
-Config file: `~/.config/claude-proxy/config.toml`
+Config file: `~/.config/aisub2api/config.toml`
 
 ```toml
 [providers.openai]
@@ -145,7 +150,7 @@ base_url = "https://chatgpt.com/backend-api/codex"
 [providers.chatgpt.chatgpt]
 # Default User-Agent uses local `codex --version` when available, then this fallback.
 # originator = "codex_cli_rs"
-# user_agent = "codex_cli_rs/1.0.0 (claude-proxy)"
+# user_agent = "codex_cli_rs/1.0.0 (aisub2api)"
 
 # Optional: override ChatGPT/Codex model capabilities when upstream changes ahead of a release.
 # GPT-5.6 defaults to the Codex catalog's 872K supported maximum; an explicit override wins.
@@ -192,7 +197,7 @@ max_sse_frame_bytes = 1048576           # Max incomplete upstream SSE frame (1 M
 
 [log]
 level = "info"                          # Log level (trace/debug/info/warn/error)
-file = ""                               # Optional, log file path (defaults to config_dir/claude-proxy.log)
+file = ""                               # Optional, log file path (defaults to config_dir/aisub2api.log)
 with_stdout = true                      # Also emit to stderr (foreground server and CLI)
 raw_api_payloads = false                # Log raw request payloads
 raw_sse_events = false                  # Log raw SSE events
@@ -395,6 +400,8 @@ All admin endpoints require `Authorization: Bearer <admin_token>`. Falls back to
 
 ## Features
 
+- **Subscription-to-API**: Exposes ChatGPT/Codex and GitHub Copilot subscriptions through compatible local APIs
+- **Agent Protocol Compatibility**: Handles Anthropic Messages, OpenAI Chat Completions/Responses, tools, thinking, and streaming semantics
 - **Multi-Provider**: OpenAI, Anthropic, GitHub Copilot, ChatGPT, OpenRouter, Google, and custom compatible APIs
 - **Copilot Integration**: Full GitHub OAuth auth, VS Code impersonation, premium request optimization
 - **Auto Model Discovery**: Fetches available models when adding a provider, interactive default model selection
@@ -405,18 +412,18 @@ All admin endpoints require `Authorization: Bearer <admin_token>`. Falls back to
 - **Daemon Mode**: Background process with PID file management (Unix)
 - **Model Cache Warmup**: Pre-fetches model lists from all providers on startup
 - **Token Usage Metrics**: Per-model input/output/cache token usage tracking with real-time session data and persistent all-time history
-- **Persistent Storage**: Usage data automatically stored in SQLite (`~/.config/claude-proxy/metrics.db`), survives restarts
+- **Persistent Storage**: Usage data automatically stored in SQLite (`~/.config/aisub2api/metrics.db`), survives restarts
 - **TUI Dashboard**: Terminal dashboard showing live request count, error rate, latency, and per-model token usage
-- **Config Migration**: Auto-migration from legacy `.env` to TOML config
+- **Rename Migration**: Atomically migrates legacy configuration, OAuth tokens, metrics, logs, and model caches on first startup
 - **Graceful Shutdown**: Handles SIGINT and SIGTERM for clean exit
 
 ## Screenshots
 
-### TUI Dashboard
-![TUI Dashboard](images/metrics-dashboard.png)
+### ChatGPT subscription setup
+![ChatGPT subscription setup](images/tui-chatgpt-add-provider.svg)
 
-### Using with Claude Code
-![Claude Code Integration](images/claude-code-usage.png)
+### ChatGPT OAuth
+![ChatGPT OAuth](images/tui-chatgpt-oauth.svg)
 
 ## Build from Source
 
@@ -426,7 +433,7 @@ Build an optimized binary and install it locally in one command:
 cargo install-local
 ```
 
-Cargo installs `claude-proxy` to `$CARGO_HOME/bin` (usually `~/.cargo/bin`). To
+Cargo installs `aisub2api` to `$CARGO_HOME/bin` (usually `~/.cargo/bin`). To
 use another installation root, for example `~/.local/bin`, run:
 
 ```bash
@@ -434,7 +441,7 @@ CARGO_INSTALL_ROOT="$HOME/.local" cargo install-local
 ```
 
 The shortcut is equivalent to
-`cargo install --path crates/claude-proxy-cli --locked --force`; Cargo's
+`cargo install --path crates/aisub2api-cli --locked --force`; Cargo's
 install command builds the release profile by default, while the committed
 lockfile keeps local installs reproducible.
 
@@ -442,7 +449,7 @@ To build without installing:
 
 ```bash
 cargo build --release
-# binary at target/release/claude-proxy
+# binary at target/release/aisub2api
 ```
 
 Build the Linux musl statically linked version:
@@ -450,7 +457,7 @@ Build the Linux musl statically linked version:
 ```bash
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --target x86_64-unknown-linux-musl
-# binary at target/x86_64-unknown-linux-musl/release/claude-proxy
+# binary at target/x86_64-unknown-linux-musl/release/aisub2api
 ```
 
 ## License

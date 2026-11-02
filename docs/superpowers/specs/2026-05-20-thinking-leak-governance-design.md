@@ -2,7 +2,7 @@
 
 ## 背景
 
-`claude-proxy` 在多个 provider 转换层之间使用 Anthropic Messages/SSE 作为统一内部格式。当前代码里结构化 reasoning 路径和普通文本降级路径并存：
+`aisub2api` 在多个 provider 转换层之间使用 Anthropic Messages/SSE 作为统一内部格式。当前代码里结构化 reasoning 路径和普通文本降级路径并存：
 
 - 正确路径：provider-native reasoning 会映射为 Anthropic `thinking_delta`。
 - 风险路径：部分请求转换会把 `Content::Thinking` 序列化为普通文本 `[thinking]...[/thinking]`，上游一旦复述该文本，响应转换器会把它当作 `text_delta` 输出。
@@ -19,7 +19,7 @@
 
 ## 非目标
 
-- 不改 `claude-proxy-core` 的 `Content::Thinking` 数据模型。
+- 不改 `aisub2api-core` 的 `Content::Thinking` 数据模型。
 - 不改 Anthropic passthrough 行为。
 - 不改 server non-stream reconstruct 逻辑。
 - 不引入配置开关或 legacy 模式。
@@ -68,28 +68,28 @@
 
 ## 修改边界
 
-主要修改 `claude-proxy-providers`：
+主要修改 `aisub2api-providers`：
 
-- `crates/claude-proxy-providers/src/responses.rs`
+- `crates/aisub2api-providers/src/responses.rs`
   - `ResponsesStreamConverter` 持有 sanitizer 状态。
   - `response.output_text.delta` / `response.refusal.delta` / `response.content_part.added` 普通文本先净化。
   - `NonStreamingResponsesConverter::add_text_block` 对完整文本净化。
   - `append_message_items` 不再将 `Content::Thinking` 转为 `[thinking]` text。
   - 移除 `should_truncate_text_item` 对 `[thinking]` 的特殊豁免。
-- `crates/claude-proxy-providers/src/chat_completions.rs`
+- `crates/aisub2api-providers/src/chat_completions.rs`
   - `StreamConverter` 持有 sanitizer 状态并净化 `delta.content`。
   - 非流式 `message.content` 净化后输出。
   - 保持 `reasoning_content` → `thinking_delta` 不变。
-- `crates/claude-proxy-providers/src/copilot/chat_completions.rs`
+- `crates/aisub2api-providers/src/copilot/chat_completions.rs`
   - 移除 `Content::Thinking` → `[thinking]` text 的转换。
-- `crates/claude-proxy-providers/src/openai_compat.rs`
+- `crates/aisub2api-providers/src/openai_compat.rs`
   - 不再用 `[thinking]` 作为正常 thinking 统计依据。
 
 不修改：
 
-- `crates/claude-proxy-core/src/types.rs`
-- `crates/claude-proxy-providers/src/anthropic.rs`
-- `crates/claude-proxy-server/src/non_stream.rs`
+- `crates/aisub2api-core/src/types.rs`
+- `crates/aisub2api-providers/src/anthropic.rs`
+- `crates/aisub2api-server/src/non_stream.rs`
 
 ## 错误处理
 
@@ -131,11 +131,11 @@ sanitizer 是纯文本状态机，不返回 runtime error。异常输入按安�
 
 1. `cargo fmt --check`
 2. 目标测试：
-   - `cargo test -p claude-proxy-providers responses::tests::`
-   - `cargo test -p claude-proxy-providers chat_completions::tests::`
-   - `cargo test -p claude-proxy-providers copilot::chat_completions::tests::`
-   - `cargo test -p claude-proxy-providers openai_compat::tests::`
-3. `cargo test -p claude-proxy-providers`
+   - `cargo test -p aisub2api-providers responses::tests::`
+   - `cargo test -p aisub2api-providers chat_completions::tests::`
+   - `cargo test -p aisub2api-providers copilot::chat_completions::tests::`
+   - `cargo test -p aisub2api-providers openai_compat::tests::`
+3. `cargo test -p aisub2api-providers`
 4. `cargo test`
 5. `cargo clippy -- -D warnings`
 6. `gitnexus_detect_changes(scope=all)`
