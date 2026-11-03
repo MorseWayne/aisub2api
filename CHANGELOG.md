@@ -1,5 +1,12 @@
 # Changelog
 
+## v6.0.2 - 2026-11-03
+
+### Fixed
+
+- Allow `aisub2api config path` to print the platform configuration path before a configuration file exists, so fresh installations can trigger migration without failing.
+- Make the installers skip immediate service startup when no configuration exists and direct the user to the TUI or provider setup first.
+
 ## v6.0.1 - 2026-11-03
 
 ### Fixed

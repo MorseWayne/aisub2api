@@ -5,6 +5,7 @@ REPO="MorseWayne/aisub2api"
 INSTALL_DIR="${AISUB2API_INSTALL_DIR:-$HOME/.local/bin}"
 SERVICE_BINARY=""
 SERVICE_WAS_RUNNING=0
+CONFIG_PATH=""
 
 detect_platform() {
     local arch os
@@ -142,10 +143,16 @@ cleanup_legacy_install() {
     # Trigger state migration during installation. If both state directories
     # exist, the new binary keeps aisub2api authoritative and archives the
     # legacy directory instead of deleting credentials or waiting for startup.
-    "${INSTALL_DIR}/aisub2api" config path >/dev/null
+    CONFIG_PATH="$("${INSTALL_DIR}/aisub2api" config path)"
 }
 
 start_installed_service() {
+    if [[ -z "$CONFIG_PATH" || ! -f "$CONFIG_PATH" ]]; then
+        echo "No configuration found; skipping service startup."
+        echo "Run '${INSTALL_DIR}/aisub2api tui' or '${INSTALL_DIR}/aisub2api provider add' first."
+        return
+    fi
+
     if ! confirm_prompt "Start aisub2api now?"; then
         return
     fi

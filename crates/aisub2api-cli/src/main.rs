@@ -752,7 +752,7 @@ async fn handle_config(action: ConfigAction) {
             }
         },
         ConfigAction::Path => {
-            let path = config_path_or_exit();
+            let path = config_file_path_or_exit();
             println!("{}", path.display());
         }
         ConfigAction::Export { path } => {
@@ -1239,12 +1239,22 @@ fn save_settings(settings: &aisub2api_config::Settings) {
 }
 
 fn config_path_or_exit() -> PathBuf {
-    aisub2api_config::Settings::config_file_path()
-        .filter(|p| p.exists())
-        .unwrap_or_else(|| {
-            eprintln!("{} No config file found.", "Error:".red().bold());
-            process::exit(1);
-        })
+    let path = config_file_path_or_exit();
+    if path.exists() {
+        return path;
+    }
+    eprintln!("{} No config file found.", "Error:".red().bold());
+    process::exit(1);
+}
+
+fn config_file_path_or_exit() -> PathBuf {
+    aisub2api_config::Settings::config_file_path().unwrap_or_else(|| {
+        eprintln!(
+            "{} Could not determine the configuration directory.",
+            "Error:".red().bold()
+        );
+        process::exit(1);
+    })
 }
 
 fn mask_key(key: &str) -> String {

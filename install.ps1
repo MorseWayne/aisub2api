@@ -8,6 +8,7 @@ $InstallDir = if ($env:AISUB2API_INSTALL_DIR) {
     Join-Path $env:LOCALAPPDATA "Programs\aisub2api"
 }
 $ServiceWasRunning = $false
+$ConfigPath = $null
 
 function Test-Architecture {
     $arch = $env:PROCESSOR_ARCHITEW6432
@@ -110,7 +111,7 @@ function Remove-LegacyInstall {
 
     # Trigger state migration during installation. Conflicting legacy state is
     # archived so credentials remain recoverable but cannot affect startup.
-    & $BinaryPath config path | Out-Null
+    $script:ConfigPath = (& $BinaryPath config path | Select-Object -Last 1).Trim()
 }
 
 function Start-InstalledService {
@@ -118,6 +119,12 @@ function Start-InstalledService {
         [Parameter(Mandatory = $true)]
         [string]$BinaryPath
     )
+
+    if ([string]::IsNullOrWhiteSpace($script:ConfigPath) -or -not (Test-Path -PathType Leaf $script:ConfigPath)) {
+        Write-Host "No configuration found; skipping service startup."
+        Write-Host "Run '$BinaryPath tui' or '$BinaryPath provider add' first."
+        return
+    }
 
     if (-not (Confirm-YesNo -Prompt "Start aisub2api now?")) {
         return
