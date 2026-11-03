@@ -1,6 +1,8 @@
 //! Responses failures keep their server retry advice across SSE and WebSocket streams.
 
-use crate::http::{json_headers_to_header_map, upstream_error_metadata_from_parts};
+use crate::http::{
+    is_audio_validation_error_code, json_headers_to_header_map, upstream_error_metadata_from_parts,
+};
 use crate::provider::ProviderError;
 use serde_json::Value;
 use std::time::Duration;
@@ -60,6 +62,8 @@ pub(super) fn responses_error_event(value: &Value) -> Option<ProviderError> {
     let retry_after = metadata.retry_after;
     let mapped = match code {
         "context_length_exceeded" => ProviderError::RequestTooLarge(message),
+        code if is_audio_validation_error_code(code) => ProviderError::InvalidRequest(message),
+        "model_not_found" => ProviderError::ModelNotFound(message),
         "invalid_prompt"
         | "bio_policy"
         | "cyber_policy"
@@ -72,6 +76,10 @@ pub(super) fn responses_error_event(value: &Value) -> Option<ProviderError> {
         // Flex capacity failures are terminal for this requested tier. In particular,
         // do not treat HTTP 429 as an invitation to select a different service tier.
         "flex_unavailable" => ProviderError::FlexUnavailable(message),
+        "policy_capacity_unavailable" => ProviderError::PolicyCapacityUnavailable {
+            message,
+            retry_after,
+        },
         "rate_limit_exceeded" | "slow_down" => ProviderError::RateLimited { retry_after },
         "server_error" | "server_is_overloaded" => ProviderError::Overloaded {
             message,

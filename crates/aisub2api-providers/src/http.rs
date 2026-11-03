@@ -517,6 +517,18 @@ pub(crate) fn upstream_error_code(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+pub(crate) fn is_audio_validation_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "audio_too_large"
+            | "audio_too_short"
+            | "invalid_audio"
+            | "invalid_audio_data"
+            | "invalid_audio_format"
+            | "missing_audio_sample_rate"
+    )
+}
+
 fn value_contains_non_retryable_rate_limit(value: &str) -> bool {
     let value = value.to_ascii_lowercase();
     NON_RETRYABLE_RATE_LIMIT_VALUES
@@ -607,6 +619,7 @@ pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError
     let safe_headers = safe_upstream_error_headers(response.headers());
     let body = read_limited_response_text(response, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
     let message = extract_upstream_error_message(&body);
+    let error_code = upstream_error_code(&body);
     let non_retryable_rate_limit =
         non_retryable_rate_limit_headers || is_non_retryable_rate_limit_error_body(&body);
     let metadata = UpstreamErrorMetadata {
@@ -619,14 +632,29 @@ pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError
     };
 
     let error = match status {
+        400 if error_code
+            .as_deref()
+            .is_some_and(is_audio_validation_error_code) =>
+        {
+            ProviderError::InvalidRequest(message)
+        }
+        400 | 403 | 404 if error_code.as_deref() == Some("model_not_found") => {
+            ProviderError::ModelNotFound(message)
+        }
+        503 if error_code.as_deref() == Some("policy_capacity_unavailable") => {
+            ProviderError::PolicyCapacityUnavailable {
+                message,
+                retry_after,
+            }
+        }
         400 => ProviderError::InvalidRequest(message),
         401 => ProviderError::Authentication(message),
         404 => ProviderError::ModelNotFound(message),
         413 => ProviderError::RequestTooLarge(message),
-        429 if upstream_error_code(&body).as_deref() == Some("flex_unavailable") => {
+        429 if error_code.as_deref() == Some("flex_unavailable") => {
             ProviderError::FlexUnavailable(message)
         }
-        503 if upstream_error_code(&body).as_deref() == Some("slow_down") => {
+        503 if error_code.as_deref() == Some("slow_down") => {
             ProviderError::RateLimited { retry_after }
         }
         429 if non_retryable_rate_limit => ProviderError::InvalidRequest(message),
@@ -1201,6 +1229,38 @@ mod tests {
                 retry_after: Some(90)
             }
         ));
+
+        let response = response_with_status_headers_and_body(
+            "503 Service Unavailable",
+            &[("retry-after", "45")],
+            r#"{"error":{"code":"policy_capacity_unavailable","message":"policy route unavailable"}}"#,
+        )
+        .await;
+        let error = map_upstream_response(response).await;
+        assert!(matches!(
+            error.without_upstream_metadata(),
+            ProviderError::PolicyCapacityUnavailable {
+                retry_after: Some(45),
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_not_found_code_overrides_400_and_403_statuses() {
+        for status in ["400 Bad Request", "403 Forbidden", "404 Not Found"] {
+            let response = response_with_status_headers_and_body(
+                status,
+                &[],
+                r#"{"error":{"code":"model_not_found","message":"unknown model"}}"#,
+            )
+            .await;
+            let error = map_upstream_response(response).await;
+            assert!(matches!(
+                error.without_upstream_metadata(),
+                ProviderError::ModelNotFound(message) if message == "unknown model"
+            ));
+        }
     }
 
     #[tokio::test]

@@ -145,6 +145,12 @@ pub enum ProviderError {
     #[error("flex capacity unavailable: {0}")]
     FlexUnavailable(String),
 
+    #[error("policy-restricted capacity unavailable: {message}")]
+    PolicyCapacityUnavailable {
+        message: String,
+        retry_after: Option<u64>,
+    },
+
     #[error("model not found: {0}")]
     ModelNotFound(String),
 

@@ -264,7 +264,6 @@ impl ChatGptWebSocketSession {
                 update_on_success: true,
                 owns_busy: true,
                 generation,
-                from_prewarm: false,
                 disabled_reason: ContinuationDisabledReason::ConnectionNotReused,
             };
         };
@@ -355,41 +354,8 @@ impl ChatGptWebSocketSession {
             update_on_success: true,
             owns_busy: true,
             generation,
-            from_prewarm: false,
             disabled_reason,
         }
-    }
-
-    fn prepare_prewarm_continuation(
-        &mut self,
-        provider: &ChatGptProvider,
-        token: &ChatGptToken,
-        body: &Value,
-        stable_client_conversation_id: Option<&str>,
-    ) -> Option<ContinuationAttempt> {
-        self.prune_expired_continuations();
-        let key = continuation_key(provider, token, body, stable_client_conversation_id)?;
-        self.clear_conflicting_continuations(&key);
-        if self.busy.contains(&key) || self.continuations.contains_key(&key) {
-            return None;
-        }
-        let full_input = response_input_items(body)?;
-        let canonical_body = canonical_request_body(body);
-        let generation = self.current_generation(&key);
-        self.busy.insert(key.clone());
-        Some(ContinuationAttempt {
-            key: Some(key),
-            send_body: body.clone(),
-            canonical_body,
-            full_input,
-            used: false,
-            synthetic_fallback_used: false,
-            update_on_success: true,
-            owns_busy: true,
-            generation,
-            from_prewarm: true,
-            disabled_reason: ContinuationDisabledReason::ConnectionNotReused,
-        })
     }
 
     fn complete_continuation(
@@ -436,7 +402,6 @@ impl ChatGptWebSocketSession {
                 canonical_body: attempt.canonical_body.clone(),
                 full_input: attempt.full_input.clone(),
                 assistant_output_items,
-                from_prewarm: attempt.from_prewarm,
                 response_id: response_id.to_string(),
                 connection_id,
                 updated_at: Instant::now(),
@@ -572,7 +537,6 @@ struct CachedContinuation {
     canonical_body: Value,
     full_input: Vec<Value>,
     assistant_output_items: Vec<Value>,
-    from_prewarm: bool,
     response_id: String,
     connection_id: u64,
     updated_at: Instant,
@@ -620,7 +584,6 @@ struct ContinuationAttempt {
     update_on_success: bool,
     owns_busy: bool,
     generation: u64,
-    from_prewarm: bool,
     disabled_reason: ContinuationDisabledReason,
 }
 
@@ -636,7 +599,6 @@ impl ContinuationAttempt {
             update_on_success: false,
             owns_busy: false,
             generation: 0,
-            from_prewarm: false,
             disabled_reason,
         }
     }
@@ -656,7 +618,6 @@ impl ContinuationAttempt {
             update_on_success: false,
             owns_busy: false,
             generation: 0,
-            from_prewarm: false,
             disabled_reason,
         }
     }
@@ -745,13 +706,6 @@ fn canonical_body_without_prompt_cache_key(body: &Value) -> Value {
 }
 
 fn continuation_delta(cached: &CachedContinuation, full_input: &[Value]) -> Option<Vec<Value>> {
-    if cached.from_prewarm
-        && cached.assistant_output_items.is_empty()
-        && full_input == cached.full_input
-    {
-        return Some(Vec::new());
-    }
-
     if !cached.assistant_output_items.is_empty() {
         let mut baseline = cached.full_input.clone();
         baseline.extend(cached.assistant_output_items.clone());
@@ -964,162 +918,6 @@ fn assistant_custom_tool_call_output_to_input_item(item: &Value) -> Option<Value
     ])))
 }
 
-pub(super) async fn prewarm_websocket(
-    provider: &ChatGptProvider,
-    body: &Value,
-    token: &ChatGptToken,
-    stable_client_conversation_id: Option<&str>,
-    request_id: u64,
-    responses_lite: ResponsesLiteDecision,
-) -> Result<bool, ChatGptWebSocketStartError> {
-    let continuation = {
-        provider
-            .websocket_session
-            .lock()
-            .await
-            .prepare_prewarm_continuation(provider, token, body, stable_client_conversation_id)
-    };
-    let Some(continuation) = continuation else {
-        info!(
-            request_id,
-            transport = "websocket",
-            "ChatGPT websocket prewarm skipped"
-        );
-        return Ok(false);
-    };
-
-    let idle_timeout = websocket_idle_timeout(provider);
-    let connection_key = websocket_connection_key(provider, token, body);
-    let (mut stream, reused, checked_out_connection_id) =
-        match checkout_connection(provider, token, &connection_key, body).await {
-            Ok((stream, reused, connection_id)) => (stream, reused, connection_id),
-            Err(error) => {
-                provider
-                    .websocket_session
-                    .lock()
-                    .await
-                    .fail_continuation(&continuation);
-                return Err(error);
-            }
-        };
-
-    let request_text = match response_create_prewarm_request_text(
-        continuation.send_body.clone(),
-        responses_lite.is_enabled(),
-    ) {
-        Ok(request_text) => request_text,
-        Err(error) => {
-            provider
-                .websocket_session
-                .lock()
-                .await
-                .fail_continuation_for_connection(&continuation, checked_out_connection_id);
-            close_or_release_websocket(stream).await;
-            return Err(error);
-        }
-    };
-    if let Err(error) = send_websocket_request(&mut stream, request_text, idle_timeout).await {
-        provider
-            .websocket_session
-            .lock()
-            .await
-            .fail_continuation_for_connection(&continuation, checked_out_connection_id);
-        close_or_release_websocket(stream).await;
-        return Err(ChatGptWebSocketStartError::with_phase(
-            error,
-            true,
-            ChatGptWebSocketPhase::Send,
-        ));
-    }
-
-    loop {
-        match read_next_json_event(&mut stream, idle_timeout, true).await {
-            Ok(event) => {
-                info!(
-                    request_id,
-                    transport = "websocket",
-                    event_type = event
-                        .get("type")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("unknown"),
-                    "ChatGPT websocket prewarm upstream event received"
-                );
-                if !is_terminal_response_event(&event) {
-                    continue;
-                }
-                if !is_successful_completed_event(&event) {
-                    handle_websocket_prewarm_failure(
-                        provider,
-                        &continuation,
-                        checked_out_connection_id,
-                        request_id,
-                        &event,
-                    )
-                    .await;
-                    close_or_release_websocket(stream).await;
-                    return Err(ChatGptWebSocketStartError::with_phase(
-                        ProviderError::UpstreamError {
-                            status: 200,
-                            body: event.to_string(),
-                        },
-                        true,
-                        ChatGptWebSocketPhase::FirstEvent,
-                    ));
-                }
-                complete_and_store_connection(
-                    provider.websocket_session.clone(),
-                    stream,
-                    connection_key,
-                    &continuation,
-                    &event,
-                    WebSocketCompletionContext {
-                        request_id,
-                        request_websocket_reused: reused,
-                        checked_out_connection_id,
-                    },
-                )
-                .await;
-                info!(
-                    request_id,
-                    transport = "websocket",
-                    websocket_reused = reused,
-                    websocket_connection_id = checked_out_connection_id.unwrap_or(0),
-                    "ChatGPT websocket prewarm completed"
-                );
-                return Ok(true);
-            }
-            Err(mut error) => {
-                let server_error = provider_error_is_chatgpt_server_error(&error.error);
-                provider
-                    .websocket_session
-                    .lock()
-                    .await
-                    .fail_continuation_for_connection(&continuation, checked_out_connection_id);
-                if server_error {
-                    rotate_chatgpt_runtime_ids_after_server_error(
-                        &provider.runtime_ids_handle(),
-                        request_id,
-                        "websocket",
-                    );
-                    ChatGptProvider::activate_websocket_sse_cooldown(
-                        &provider.websocket_sse_cooldown_handle(),
-                        request_id,
-                        "websocket",
-                    );
-                    provider
-                        .websocket_session
-                        .lock()
-                        .await
-                        .clear_volatile_state();
-                    error.fallback_allowed = true;
-                }
-                close_or_release_websocket(stream).await;
-                return Err(error);
-            }
-        }
-    }
-}
-
 pub(super) struct ChatGptWebSocketStreamStart {
     pub(super) stream: BoxStream<'static, Result<ProviderEvent, ProviderError>>,
     pub(super) websocket_reused: bool,
@@ -1304,7 +1102,7 @@ where
 
     let websocket_session = provider.websocket_session.clone();
     let runtime_ids = provider.runtime_ids_handle();
-    let websocket_sse_cooldown_until_secs = provider.websocket_sse_cooldown_handle();
+    let websocket_http_fallback = provider.websocket_http_fallback_handle();
     let (abort_tx, mut abort_rx) = watch::channel(false);
     tokio::spawn(async move {
         if first_event_terminal {
@@ -1315,10 +1113,11 @@ where
                     request_id,
                     "websocket",
                 );
-                ChatGptProvider::activate_websocket_sse_cooldown(
-                    &websocket_sse_cooldown_until_secs,
+                ChatGptProvider::activate_websocket_http_fallback(
+                    &websocket_http_fallback,
                     request_id,
                     "websocket",
+                    "upstream server_error",
                 );
                 websocket_session.lock().await.clear_volatile_state();
                 close_or_release_websocket(stream).await;
@@ -1373,10 +1172,11 @@ where
                                         request_id,
                                         "websocket",
                                     );
-                                    ChatGptProvider::activate_websocket_sse_cooldown(
-                                        &websocket_sse_cooldown_until_secs,
+                                    ChatGptProvider::activate_websocket_http_fallback(
+                                        &websocket_http_fallback,
                                         request_id,
                                         "websocket",
+                                        "upstream server_error",
                                     );
                                     websocket_session.lock().await.clear_volatile_state();
                                     close_or_release_websocket(stream).await;
@@ -1413,10 +1213,11 @@ where
                                     request_id,
                                     "websocket",
                                 );
-                                ChatGptProvider::activate_websocket_sse_cooldown(
-                                    &websocket_sse_cooldown_until_secs,
+                                ChatGptProvider::activate_websocket_http_fallback(
+                                    &websocket_http_fallback,
                                     request_id,
                                     "websocket",
+                                    "upstream server_error",
                                 );
                                 websocket_session.lock().await.clear_volatile_state();
                             }
@@ -1465,38 +1266,6 @@ struct WebSocketCompletionContext {
     request_id: u64,
     request_websocket_reused: bool,
     checked_out_connection_id: Option<u64>,
-}
-
-async fn handle_websocket_prewarm_failure(
-    provider: &ChatGptProvider,
-    continuation: &ContinuationAttempt,
-    checked_out_connection_id: Option<u64>,
-    request_id: u64,
-    terminal_event: &Value,
-) {
-    let server_error = super::chatgpt_event_is_server_error(terminal_event);
-    provider
-        .websocket_session
-        .lock()
-        .await
-        .fail_continuation_for_connection(continuation, checked_out_connection_id);
-    if server_error {
-        rotate_chatgpt_runtime_ids_after_server_error(
-            &provider.runtime_ids_handle(),
-            request_id,
-            "websocket",
-        );
-        ChatGptProvider::activate_websocket_sse_cooldown(
-            &provider.websocket_sse_cooldown_handle(),
-            request_id,
-            "websocket",
-        );
-        provider
-            .websocket_session
-            .lock()
-            .await
-            .clear_volatile_state();
-    }
 }
 
 async fn complete_and_store_connection(
@@ -2173,23 +1942,6 @@ fn response_create_request_text(
     })
 }
 
-fn response_create_prewarm_request_text(
-    mut body: Value,
-    use_responses_lite: bool,
-) -> Result<String, ChatGptWebSocketStartError> {
-    super::responses::set_codex_request_kind(&mut body, "prewarm");
-    let object = body.as_object_mut().ok_or_else(|| {
-        ChatGptWebSocketStartError::new(
-            ProviderError::InvalidRequest(
-                "ChatGPT websocket request body must be an object".to_string(),
-            ),
-            false,
-        )
-    })?;
-    object.insert("generate".to_string(), Value::Bool(false));
-    response_create_request_text(body, use_responses_lite)
-}
-
 async fn send_websocket_request(
     stream: &mut ChatGptWsStream,
     request_text: String,
@@ -2427,6 +2179,19 @@ fn map_wrapped_websocket_error_event(value: &Value, original_text: &str) -> Prov
     if code == Some("flex_unavailable") {
         return ProviderError::FlexUnavailable(message).with_upstream_metadata(metadata);
     }
+    if code == Some("policy_capacity_unavailable") {
+        return ProviderError::PolicyCapacityUnavailable {
+            message,
+            retry_after: metadata.retry_after,
+        }
+        .with_upstream_metadata(metadata);
+    }
+    if code == Some("model_not_found") {
+        return ProviderError::ModelNotFound(message).with_upstream_metadata(metadata);
+    }
+    if code.is_some_and(crate::http::is_audio_validation_error_code) {
+        return ProviderError::InvalidRequest(message).with_upstream_metadata(metadata);
+    }
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     map_chatgpt_error_status_body_with_headers(status, &headers, original_text.to_string())
 }
@@ -2493,6 +2258,35 @@ mod tests {
     }
 
     #[test]
+    fn websocket_terminal_provider_codes_match_http_and_sse() {
+        let policy = json!({
+            "type":"error",
+            "status":503,
+            "error":{"code":"policy_capacity_unavailable","message":"policy route unavailable"},
+            "headers":{"retry-after":"30"}
+        });
+        let error = map_wrapped_websocket_error_event(&policy, &policy.to_string());
+        assert!(matches!(
+            error.without_upstream_metadata(),
+            ProviderError::PolicyCapacityUnavailable {
+                retry_after: Some(30),
+                ..
+            }
+        ));
+
+        let missing_model = json!({
+            "type":"error",
+            "status":403,
+            "error":{"code":"model_not_found","message":"unknown model"}
+        });
+        let error = map_wrapped_websocket_error_event(&missing_model, &missing_model.to_string());
+        assert!(matches!(
+            error.without_upstream_metadata(),
+            ProviderError::ModelNotFound(message) if message == "unknown model"
+        ));
+    }
+
+    #[test]
     fn websocket_connect_timeout_uses_runtime_attempt_timeout_override() {
         let default_runtime = ProviderRuntimeConfig::default();
         assert_eq!(
@@ -2530,24 +2324,6 @@ mod tests {
         assert_eq!(value["type"], "response.create");
         assert_eq!(value["model"], "gpt-5.3-codex");
         assert_eq!(value["stream"], true);
-    }
-
-    #[test]
-    fn response_create_prewarm_request_text_wraps_body_with_generate_false() {
-        let text = response_create_prewarm_request_text(
-            json!({
-                "model": "gpt-5.3-codex",
-                "input": [{"role": "user", "content": "hi"}],
-                "stream": true
-            }),
-            false,
-        )
-        .expect("request text");
-        let value: Value = serde_json::from_str(&text).unwrap();
-
-        assert_eq!(value["type"], "response.create");
-        assert_eq!(value["generate"], false);
-        assert_eq!(value["input"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]
@@ -2654,7 +2430,6 @@ mod tests {
                 })),
                 full_input: vec![json!({"role": "user", "content": "first"})],
                 assistant_output_items: assistant_output,
-                from_prewarm: false,
                 response_id: "resp-1".to_string(),
                 connection_id: 1,
                 updated_at: Instant::now(),
@@ -2706,7 +2481,6 @@ mod tests {
                 })),
                 full_input: vec![json!({"role": "user", "content": "first"})],
                 assistant_output_items: vec![json!({"role": "assistant", "content": "answer"})],
-                from_prewarm: false,
                 response_id: "resp-1".to_string(),
                 connection_id: 1,
                 updated_at: Instant::now(),
@@ -2804,7 +2578,6 @@ mod tests {
             canonical_body: json!({}),
             full_input: vec![json!({"role": "user", "content": "first"})],
             assistant_output_items: vec![json!({"role": "assistant", "content": "answer"})],
-            from_prewarm: false,
             response_id: "resp-1".to_string(),
             connection_id: 1,
             updated_at: Instant::now(),
@@ -2820,30 +2593,11 @@ mod tests {
     }
 
     #[test]
-    fn continuation_delta_uses_empty_input_after_prewarm_for_same_logical_request() {
-        let input = vec![json!({"role": "user", "content": "hi"})];
-        let cached = CachedContinuation {
-            canonical_body: json!({}),
-            full_input: input.clone(),
-            assistant_output_items: Vec::new(),
-            from_prewarm: true,
-            response_id: "warm-1".to_string(),
-            connection_id: 1,
-            updated_at: Instant::now(),
-        };
-
-        let delta = continuation_delta(&cached, &input).expect("prewarm delta");
-
-        assert!(delta.is_empty());
-    }
-
-    #[test]
     fn continuation_delta_infers_missing_assistant_prefix() {
         let cached = CachedContinuation {
             canonical_body: json!({}),
             full_input: vec![json!({"role": "user", "content": "first"})],
             assistant_output_items: Vec::new(),
-            from_prewarm: false,
             response_id: "resp-1".to_string(),
             connection_id: 1,
             updated_at: Instant::now(),
@@ -2865,7 +2619,6 @@ mod tests {
             canonical_body: json!({}),
             full_input: vec![json!({"role": "user", "content": "first"})],
             assistant_output_items: Vec::new(),
-            from_prewarm: false,
             response_id: "resp-1".to_string(),
             connection_id: 1,
             updated_at: Instant::now(),
@@ -2890,7 +2643,6 @@ mod tests {
             canonical_body: json!({}),
             full_input: vec![json!({"role": "user", "content": "first"})],
             assistant_output_items: Vec::new(),
-            from_prewarm: false,
             response_id: "resp-1".to_string(),
             connection_id: 1,
             updated_at: Instant::now(),
@@ -2982,7 +2734,6 @@ mod tests {
                 })),
                 full_input: vec![json!({"role": "user", "content": "first"})],
                 assistant_output_items: vec![json!({"role": "assistant", "content": "answer"})],
-                from_prewarm: false,
                 response_id: "resp-old".to_string(),
                 connection_id: 1,
                 updated_at: Instant::now(),
@@ -3029,7 +2780,6 @@ mod tests {
             update_on_success: true,
             owns_busy: true,
             generation: 0,
-            from_prewarm: false,
             disabled_reason: ContinuationDisabledReason::None,
         };
         session.busy.insert(key.clone());
@@ -3075,7 +2825,6 @@ mod tests {
                 canonical_body: json!({"model": "gpt-5.3-codex"}),
                 full_input: vec![json!({"role": "user", "content": "hi"})],
                 assistant_output_items: Vec::new(),
-                from_prewarm: false,
                 response_id: "resp-1".to_string(),
                 connection_id: 1,
                 updated_at: Instant::now()
@@ -3101,7 +2850,6 @@ mod tests {
             update_on_success: true,
             owns_busy: true,
             generation: 0,
-            from_prewarm: false,
             disabled_reason: ContinuationDisabledReason::None,
         };
         let error_event = json!({

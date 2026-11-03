@@ -3875,9 +3875,12 @@ mod tests {
             ("cyber_policy", "invalid_request"),
             ("insufficient_quota", "invalid_request"),
             ("usage_not_included", "invalid_request"),
+            ("invalid_audio_format", "invalid_request"),
+            ("model_not_found", "model_not_found"),
             ("rate_limit_exceeded", "rate_limited"),
             ("server_error", "overloaded"),
             ("server_is_overloaded", "overloaded"),
+            ("policy_capacity_unavailable", "policy_capacity"),
             ("slow_down", "rate_limited"),
         ];
 
@@ -3893,8 +3896,10 @@ mod tests {
             let actual = match error.without_upstream_metadata() {
                 ProviderError::RequestTooLarge(_) => "request_too_large",
                 ProviderError::InvalidRequest(_) => "invalid_request",
+                ProviderError::ModelNotFound(_) => "model_not_found",
                 ProviderError::RateLimited { .. } => "rate_limited",
                 ProviderError::Overloaded { .. } => "overloaded",
+                ProviderError::PolicyCapacityUnavailable { .. } => "policy_capacity",
                 other => panic!("unexpected error for {code}: {other}"),
             };
             assert_eq!(actual, expected, "error code {code}");

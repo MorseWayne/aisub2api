@@ -91,6 +91,55 @@ fn quota_and_policy_errors_are_terminal_and_flex_retains_its_classification() {
 }
 
 #[test]
+fn codex_terminal_provider_codes_preserve_their_semantics() {
+    for code in [
+        "audio_too_large",
+        "audio_too_short",
+        "invalid_audio",
+        "invalid_audio_data",
+        "invalid_audio_format",
+        "missing_audio_sample_rate",
+    ] {
+        let error = responses_error_event(&json!({
+            "type":"response.failed",
+            "response":{"error":{"code":code,"message":"Invalid recording."}}
+        }))
+        .unwrap();
+        assert!(matches!(
+            error.without_upstream_metadata(),
+            ProviderError::InvalidRequest(message) if message == "Invalid recording."
+        ));
+    }
+
+    let error = responses_error_event(&json!({
+        "type":"error",
+        "error":{"code":"model_not_found","message":"Unknown model."}
+    }))
+    .unwrap();
+    assert!(matches!(
+        error.without_upstream_metadata(),
+        ProviderError::ModelNotFound(message) if message == "Unknown model."
+    ));
+
+    let error = responses_error_event(&json!({
+        "type":"response.failed",
+        "response":{"error":{
+            "code":"policy_capacity_unavailable",
+            "message":"Policy route unavailable.",
+            "headers":{"Retry-After": 45}
+        }}
+    }))
+    .unwrap();
+    assert!(matches!(
+        error.without_upstream_metadata(),
+        ProviderError::PolicyCapacityUnavailable {
+            message,
+            retry_after: Some(45)
+        } if message == "Policy route unavailable."
+    ));
+}
+
+#[test]
 fn unknown_incomplete_reasons_are_not_successful_translated_responses() {
     for reason in ["budget_exhausted", "interrupted", "unknown"] {
         let event = json!({"type":"response.incomplete","response":{"id":"resp-test","incomplete_details":{"reason":reason},"usage":{"output_tokens":17}}});

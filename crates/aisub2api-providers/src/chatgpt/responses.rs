@@ -13,7 +13,6 @@ pub(super) struct CodexRequestContext<'a> {
     pub turn_id: Option<&'a str>,
     pub window_id: Option<&'a str>,
     pub service_tier: Option<&'a str>,
-    pub standalone_tools: bool,
     pub responses_lite: bool,
     pub model: Option<&'a ModelInfo>,
     pub additional_instructions: Option<&'a str>,
@@ -30,7 +29,6 @@ impl Default for CodexRequestContext<'_> {
             turn_id: None,
             window_id: None,
             service_tier: None,
-            standalone_tools: true,
             responses_lite: false,
             model: None,
             additional_instructions: None,
@@ -109,11 +107,7 @@ pub(super) fn build_body_with_context(
         crate::responses::ConversionContext {
             provider_id: Some("chatgpt"),
             model: context.model,
-            tool_conversion_mode: if context.standalone_tools {
-                crate::responses::ToolConversionMode::CodexStandalone
-            } else {
-                crate::responses::ToolConversionMode::Function
-            },
+            tool_conversion_mode: crate::responses::ToolConversionMode::CodexStandalone,
             supports_reasoning_summary_parameter: Some(
                 context.supports_reasoning_summary_parameter,
             ),
@@ -421,23 +415,6 @@ pub(super) fn codex_routing_hint(body: &Value) -> Option<String> {
         Some(tier) => format!("model={model};tier={tier}"),
         None => format!("model={model}"),
     })
-}
-
-pub(super) fn set_codex_request_kind(body: &mut Value, request_kind: &str) {
-    let Some(metadata) = body
-        .pointer_mut("/client_metadata/x-codex-turn-metadata")
-        .and_then(|value| value.as_str())
-        .and_then(|value| serde_json::from_str::<Value>(value).ok())
-    else {
-        return;
-    };
-    let mut metadata = metadata;
-    if let Some(object) = metadata.as_object_mut() {
-        object.insert("request_kind".to_string(), json!(request_kind));
-    }
-    if let Some(slot) = body.pointer_mut("/client_metadata/x-codex-turn-metadata") {
-        *slot = Value::String(metadata.to_string());
-    }
 }
 
 pub(super) fn prompt_cache_key_source(request: &MessagesRequest) -> PromptCacheKeySource {

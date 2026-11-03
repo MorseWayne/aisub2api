@@ -257,6 +257,8 @@ ChatGPT 使用 OAuth，因此 Providers 详情里的 **API Key** 会显示为 `O
 [providers.chatgpt.chatgpt]
 # originator = "codex_cli_rs"
 # user_agent = "codex_cli_rs/1.0.0 (aisub2api)"
+# transport = "auto"       # "auto"、"websocket" 或 "sse"
+# responses_lite = "auto"  # "auto"、"on" 或 "off"
 # claude_code_context = "auto" # "standard" 可关闭虚拟 1M 投影
 
 # 可选：在线 /models 目录不可用或需要本地强制覆盖时使用。
@@ -281,8 +283,9 @@ ChatGPT provider 会优先通过 OAuth 从 Codex `/models` 获取在线模型目
 | `gpt-6-sol` | 可选通用模型 | 272k | `low`…`ultra` | 是 |
 | `gpt-6-luna` | 可选轻量模型 | 272k | `low`…`max` | 是 |
 | `gpt-6.1-sol` | 可选通用模型 | 272k | `low`…`ultra` | 是 |
+| `gpt-6.1-terra` | 可选通用模型 | 500k | `low`…`ultra` | 是 |
 
-Astra、GPT-6 Sol/Luna 和 GPT-6.1 Sol 的 ChatGPT 回退使用 Codex 目录中的 272K 默认窗口，不自动启用可选的 872K 扩展窗口。`openai/gpt-6-astra` 则声明公开 API 的 1,050,000 context、128,000 output 和 `low` 到 `max` 推理能力，Messages 请求也使用 Responses；两种提供商的限制分别处理。
+Astra、GPT-6 Sol/Luna 和 GPT-6.1 Sol 的 ChatGPT 回退使用 Codex 目录中的 272K active context；GPT-6.1 Terra 使用 500K active context，均不自动启用可选的 872K 扩展窗口。`openai/gpt-6-astra` 则声明公开 API 的 1,050,000 context、128,000 output 和 `low` 到 `max` 推理能力，Messages 请求也使用 Responses；两种提供商的限制分别处理。
 
 所有新建 ChatGPT 映射默认使用 `high`。TUI 的 Reasoning picker 对所有 Provider 都按当前模型声明的 `reasoning_effort_levels` 过滤，并在打开时按需拉取、缓存模型能力；能力明确为空时只显示 `unset`，拿不到能力或使用目录外的自定义模型时才显示完整兼容列表。以 GPT-5.6 为例，Sol/Terra 显示 `low` 到 `ultra`，Luna 只显示 `low` 到 `max`，不会再给 Luna 显示 `default`、`none` 或 `minimal`。`unset` 用于清除代理侧强制覆盖。`ultra` 遵循 Codex 语义：上游请求发送 `max`；支持 `ultra` 的 Sol/Terra/Astra 模型且请求包含委派工具时，同时启用主动多代理指令，否则仅按 `max` 发送并记录警告。Luna 不支持 `ultra`，会降为 `max`。
 
@@ -524,7 +527,11 @@ Codex 后端不接受 `max_output_tokens`；Proxy 会在 `unsupported_parameters
 
 Responses 错误会保留服务端重试建议和请求 ID。HTTP 等待建议超过 5 秒时，代理交还调用方安排重试，不提前重试。未知的不完整响应原因在 Messages/Chat 翻译路径报告为错误；原生 Responses 保留原始终止事件。长度截断和内容过滤保持已有结束原因映射，用量仍被记录。收到终止 SSE 事件后立即结束上游读取。
 
+模型不存在和音频校验错误在 HTTP、SSE、WebSocket 中均按终止错误处理。策略限制路由容量不足仍可重试，下游返回 529 并保留上游 `Retry-After` 建议。
+
 最后一个流式消费者断开后，Proxy 会立即停止上游读取；仍有其他共享消费者时继续传输。ChatGPT 客户端仅在已知 HTTPS/WSS ChatGPT 域名存储上游 `__oailb` 路由 Cookie，并在同一 provider 的 HTTP 与 WebSocket 之间共享，遵守域名、路径、安全传输和过期规则。WebSocket 连接及续接状态按凭证所有者和路由配置隔离。
+
+使用 `transport = "auto"` 时，一次允许 fallback 的 WebSocket 失败会让该 provider 实例持续使用 HTTP/SSE，直到 provider 重载；不再维护定时恢复状态，也不再发送旧的 `generate=false` prewarm 请求。
 
 ### OpenAI 客户端接入
 

@@ -173,15 +173,9 @@ pub struct ChatGptProviderConfig {
     /// Transport used for ChatGPT Codex Responses streams.
     #[serde(default)]
     pub transport: ChatGptTransport,
-    /// Enable Codex WebSocket prewarm by sending a generate=false request before the first real turn.
-    #[serde(default)]
-    pub websocket_prewarm: bool,
     /// Responses Lite policy for ChatGPT Codex requests.
     #[serde(default)]
     pub responses_lite: ResponsesLiteMode,
-    /// Enable Codex-style standalone/custom tools for ChatGPT Codex requests.
-    #[serde(default = "default_true")]
-    pub standalone_tools: bool,
     /// Enable Codex fast mode by sending the priority service tier when no explicit service tier is configured.
     #[serde(default)]
     pub fast_mode: bool,
@@ -199,9 +193,7 @@ impl Default for ChatGptProviderConfig {
             originator: default_empty(),
             user_agent: default_empty(),
             transport: ChatGptTransport::default(),
-            websocket_prewarm: false,
             responses_lite: ResponsesLiteMode::Auto,
-            standalone_tools: true,
             fast_mode: false,
             claude_code_context: ClaudeCodeContextMode::Auto,
             model_capabilities: HashMap::new(),
@@ -217,22 +209,13 @@ pub enum ClaudeCodeContextMode {
     Standard,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponsesLiteMode {
     #[default]
     Auto,
     On,
     Off,
-}
-
-impl<'de> Deserialize<'de> for ResponsesLiteMode {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserialize_responses_lite_mode(deserializer)
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -267,55 +250,6 @@ fn default_max_thinking_tokens() -> u32 {
 }
 fn default_true() -> bool {
     true
-}
-
-fn deserialize_responses_lite_mode<'de, D>(deserializer: D) -> Result<ResponsesLiteMode, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct Visitor;
-
-    impl serde::de::Visitor<'_> for Visitor {
-        type Value = ResponsesLiteMode;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str(r#"a boolean or one of "auto", "on", "off""#)
-        }
-
-        fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(if value {
-                ResponsesLiteMode::On
-            } else {
-                ResponsesLiteMode::Off
-            })
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            match value.trim().to_ascii_lowercase().as_str() {
-                "auto" => Ok(ResponsesLiteMode::Auto),
-                "on" | "true" | "enabled" => Ok(ResponsesLiteMode::On),
-                "off" | "false" | "disabled" => Ok(ResponsesLiteMode::Off),
-                other => Err(E::custom(format!(
-                    "invalid responses_lite mode `{other}`, expected auto, on, or off"
-                ))),
-            }
-        }
-
-        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-        where
-            E: serde::de::Error,
-        {
-            self.visit_str(&value)
-        }
-    }
-
-    deserializer.deserialize_any(Visitor)
 }
 
 /// Authentication method for a provider.
@@ -1664,9 +1598,7 @@ base_url = "https://chatgpt.com/backend-api/codex"
 originator = "codex_cli"
 user_agent = "CodexCLI/1.2.3"
 transport = "websocket"
-websocket_prewarm = true
-responses_lite = false
-standalone_tools = false
+responses_lite = "off"
 fast_mode = true
 "#;
 
@@ -1677,21 +1609,17 @@ fast_mode = true
         assert_eq!(chatgpt.originator, "codex_cli");
         assert_eq!(chatgpt.user_agent, "CodexCLI/1.2.3");
         assert_eq!(chatgpt.transport, ChatGptTransport::Websocket);
-        assert!(chatgpt.websocket_prewarm);
         assert_eq!(chatgpt.responses_lite, ResponsesLiteMode::Off);
-        assert!(!chatgpt.standalone_tools);
         assert!(chatgpt.fast_mode);
         assert_eq!(chatgpt.claude_code_context, ClaudeCodeContextMode::Auto);
         assert_eq!(
             ChatGptProviderConfig::default().transport,
             ChatGptTransport::Auto
         );
-        assert!(!ChatGptProviderConfig::default().websocket_prewarm);
         assert_eq!(
             ChatGptProviderConfig::default().responses_lite,
             ResponsesLiteMode::Auto
         );
-        assert!(ChatGptProviderConfig::default().standalone_tools);
         assert!(!ChatGptProviderConfig::default().fast_mode);
         assert_eq!(
             ChatGptProviderConfig::default().claude_code_context,
@@ -1761,46 +1689,6 @@ reasoning_effort_levels = ["low", "high", "xhigh"]
                 .reasoning_effort_levels
                 .as_deref(),
             Some(["low".to_string(), "high".to_string(), "xhigh".to_string()].as_slice())
-        );
-
-        let legacy_true = Settings::from_toml(
-            r#"
-[providers.chatgpt]
-provider_type = "chatgpt"
-
-[providers.chatgpt.chatgpt]
-responses_lite = true
-"#,
-            Path::new("test.toml"),
-        )
-        .unwrap();
-        assert_eq!(
-            legacy_true.providers["chatgpt"]
-                .chatgpt
-                .as_ref()
-                .unwrap()
-                .responses_lite,
-            ResponsesLiteMode::On
-        );
-
-        let legacy_false = Settings::from_toml(
-            r#"
-[providers.chatgpt]
-provider_type = "chatgpt"
-
-[providers.chatgpt.chatgpt]
-responses_lite = false
-"#,
-            Path::new("test.toml"),
-        )
-        .unwrap();
-        assert_eq!(
-            legacy_false.providers["chatgpt"]
-                .chatgpt
-                .as_ref()
-                .unwrap()
-                .responses_lite,
-            ResponsesLiteMode::Off
         );
     }
 

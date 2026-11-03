@@ -1,5 +1,26 @@
 # Changelog
 
+## v6.0.0 - 2026-11-03
+
+### Breaking
+
+- Removed the obsolete `chatgpt.websocket_prewarm` and `chatgpt.standalone_tools` configuration branches. ChatGPT now always uses the current Codex standalone/custom-tool request shape and no longer sends legacy `generate=false` prewarm requests.
+- `chatgpt.responses_lite` now accepts only `"auto"`, `"on"`, or `"off"`; legacy boolean and alias spellings are no longer parsed.
+
+### Added
+
+- Added ChatGPT fallback capabilities for `gpt-6.1-terra`, following the Codex catalog's 500K active context, Responses Lite, image input, reasoning aliases, and priority tier metadata.
+
+### Fixed
+
+- Classify `model_not_found` consistently across HTTP 400/403/404, SSE, and WebSocket failures instead of retrying or returning a generic upstream error.
+- Treat Codex audio validation failures as terminal invalid requests on every transport.
+- Preserve `policy_capacity_unavailable` as a distinct retryable capacity failure, including upstream `Retry-After` advice and downstream 529 retry semantics.
+
+### Changed
+
+- Simplified automatic ChatGPT WebSocket fallback to a one-way transition: after a fallback-eligible WebSocket failure, the provider instance remains on HTTP/SSE until it is reloaded, matching current Codex session behavior without cooldown recovery state.
+
 ## v5.0.0 - 2026-11-02
 
 ### Breaking

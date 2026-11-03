@@ -151,6 +151,8 @@ base_url = "https://chatgpt.com/backend-api/codex"
 # Default User-Agent uses local `codex --version` when available, then this fallback.
 # originator = "codex_cli_rs"
 # user_agent = "codex_cli_rs/1.0.0 (aisub2api)"
+# transport = "auto"       # "auto", "websocket", or "sse"
+# responses_lite = "auto"  # "auto", "on", or "off"
 
 # Optional: override ChatGPT/Codex model capabilities when upstream changes ahead of a release.
 # GPT-5.6 defaults to the Codex catalog's 872K supported maximum; an explicit override wins.
@@ -263,7 +265,8 @@ catalog's 272,000-token default context; online metadata and explicit capability
 overrides take precedence. These provider limits are separate.
 
 The ChatGPT fallback catalog also includes `gpt-6-sol`, `gpt-6-luna`, and
-`gpt-6.1-sol`, using Responses Lite and the 272,000-token default context.
+`gpt-6.1-sol` with the 272,000-token active context, plus `gpt-6.1-terra` with
+the Codex catalog's 500,000-token active context. All use Responses Lite.
 Service tiers are sent only when requested or configured; an explicit `flex`
 tier is retained even when the catalog omits it. Flex capacity failures return
 503 with `x-should-retry: false` before streaming begins.
@@ -274,6 +277,9 @@ incomplete-response reasons are errors on translated Messages/Chat streams;
 native Responses preserves the original terminal event. Token-limit and
 content-filter finish reasons retain their existing mappings. Terminal SSE events
 close the upstream read without waiting for the server to close its socket.
+Model-not-found and audio-validation failures are terminal across HTTP, SSE,
+and WebSocket transports. Policy-restricted capacity remains retryable and is
+returned as 529 with the upstream `Retry-After` advice.
 
 Disconnecting the last streaming consumer closes the upstream read immediately;
 other consumers of a shared request can continue. ChatGPT clients retain only the
@@ -282,6 +288,9 @@ the provider's HTTP and WebSocket transports. WebSocket connections and
 continuations are isolated by credential ownership and routing configuration. Model caches are
 invalidated when their provider or authentication scope changes. Existing context
 capability caches are refreshed after upgrading to the new identity-scoped format.
+With `transport = "auto"`, a fallback-eligible WebSocket failure switches that
+provider instance to HTTP/SSE until the provider is reloaded; there is no timed
+WebSocket recovery or `generate=false` prewarm path.
 
 ### OpenAI Client Setup
 

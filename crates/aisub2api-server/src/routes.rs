@@ -2844,6 +2844,7 @@ fn provider_error_kind(error: &ProviderError) -> &'static str {
         ProviderError::RequestTooLarge(_) => "request_too_large",
         ProviderError::ResponseTooLarge(_) => "response_too_large",
         ProviderError::Overloaded { .. } => "overloaded",
+        ProviderError::PolicyCapacityUnavailable { .. } => "policy_capacity_unavailable",
         ProviderError::ModelNotFound(_) => "model_not_found",
         ProviderError::Timeout => "timeout",
         ProviderError::UpstreamError { .. } => "upstream",
@@ -2885,6 +2886,10 @@ fn provider_error_to_response(error: &ProviderError) -> Response {
             error_response(StatusCode::BAD_GATEWAY, &ErrorResponse::api_error(msg))
         }
         ProviderError::Overloaded {
+            message,
+            retry_after,
+        } => overloaded_response(message, *retry_after),
+        ProviderError::PolicyCapacityUnavailable {
             message,
             retry_after,
         } => overloaded_response(message, *retry_after),
@@ -4560,6 +4565,32 @@ mod tests {
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["error"]["type"], "overloaded_error");
         assert_eq!(body["error"]["message"], "upstream overloaded");
+    }
+
+    #[tokio::test]
+    async fn policy_capacity_preserves_retry_advice_for_all_downstream_protocols() {
+        let error = ProviderError::PolicyCapacityUnavailable {
+            message: "policy route unavailable".to_string(),
+            retry_after: Some(45),
+        };
+        for response in [
+            provider_error_to_response(&error),
+            crate::downstream::provider_error_response(
+                &DownstreamProtocol::chat_completions("model", false),
+                &error,
+            ),
+            crate::downstream::provider_error_response(
+                &DownstreamProtocol::responses("model", serde_json::Map::new()),
+                &error,
+            ),
+        ] {
+            assert_eq!(response.status().as_u16(), 529);
+            assert_eq!(response.headers()["retry-after"], "45");
+            assert_eq!(response.headers()["x-should-retry"], "true");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["message"], "policy route unavailable");
+        }
     }
 
     #[test]

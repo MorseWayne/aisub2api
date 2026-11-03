@@ -267,6 +267,15 @@ pub(crate) fn provider_error_response(
                 *retry_after,
                 true,
             ),
+            ProviderError::PolicyCapacityUnavailable {
+                message,
+                retry_after,
+            } => (
+                overloaded_status(),
+                overloaded_error(message),
+                *retry_after,
+                true,
+            ),
             ProviderError::ModelNotFound(message) => (
                 StatusCode::NOT_FOUND,
                 ErrorResponse::not_found(message),

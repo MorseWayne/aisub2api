@@ -4,7 +4,12 @@ use serde_json::json;
 #[tokio::test]
 async fn new_codex_models_use_lite_requests_and_catalog_tiers() {
     let provider = tests::test_chatgpt_provider("http://127.0.0.1:1/responses".to_string()).await;
-    for model in ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"] {
+    for (model, context_window) in [
+        ("gpt-6-sol", 272_000),
+        ("gpt-6-luna", 272_000),
+        ("gpt-6.1-sol", 272_000),
+        ("gpt-6.1-terra", 500_000),
+    ] {
         let mut request: MessagesRequest = serde_json::from_value(json!({
             "model": model, "messages":[{"role":"user","content":"hi"}],
             "reasoning":{"effort":"ultra"}, "temperature":0.5, "top_p":0.8,
@@ -33,7 +38,10 @@ async fn new_codex_models_use_lite_requests_and_catalog_tiers() {
         assert_eq!(body["parallel_tool_calls"], false);
         assert!(body.get("temperature").is_none());
         assert!(body.get("top_p").is_none());
-        assert_eq!(info.capabilities.limits.context_window, Some(272_000));
+        assert_eq!(
+            info.capabilities.limits.context_window,
+            Some(context_window)
+        );
         assert!(body.get("service_tier").is_none());
     }
 }
@@ -106,5 +114,36 @@ fn chatgpt_http_capacity_and_throttling_errors_keep_their_meaning() {
         ProviderError::RateLimited {
             retry_after: Some(90)
         }
+    ));
+
+    let error = map_chatgpt_error_status_body_with_headers(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &headers,
+        json!({"error":{"code":"policy_capacity_unavailable","message":"policy route unavailable"}}).to_string(),
+    );
+    assert!(matches!(
+        error.without_upstream_metadata(),
+        ProviderError::PolicyCapacityUnavailable {
+            retry_after: Some(90),
+            ..
+        }
+    ));
+
+    let error = map_chatgpt_error_status_body(
+        StatusCode::FORBIDDEN,
+        json!({"error":{"code":"model_not_found","message":"unknown model"}}).to_string(),
+    );
+    assert!(matches!(
+        error.without_upstream_metadata(),
+        ProviderError::ModelNotFound(message) if message == "unknown model"
+    ));
+
+    let error = map_chatgpt_error_status_body(
+        StatusCode::BAD_REQUEST,
+        json!({"error":{"code":"invalid_audio_format","message":"Invalid recording."}}).to_string(),
+    );
+    assert!(matches!(
+        error.without_upstream_metadata(),
+        ProviderError::InvalidRequest(message) if message == "Invalid recording."
     ));
 }
