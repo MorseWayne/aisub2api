@@ -2457,7 +2457,7 @@ fn apply_claude_code_env(value: &mut Value, settings: &Settings) {
     }
     let env = env_value.as_object_mut().expect("env is an object");
 
-    set_env(env, "ANTHROPIC_BASE_URL", &claude_code_base_url(settings));
+    set_env(env, "ANTHROPIC_BASE_URL", &server_client_base_url(settings));
     set_env(env, "ANTHROPIC_API_KEY", &settings.server.auth_token);
     set_env(env, "CLAUDE_CODE_ATTRIBUTION_HEADER", "0");
     set_env(env, "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "128000");
@@ -2496,7 +2496,7 @@ fn apply_claude_code_env(value: &mut Value, settings: &Settings) {
     env.remove("ANTHROPIC_SMALL_FAST_MODEL");
 }
 
-fn claude_code_base_url(settings: &Settings) -> String {
+fn server_client_base_url(settings: &Settings) -> String {
     let host = match settings.server.host.as_str() {
         "0.0.0.0" | "::" => "127.0.0.1".to_string(),
         host if host.contains(':') && !host.starts_with('[') => format!("[{host}]"),
@@ -2506,7 +2506,7 @@ fn claude_code_base_url(settings: &Settings) -> String {
 }
 
 fn openai_base_url(settings: &Settings) -> String {
-    format!("{}/v1", claude_code_base_url(settings))
+    format!("{}/v1", server_client_base_url(settings))
 }
 
 fn set_optional_env(env: &mut Map<String, Value>, key: &str, value: Option<&str>) {
@@ -2653,24 +2653,28 @@ fn fetch_live_metrics(app: &mut App, now: Instant) {
     }
     app.last_metrics_fetch_at = Some(now);
 
-    let host = app.settings.server.host.clone();
-    let port = app.settings.server.port;
     let admin_token = app.settings.admin_auth_token().to_string();
-    let url = format!("http://{host}:{port}/admin/metrics");
+    let url = format!("{}/admin/metrics", server_client_base_url(&app.settings));
 
     let (tx, rx) = std::sync::mpsc::channel();
     app.metrics_rx = Some(rx);
 
     std::thread::spawn(move || {
-        let client = reqwest::blocking::Client::new();
-        let mut req = client.get(&url).timeout(Duration::from_secs(2));
-        if !admin_token.is_empty() {
-            req = req.header("Authorization", format!("Bearer {admin_token}"));
-        }
-        let result = req
-            .send()
+        // The admin endpoint belongs to the configured server itself. Never send
+        // this request through an outbound HTTP proxy inherited from the shell.
+        let result = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
             .ok()
-            .and_then(|r| r.json::<serde_json::Value>().ok());
+            .and_then(|client| {
+                let mut req = client.get(&url).timeout(Duration::from_secs(2));
+                if !admin_token.is_empty() {
+                    req = req.header("Authorization", format!("Bearer {admin_token}"));
+                }
+                req.send()
+                    .ok()
+                    .and_then(|response| response.json::<serde_json::Value>().ok())
+            });
         let _ = tx.send(result);
     });
 }
@@ -3116,6 +3120,23 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(openai_base_url(&ipv6), "http://[::1]:8082/v1");
+    }
+
+    #[test]
+    fn metrics_url_is_client_ready_for_wildcard_host() {
+        let settings = Settings {
+            server: ServerConfig {
+                host: "0.0.0.0".to_string(),
+                port: 8082,
+                ..ServerConfig::default()
+            },
+            ..Settings::default()
+        };
+
+        assert_eq!(
+            format!("{}/admin/metrics", server_client_base_url(&settings)),
+            "http://127.0.0.1:8082/admin/metrics"
+        );
     }
 
     #[test]

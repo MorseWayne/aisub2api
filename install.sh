@@ -131,6 +131,20 @@ stop_existing_service() {
     fi
 }
 
+cleanup_legacy_install() {
+    local legacy_binary="${INSTALL_DIR}/claude-proxy"
+
+    if [[ -e "$legacy_binary" ]]; then
+        rm -f -- "$legacy_binary"
+        echo "Removed legacy binary ${legacy_binary}"
+    fi
+
+    # Trigger state migration during installation. If both state directories
+    # exist, the new binary keeps aisub2api authoritative and archives the
+    # legacy directory instead of deleting credentials or waiting for startup.
+    "${INSTALL_DIR}/aisub2api" config path >/dev/null
+}
+
 start_installed_service() {
     if ! confirm_prompt "Start aisub2api now?"; then
         return
@@ -174,6 +188,7 @@ main() {
     mkdir -p "$INSTALL_DIR"
     mv "${TMP_DIR}/aisub2api" "${INSTALL_DIR}/aisub2api"
     chmod +x "${INSTALL_DIR}/aisub2api"
+    cleanup_legacy_install
 
     echo ""
     echo "Installed to ${INSTALL_DIR}/aisub2api"

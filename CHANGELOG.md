@@ -1,5 +1,17 @@
 # Changelog
 
+## v6.0.1 - 2026-11-03
+
+### Fixed
+
+- Make the TUI dashboard connect to wildcard-bound local servers through loopback and bypass inherited outbound proxy settings for `/admin/metrics` requests.
+- Reject duplicate daemon starts before truncating daemon logs or replacing the active PID file.
+
+### Migration
+
+- Run legacy state migration during installation and remove the old `claude-proxy` binary from the installer-managed directory.
+- When legacy and canonical state directories both exist, keep `aisub2api` authoritative and atomically archive the legacy state as `claude-proxy.legacy-backup*` so it cannot interfere with startup while remaining recoverable.
+
 ## v6.0.0 - 2026-11-03
 
 ### Breaking

@@ -181,7 +181,7 @@ fn migrate_legacy_state_or_exit() {
     }
     if migration.has_conflicts() {
         eprintln!(
-            "Warning: both aisub2api and legacy state directories exist; aisub2api kept its canonical state and left the legacy directories unchanged."
+            "Both aisub2api and legacy state directories existed; continuing with aisub2api state and archived the legacy directories as claude-proxy.legacy-backup*."
         );
     }
 }
@@ -220,6 +220,14 @@ async fn async_main(cli: Cli) {
 #[cfg(unix)]
 fn daemonize_process() {
     use daemonize::{Daemonize, Outcome};
+
+    if let Some(pid) = read_pid_file() {
+        if is_process_running(pid) {
+            eprintln!("aisub2api is already running (PID {pid})");
+            std::process::exit(1);
+        }
+        cleanup_pid_file();
+    }
 
     let config_dir =
         aisub2api_config::Settings::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));

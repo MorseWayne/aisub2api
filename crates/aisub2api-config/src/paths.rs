@@ -70,6 +70,7 @@ fn migrate_directory(legacy: &Path, canonical: &Path) -> io::Result<DirectoryMig
         return Ok(DirectoryMigration::default());
     }
     if canonical.exists() {
+        archive_legacy_directory(legacy)?;
         return Ok(DirectoryMigration {
             migrated: false,
             conflict: true,
@@ -83,6 +84,30 @@ fn migrate_directory(legacy: &Path, canonical: &Path) -> io::Result<DirectoryMig
         migrated: true,
         conflict: false,
     })
+}
+
+fn archive_legacy_directory(legacy: &Path) -> io::Result<PathBuf> {
+    let file_name = legacy
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(LEGACY_APP_NAME);
+    let parent = legacy.parent().unwrap_or_else(|| Path::new("."));
+    let base_name = format!("{file_name}.legacy-backup");
+
+    for index in 0.. {
+        let backup_name = if index == 0 {
+            base_name.clone()
+        } else {
+            format!("{base_name}.{index}")
+        };
+        let backup = parent.join(backup_name);
+        if !backup.exists() {
+            fs::rename(legacy, &backup)?;
+            return Ok(backup);
+        }
+    }
+
+    unreachable!("an available legacy backup path is always found")
 }
 
 fn migrate_runtime_file_names(config_dir: &Path) -> io::Result<usize> {
@@ -123,7 +148,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn migrates_legacy_directory_without_overwriting_canonical_state() {
+    fn migrates_or_archives_legacy_directory_without_overwriting_canonical_state() {
         let root = tempdir().unwrap();
         let legacy = root.path().join(LEGACY_APP_NAME);
         let canonical = root.path().join(APP_NAME);
@@ -157,6 +182,41 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(canonical.join("config.toml")).unwrap(),
+            "legacy"
+        );
+        assert!(!legacy.exists());
+        assert_eq!(
+            fs::read_to_string(
+                root.path()
+                    .join("claude-proxy.legacy-backup")
+                    .join("config.toml")
+            )
+            .unwrap(),
+            "second"
+        );
+    }
+
+    #[test]
+    fn archives_legacy_directory_to_a_unique_backup_path() {
+        let root = tempdir().unwrap();
+        let legacy = root.path().join(LEGACY_APP_NAME);
+        let canonical = root.path().join(APP_NAME);
+        fs::create_dir_all(&canonical).unwrap();
+        fs::create_dir_all(root.path().join("claude-proxy.legacy-backup")).unwrap();
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("config.toml"), "legacy").unwrap();
+
+        let outcome = migrate_directory(&legacy, &canonical).unwrap();
+
+        assert!(outcome.conflict);
+        assert!(!legacy.exists());
+        assert_eq!(
+            fs::read_to_string(
+                root.path()
+                    .join("claude-proxy.legacy-backup.1")
+                    .join("config.toml")
+            )
+            .unwrap(),
             "legacy"
         );
     }

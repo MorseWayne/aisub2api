@@ -96,6 +96,23 @@ function Stop-ExistingService {
     }
 }
 
+function Remove-LegacyInstall {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BinaryPath
+    )
+
+    $legacyBinary = Join-Path $InstallDir "claude-proxy.exe"
+    if (Test-Path $legacyBinary) {
+        Remove-Item -Force $legacyBinary
+        Write-Host "Removed legacy binary $legacyBinary"
+    }
+
+    # Trigger state migration during installation. Conflicting legacy state is
+    # archived so credentials remain recoverable but cannot affect startup.
+    & $BinaryPath config path | Out-Null
+}
+
 function Start-InstalledService {
     param(
         [Parameter(Mandatory = $true)]
@@ -139,6 +156,7 @@ function Install-AiSub2Api {
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
         $binaryPath = Join-Path $InstallDir "aisub2api.exe"
         Move-Item -Force (Join-Path $tempDir "aisub2api.exe") $binaryPath
+        Remove-LegacyInstall -BinaryPath $binaryPath
 
         Write-Host ""
         Write-Host "Installed to $binaryPath"

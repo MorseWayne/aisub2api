@@ -42,7 +42,7 @@ Or download from [GitHub Releases](https://github.com/MorseWayne/aisub2api/relea
 
 ### Upgrading from the old name
 
-On first startup, `aisub2api` atomically moves the configuration, OAuth tokens, metrics, logs, and model capability cache from the legacy state directories when the new directories do not exist. Stop the old daemon before upgrading. If both old and new directories exist, the program does not merge or overwrite either directory and prints a warning.
+The installer migrates legacy state immediately after replacing the binary and removes the legacy `claude-proxy` executable from the install directory. If the new directory does not exist, legacy configuration, OAuth tokens, metrics, logs, and model capability caches are moved atomically to `aisub2api`. If both directories exist, the `aisub2api` directory remains authoritative and the legacy directory is atomically archived as `claude-proxy.legacy-backup*`, keeping it recoverable without affecting startup. Deployments that do not use the installer perform the same migration on the first run of the new binary. Stop the old daemon before upgrading.
 
 ## Quick Start
 

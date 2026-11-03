@@ -42,7 +42,7 @@ irm https://github.com/MorseWayne/aisub2api/releases/latest/download/install.ps1
 
 ### 从旧名称升级
 
-首次运行 `aisub2api` 时，如果新目录尚不存在，程序会把旧名称下的配置、OAuth token、metrics、日志和模型能力缓存原子迁移到 `aisub2api`。升级前应先停止旧守护进程。如果新旧目录同时存在，程序不会自动合并或覆盖，并会输出警告。
+安装脚本会在替换二进制后立即迁移旧状态，并移除安装目录中的旧 `claude-proxy` 可执行文件。如果新目录尚不存在，旧名称下的配置、OAuth token、metrics、日志和模型能力缓存会原子迁移到 `aisub2api`；如果新旧目录同时存在，`aisub2api` 目录保持权威，旧目录会原子归档为 `claude-proxy.legacy-backup*`，既不影响启动也保留人工恢复的可能。未通过安装脚本部署时，同一迁移会在首次运行新版程序时执行。升级前应先停止旧守护进程。
 
 ## 快速开始
 
