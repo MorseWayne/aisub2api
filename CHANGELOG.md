@@ -1,5 +1,16 @@
 # Changelog
 
+## v6.0.3 - 2026-11-04
+
+### Changed
+
+- Replace the single cached ChatGPT WebSocket with a bounded pool sized from the existing per-provider concurrency limit, preserving reusable connections when models or conversations interleave.
+- Prefer the connection that owns a continuation and isolate expiration, eviction, cancellation, and stale-response cleanup to the affected connection instead of discarding unrelated session state.
+
+### Validation
+
+- Passed all 622 workspace tests, formatting checks, and workspace Clippy with warnings denied. WebSocket validation used local mock servers; live continuation hit-rate improvements remain to be measured after rollout.
+
 ## v6.0.2 - 2026-11-03
 
 ### Fixed

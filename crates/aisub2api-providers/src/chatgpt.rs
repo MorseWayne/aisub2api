@@ -717,7 +717,9 @@ impl ChatGptProvider {
             transport,
             websocket_http_fallback: Arc::new(AtomicBool::new(false)),
             websocket_stats: ChatGptWebSocketStats::default(),
-            websocket_session: Arc::new(Mutex::new(transport::ChatGptWebSocketSession::new())),
+            websocket_session: Arc::new(Mutex::new(transport::ChatGptWebSocketSession::new(
+                settings.limits.provider_max_concurrency as usize,
+            ))),
             auth,
             remote_models: Arc::new(RwLock::new(ChatGptModelCatalog::default())),
             cached_rate_limits: Arc::new(Mutex::new(CachedRateLimits {
@@ -8016,6 +8018,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chatgpt_websocket_pool_preserves_continuations_across_models() {
+        let assistant_message = |text: &str| {
+            json!([{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}]
+            }])
+        };
+        let (endpoint, requests, handshakes) = websocket_multi_connection_sequence_server(vec![
+            vec![
+                vec![
+                    websocket_response_created("resp-a-1"),
+                    websocket_response_completed_with_output(
+                        "resp-a-1",
+                        assistant_message("answer-a"),
+                    ),
+                ],
+                vec![
+                    websocket_response_created("resp-a-2"),
+                    websocket_response_completed("resp-a-2"),
+                ],
+            ],
+            vec![
+                vec![
+                    websocket_response_created("resp-b-1"),
+                    websocket_response_completed_with_output(
+                        "resp-b-1",
+                        assistant_message("answer-b"),
+                    ),
+                ],
+                vec![
+                    websocket_response_created("resp-b-2"),
+                    websocket_response_completed("resp-b-2"),
+                ],
+            ],
+        ])
+        .await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Websocket;
+
+        let mut model_b_body = chatgpt_websocket_test_body();
+        model_b_body["model"] = json!("gpt-5.5");
+        let mut model_a_follow_up = chatgpt_websocket_test_body();
+        model_a_follow_up["input"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "answer-a"},
+            {"role": "user", "content": "next-a"}
+        ]);
+        let mut model_b_follow_up = model_b_body.clone();
+        model_b_follow_up["input"] = json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "answer-b"},
+            {"role": "user", "content": "next-b"}
+        ]);
+        let requests_to_send = [
+            (4, chatgpt_websocket_test_body(), "conversation-a"),
+            (5, model_b_body, "conversation-b"),
+            (6, model_a_follow_up, "conversation-a"),
+            (7, model_b_follow_up, "conversation-b"),
+        ];
+        for (request_id, body, conversation_id) in requests_to_send {
+            let stream = provider
+                .chat_prepared_with_token(
+                    chatgpt_test_prepared_request_with_body(
+                        request_id,
+                        body,
+                        Some(conversation_id),
+                    ),
+                    chatgpt_test_token(),
+                )
+                .await
+                .expect("websocket stream should start");
+            assert!(
+                collect_stream_results(stream)
+                    .await
+                    .iter()
+                    .all(Result::is_ok)
+            );
+        }
+
+        assert_eq!(handshakes.lock().unwrap().len(), 2);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[2]["previous_response_id"], "resp-a-1");
+        assert_eq!(
+            requests[2]["input"],
+            json!([{"role": "user", "content": "next-a"}])
+        );
+        assert_eq!(requests[3]["previous_response_id"], "resp-b-1");
+        assert_eq!(
+            requests[3]["input"],
+            json!([{"role": "user", "content": "next-b"}])
+        );
+    }
+
+    #[tokio::test]
     async fn chatgpt_upstream_context_length_error_returns_request_too_large_without_retry() {
         let (endpoint, requests) = prompt_too_long_error_server().await;
         let provider = test_chatgpt_provider(endpoint).await;
@@ -8485,6 +8583,73 @@ mod tests {
                         .unwrap();
                 }
                 let _ = websocket.close(None).await;
+            }
+        });
+
+        (format!("http://{addr}/responses"), requests, handshakes)
+    }
+
+    async fn websocket_multi_connection_sequence_server(
+        responses: Vec<Vec<Vec<Value>>>,
+    ) -> (
+        String,
+        Arc<StdMutex<Vec<Value>>>,
+        Arc<StdMutex<Vec<CapturedWsHandshake>>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let handshakes = Arc::new(StdMutex::new(Vec::new()));
+        let captured_requests = Arc::clone(&requests);
+        let captured_handshakes = Arc::clone(&handshakes);
+
+        tokio::spawn(async move {
+            let mut handlers = Vec::new();
+            for connection_responses in responses {
+                let (socket, _) = listener.accept().await.unwrap();
+                let requests = Arc::clone(&captured_requests);
+                let handshakes = Arc::clone(&captured_handshakes);
+                handlers.push(tokio::spawn(async move {
+                    let mut websocket = accept_hdr_async(
+                        socket,
+                        move |request: &WsServerRequest, response: WsServerResponse| {
+                            handshakes.lock().unwrap().push(CapturedWsHandshake {
+                                headers: request
+                                    .headers()
+                                    .iter()
+                                    .map(|(name, value)| {
+                                        (
+                                            name.as_str().to_string(),
+                                            value.to_str().unwrap_or_default().to_string(),
+                                        )
+                                    })
+                                    .collect(),
+                            });
+                            Ok(response)
+                        },
+                    )
+                    .await
+                    .unwrap();
+
+                    for events in connection_responses {
+                        if let Some(Ok(WsMessage::Text(text))) = websocket.next().await {
+                            requests
+                                .lock()
+                                .unwrap()
+                                .push(serde_json::from_str(&text).unwrap());
+                        }
+                        for event in events {
+                            websocket
+                                .send(WsMessage::Text(event.to_string().into()))
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    let _ = websocket.close(None).await;
+                }));
+            }
+            for handler in handlers {
+                let _ = handler.await;
             }
         });
 
@@ -9136,7 +9301,7 @@ mod tests {
             transport: ChatGptTransport::Sse,
             websocket_http_fallback: Arc::new(AtomicBool::new(false)),
             websocket_stats: ChatGptWebSocketStats::default(),
-            websocket_session: Arc::new(Mutex::new(transport::ChatGptWebSocketSession::new())),
+            websocket_session: Arc::new(Mutex::new(transport::ChatGptWebSocketSession::new(4))),
             auth: ChatGptAuth::for_test(),
             payload_limits: crate::http::ResponsePayloadLimits {
                 max_response_body_bytes: 1024 * 1024,
