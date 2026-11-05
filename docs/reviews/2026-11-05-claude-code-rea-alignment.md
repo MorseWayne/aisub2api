@@ -2,6 +2,8 @@
 
 日期：2026-11-05。范围：用 REA 和隔离的真实 Claude Code 验证 aisub2api 的 Messages 协议适配，修复有直接证据的缺口。
 
+本文记录首轮 `2180a9d` 的结果。后续定向读取模块 contents、受控 MCP 工具搜索和 HTTP 422 恢复的验证见[第二轮调研](2026-11-05-claude-code-tool-search-recovery.md)；下文未覆盖项对应首轮范围。
+
 ## 结论与证据范围
 
 - REA 已在 `/tmp/aisub2api-rea-20261105` 隔离构建，未注册全局 MCP 或安装全局 skill。

@@ -243,6 +243,45 @@ async fn start_proxy(settings: Settings) -> String {
 }
 
 #[tokio::test]
+async fn upstream_validation_errors_preserve_messages_recovery_contract() {
+    let message = "tools.0.defer_loading: Extra inputs are not permitted";
+    let mock = Router::new().route(
+        "/v1/messages",
+        post(move || async move {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"type": "error", "error": {
+                    "type": "invalid_request_error", "message": message
+                }})),
+            )
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let mut settings = test_settings(&upstream, "local-test-key");
+    settings.providers.get_mut("openai").unwrap().provider_type = Some(ProviderType::Anthropic);
+    let proxy = start_proxy(settings).await;
+    let response = reqwest::Client::new()
+        .post(format!("{proxy}/v1/messages"))
+        .header("x-api-key", "local-test-key")
+        .json(&json!({
+            "model": "openai/claude-sonnet-4-6",
+            "stream": true,
+            "messages": [{"role": "user", "content": "test"}],
+            "tools": [{"name": "DeferredToolPlaceholder", "defer_loading": true,
+                "input_schema": {"type": "object"}}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert_eq!(body["error"]["message"], message);
+}
+
+#[tokio::test]
 async fn claude_code_protocol_headers_reach_anthropic_without_client_credentials() {
     let received = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let capture = received.clone();

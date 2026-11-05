@@ -297,6 +297,12 @@ pub(crate) fn provider_error_response(
                         None,
                         false,
                     ),
+                    422 => (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        ErrorResponse::invalid_request(&message),
+                        None,
+                        false,
+                    ),
                     413 => (
                         StatusCode::PAYLOAD_TOO_LARGE,
                         ErrorResponse::invalid_request(&message),

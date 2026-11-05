@@ -2961,6 +2961,10 @@ fn upstream_error_to_response(status: u16, body: &str) -> Response {
             StatusCode::BAD_REQUEST,
             &ErrorResponse::invalid_request(&message),
         ),
+        422 => error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &ErrorResponse::invalid_request(&message),
+        ),
         413 => error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             &ErrorResponse::invalid_request(&message),
@@ -4552,6 +4556,35 @@ mod tests {
                     .unwrap()
                     .contains("response budget exceeded")
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_validation_errors_remain_422_for_all_downstream_protocols() {
+        let message = "tools.0.defer_loading: Extra inputs are not permitted";
+        let error = ProviderError::UpstreamError {
+            status: 422,
+            body: json!({"type": "error", "error": {
+                "type": "invalid_request_error", "message": message
+            }})
+            .to_string(),
+        };
+        for response in [
+            provider_error_to_response(&error),
+            crate::downstream::provider_error_response(
+                &DownstreamProtocol::chat_completions("model", false),
+                &error,
+            ),
+            crate::downstream::provider_error_response(
+                &DownstreamProtocol::responses("model", Default::default()),
+                &error,
+            ),
+        ] {
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert_eq!(body["error"]["message"], message);
         }
     }
 
