@@ -1,5 +1,24 @@
 # Changelog
 
+## v6.0.4 - 2026-11-05
+
+### Fixed
+
+- Preserve Anthropic Messages beta/version negotiation headers and include them in inflight request identity, while keeping provider credentials isolated from client authentication.
+- Recognize Claude Code's JSON-encoded conversation identity for ChatGPT continuation and prompt-cache scope, preserve `thinking.display`, and distinguish reasoning effort from structured-output capability checks.
+- Preserve upstream HTTP 422 validation errors across Messages, Chat Completions, and Responses so Claude Code can recover by disabling rejected tool-search capabilities.
+- Share native Messages SSE handling between Anthropic and Copilot, reject premature or empty stream completion, and finish on terminal events without treating later HTTP closure errors as failed replies.
+- Report explicit adaptive `output_config.effort` accurately in request logs using the same field-reading rule as Responses conversion.
+
+### Added
+
+- Added community-derived regressions for tool-reference call/output pairing and reasoning-to-tool-call argument/block transitions.
+- Added the reusable `agent-api-compatibility` skill and evidence reports covering official contracts, community feedback, client artifacts, controlled protocol probes, and validation limits.
+
+### Validation
+
+- Passed all 639 workspace/all-targets tests, formatting checks, and workspace Clippy with warnings denied. Client/protocol validation used isolated Claude Code sessions and local model/MCP fixtures; live model quality, cache hit rates, and production performance remain unmeasured.
+
 ## v6.0.3 - 2026-11-04
 
 ### Changed

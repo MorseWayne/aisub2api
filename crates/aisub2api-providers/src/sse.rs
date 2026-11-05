@@ -1,4 +1,91 @@
+use aisub2api_core::SseEvent;
+use futures::{StreamExt, stream::BoxStream};
 use serde_json::Value;
+
+use crate::http::{fmt_reqwest_err, next_upstream_stream_item};
+use crate::provider::ProviderError;
+
+/// Stream native Messages events with the same completion boundary for
+/// Anthropic and Copilot. A clean HTTP EOF alone does not complete a message.
+pub(crate) fn stream_anthropic_response(
+    response: reqwest::Response,
+    max_sse_frame_bytes: u64,
+) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    tokio::spawn(async move {
+        let mut decoder = SseDecoder::new(max_sse_frame_bytes);
+        let mut byte_stream = response.bytes_stream();
+        let failure = loop {
+            let chunk = match next_upstream_stream_item(byte_stream.next()).await {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(error))) => break ProviderError::Network(fmt_reqwest_err(&error)),
+                Ok(None) => {
+                    break ProviderError::Network(
+                        "upstream Anthropic stream ended before message_stop".to_string(),
+                    );
+                }
+                Err(error) => break error,
+            };
+            if let Err(error) = decoder.push(&chunk) {
+                let _ = tx
+                    .send(Err(ProviderError::ResponseTooLarge(format!(
+                        "SSE frame exceeds configured limit of {} bytes",
+                        error.limit
+                    ))))
+                    .await;
+                return;
+            }
+            while let Some(frame) = decoder.next_frame() {
+                let Some(event) = parse_anthropic_sse_frame(&frame) else {
+                    continue;
+                };
+                let terminal = is_anthropic_terminal_event(&event);
+                if tx.send(Ok(event)).await.is_err() || terminal {
+                    return;
+                }
+            }
+        };
+
+        // A complete final frame may have no trailing blank line. Recover it
+        // even when the HTTP transport reports a chunk/length error at EOF.
+        match decoder.finish() {
+            Ok(Some(frame)) => {
+                if let Some(event) = parse_anthropic_sse_frame(&frame) {
+                    let terminal = is_anthropic_terminal_event(&event);
+                    if tx.send(Ok(event)).await.is_err() || terminal {
+                        return;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = tx
+                    .send(Err(ProviderError::ResponseTooLarge(format!(
+                        "SSE frame exceeds configured limit of {} bytes",
+                        error.limit
+                    ))))
+                    .await;
+                return;
+            }
+        }
+        let _ = tx.send(Err(failure)).await;
+    });
+    Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+pub(crate) fn parse_anthropic_sse_frame(text: &str) -> Option<SseEvent> {
+    let frame = parse_sse_frame(text)?;
+    let data = serde_json::from_str::<Value>(frame.data.trim()).unwrap_or(Value::Null);
+    Some(SseEvent {
+        event: frame.event.unwrap_or_default(),
+        data,
+    })
+}
+
+fn is_anthropic_terminal_event(event: &SseEvent) -> bool {
+    matches!(event.event.as_str(), "message_stop" | "error")
+        || matches!(event.data["type"].as_str(), Some("message_stop" | "error"))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SseFrameTooLarge {
@@ -221,8 +308,140 @@ pub(crate) fn is_sse_done(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     const LIMIT: u64 = 1024;
+
+    async fn native_sse_response(
+        body: &str,
+        extra_declared_bytes: usize,
+        hold_open: bool,
+    ) -> (reqwest::Response, oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = body.to_string();
+        let (release, released) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len() + extra_declared_bytes
+            );
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+            if hold_open {
+                let _ = released.await;
+            }
+        });
+        let response = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        (response, release)
+    }
+
+    #[tokio::test]
+    async fn native_anthropic_stream_requires_message_stop_for_text_and_thinking() {
+        for kind in ["text", "thinking"] {
+            let start = serde_json::json!({"type":"content_block_start", "index":0,
+                "content_block":{"type":kind, kind:""}});
+            let body = format!(
+                "event: message_start\ndata: {{\"type\":\"message_start\",\"message\":{{\"id\":\"msg_partial\",\"content\":[]}}}}\n\nevent: content_block_start\ndata: {start}\n\nevent: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n"
+            );
+            let (response, _release) = native_sse_response(&body, 0, false).await;
+            let events = stream_anthropic_response(response, LIMIT)
+                .collect::<Vec<_>>()
+                .await;
+            assert!(events[..3].iter().all(Result::is_ok));
+            assert!(
+                matches!(events.last(), Some(Err(ProviderError::Network(message)))
+                if message.contains("ended before message_stop"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_anthropic_stream_rejects_empty_success_response() {
+        let (response, _release) = native_sse_response("", 0, false).await;
+        let events = stream_anthropic_response(response, LIMIT)
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], Err(ProviderError::Network(message))
+            if message.contains("ended before message_stop")));
+    }
+
+    #[tokio::test]
+    async fn native_anthropic_stream_recovers_undelimited_stop_at_transport_eof() {
+        let body = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_done\",\"content\":[]}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "data: {\"type\":\"message_stop\"}"
+        );
+        let (response, _release) = native_sse_response(body, 10, false).await;
+        let events = stream_anthropic_response(response, LIMIT)
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(Result::is_ok));
+        assert_eq!(
+            events.last().unwrap().as_ref().unwrap().data["type"],
+            "message_stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_anthropic_stream_completes_before_transport_eof() {
+        let body = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_done\",\"content\":[]}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (response, release) = native_sse_response(body, 10, true).await;
+        let events = tokio::time::timeout(
+            Duration::from_secs(1),
+            stream_anthropic_response(response, LIMIT).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("message_stop must complete without waiting for HTTP EOF");
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(Result::is_ok));
+        let _ = release.send(());
+    }
+
+    #[tokio::test]
+    async fn native_anthropic_stream_preserves_terminal_api_error() {
+        let body = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"local fixture\"}}\n\n";
+        let (response, release) = native_sse_response(body, 10, true).await;
+        let events = tokio::time::timeout(
+            Duration::from_secs(1),
+            stream_anthropic_response(response, LIMIT).collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].as_ref().unwrap().data["error"]["type"],
+            "overloaded_error"
+        );
+        let _ = release.send(());
+    }
 
     #[test]
     fn decoder_returns_complete_frames_and_keeps_partial_tail() {

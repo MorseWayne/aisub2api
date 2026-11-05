@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent API 适配优化"
+  short_description: "结合官方契约、社区反馈和协议复现，分析并优化 Agent API 适配"
+  default_prompt: "使用 $agent-api-compatibility，结合官方契约、社区实现与反馈，复现并改进当前工具的客户端适配。"

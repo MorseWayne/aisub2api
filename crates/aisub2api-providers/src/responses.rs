@@ -10,8 +10,8 @@ use tokio::sync::mpsc;
 
 use crate::http::{fmt_reqwest_err, next_upstream_stream_item};
 use crate::openai_compat::{
-    default_adaptive_reasoning_effort, supports_reasoning_summary, supports_sampling_parameters,
-    thinking_budget_to_reasoning_effort,
+    adaptive_output_effort, default_adaptive_reasoning_effort, supports_reasoning_summary,
+    supports_sampling_parameters, thinking_budget_to_reasoning_effort,
 };
 use crate::provider::{
     ProviderError, ProviderEvent, ProviderRequestObserver, ProviderRequestObserverEvent,
@@ -1280,11 +1280,7 @@ fn convert_reasoning(req: &MessagesRequest, context: ConversionContext<'_>) -> O
         return Some(reasoning_effort_for_context(req, context, effort));
     }
     if thinking.r#type.as_deref() == Some("adaptive") {
-        let effort = req
-            .extra
-            .get("output_config")
-            .and_then(|config| config.get("effort"))
-            .and_then(Value::as_str)
+        let effort = adaptive_output_effort(req)
             .unwrap_or_else(|| default_adaptive_reasoning_effort(&req.model));
         return Some(reasoning_effort_for_context(req, context, effort));
     }
@@ -6831,6 +6827,51 @@ mod tests {
             .find(|event| event.data["content_block"]["type"] == "tool_use")
             .unwrap();
         assert_eq!(start.data["content_block"]["name"], "Read");
+    }
+
+    #[test]
+    fn community_tool_reference_results_preserve_call_output_pairing() {
+        // LiteLLM#36540 reports dropping the entire result when its content
+        // includes tool_reference. Keep the call paired through this adapter.
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"gpt-5.5",
+            "messages":[
+                {"role":"user","content":"find a tool"},
+                {"role":"assistant","content":[{"type":"tool_use","id":"toolu_search","name":"ToolSearch","input":{"query":"lookup"}}]},
+                {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_search","content":[
+                    {"type":"text","text":"Available:"},
+                    {"type":"tool_reference","tool_name":"lookup_record_001"}
+                ]}]}
+            ],
+            "tools":[
+                {"name":"ToolSearch","input_schema":{"type":"object","properties":{"query":{"type":"string"}}}},
+                {"name":"lookup_record_001","defer_loading":true,"input_schema":{"type":"object","properties":{"query":{"type":"string"}}}}
+            ]
+        })).unwrap();
+        let body = convert_to_responses(&request).unwrap();
+        let input = body["input"].as_array().unwrap();
+        let calls: Vec<_> = input
+            .iter()
+            .filter(|item| item["type"] == "function_call")
+            .collect();
+        let outputs: Vec<_> = input
+            .iter()
+            .filter(|item| item["type"] == "function_call_output")
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0]["call_id"], calls[0]["call_id"]);
+        let output = outputs[0]["output"].to_string();
+        assert!(output.contains("Available:"));
+        assert!(output.contains("lookup_record_001"));
+        assert!(
+            body["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == "lookup_record_001"
+                    && tool["parameters"]["properties"]["query"]["type"] == "string")
+        );
     }
 
     #[test]

@@ -243,6 +243,55 @@ async fn start_proxy(settings: Settings) -> String {
 }
 
 #[tokio::test]
+async fn truncated_anthropic_text_stream_is_not_completed_successfully() {
+    let partial = concat!(
+        "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_partial\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[],\"usage\":{\"input_tokens\":4,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"PARTIAL_ONLY\"}}\n\n"
+    );
+    let mock = Router::new().route(
+        "/v1/messages",
+        post(move || async move {
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from(partial))
+                .unwrap()
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let mut settings = test_settings(&upstream, "local-test-key");
+    settings.providers.get_mut("openai").unwrap().provider_type = Some(ProviderType::Anthropic);
+    let proxy = start_proxy(settings).await;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    for endpoint in ["/v1/messages", "/v1/chat/completions"] {
+        let response = client
+            .post(format!("{proxy}{endpoint}"))
+            .header("x-api-key", "local-test-key")
+            .json(&json!({
+                "model":"openai/claude-sonnet-4-6", "stream":true,
+                "messages":[{"role":"user","content":"local fixture"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("PARTIAL_ONLY"));
+        assert!(
+            body.contains("ended before message_stop"),
+            "{endpoint}: {body}"
+        );
+        assert!(body.contains("\"error\""));
+        assert!(!body.contains("\"finish_reason\":\"stop\""));
+    }
+}
+
+#[tokio::test]
 async fn upstream_validation_errors_preserve_messages_recovery_contract() {
     let message = "tools.0.defer_loading: Extra inputs are not permitted";
     let mock = Router::new().route(

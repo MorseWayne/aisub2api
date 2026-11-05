@@ -1,81 +1,11 @@
+pub(super) use crate::sse::stream_anthropic_response as stream_anthropic_sse_response;
+
+#[cfg(test)]
+use crate::sse::parse_anthropic_sse_frame as parse_anthropic_sse_text;
+#[cfg(test)]
 use aisub2api_core::SseEvent;
-use futures::StreamExt;
-use futures::stream::BoxStream;
+#[cfg(test)]
 use serde_json::Value;
-use tokio::sync::mpsc;
-
-use crate::http::{fmt_reqwest_err, next_upstream_stream_item};
-use crate::provider::ProviderError;
-use crate::sse::{SseDecoder, parse_sse_frame};
-
-pub(super) fn stream_anthropic_sse_response(
-    response: reqwest::Response,
-    max_sse_frame_bytes: u64,
-) -> BoxStream<'static, Result<SseEvent, ProviderError>> {
-    let (tx, rx) = mpsc::channel::<Result<SseEvent, ProviderError>>(64);
-
-    tokio::spawn(async move {
-        let mut decoder = SseDecoder::new(max_sse_frame_bytes);
-        let mut byte_stream = response.bytes_stream();
-
-        loop {
-            let chunk_result = match next_upstream_stream_item(byte_stream.next()).await {
-                Ok(Some(chunk_result)) => chunk_result,
-                Ok(None) => break,
-                Err(error) => {
-                    let _ = tx.send(Err(error)).await;
-                    return;
-                }
-            };
-
-            match chunk_result {
-                Ok(chunk) => {
-                    if let Err(error) = decoder.push(&chunk) {
-                        let _ = tx
-                            .send(Err(ProviderError::ResponseTooLarge(format!(
-                                "SSE frame exceeds configured limit of {} bytes",
-                                error.limit
-                            ))))
-                            .await;
-                        return;
-                    }
-                    while let Some(event_text) = decoder.next_frame() {
-                        if let Some(event) = parse_anthropic_sse_text(&event_text)
-                            && tx.send(Ok(event)).await.is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx
-                        .send(Err(ProviderError::Network(fmt_reqwest_err(&e))))
-                        .await;
-                    return;
-                }
-            }
-        }
-
-        match decoder.finish() {
-            Ok(Some(event_text)) => {
-                if let Some(event) = parse_anthropic_sse_text(&event_text) {
-                    let _ = tx.send(Ok(event)).await;
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                let _ = tx
-                    .send(Err(ProviderError::ResponseTooLarge(format!(
-                        "SSE frame exceeds configured limit of {} bytes",
-                        error.limit
-                    ))))
-                    .await;
-            }
-        }
-    });
-
-    Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
-}
 
 #[cfg(test)]
 fn parse_anthropic_sse(bytes: &[u8]) -> SseEvent {
@@ -83,16 +13,6 @@ fn parse_anthropic_sse(bytes: &[u8]) -> SseEvent {
     parse_anthropic_sse_text(&text).unwrap_or_else(|| SseEvent {
         event: String::new(),
         data: Value::Null,
-    })
-}
-
-fn parse_anthropic_sse_text(text: &str) -> Option<SseEvent> {
-    let frame = parse_sse_frame(text)?;
-    let data = serde_json::from_str::<Value>(frame.data.trim()).unwrap_or(Value::Null);
-
-    Some(SseEvent {
-        event: frame.event.unwrap_or_default(),
-        data,
     })
 }
 

@@ -59,9 +59,21 @@ fn explicit_reasoning_source(request: &MessagesRequest) -> Option<&'static str> 
         Some("explicit:reasoning")
     } else if request.extra.contains_key("reasoning_effort") {
         Some("explicit:reasoning_effort")
+    } else if adaptive_output_effort(request).is_some() {
+        Some("explicit:output_config.effort")
     } else {
         None
     }
+}
+
+/// Explicit Anthropic effort is used by adaptive thinking after the legacy
+/// budget path. Keep diagnostics and Responses conversion on the same rule.
+pub(crate) fn adaptive_output_effort(request: &MessagesRequest) -> Option<&str> {
+    let thinking = request.thinking.as_ref()?;
+    if thinking.r#type.as_deref() != Some("adaptive") || thinking.budget_tokens.is_some() {
+        return None;
+    }
+    request.extra.get("output_config")?.get("effort")?.as_str()
 }
 
 fn thinking_reasoning_source(request: &MessagesRequest) -> Option<&'static str> {
@@ -117,7 +129,11 @@ fn request_reasoning_effort(request: &MessagesRequest) -> Option<String> {
         );
     }
     if thinking.r#type.as_deref() == Some("adaptive") {
-        return Some(default_adaptive_reasoning_effort(&request.model).to_string());
+        return Some(
+            adaptive_output_effort(request)
+                .unwrap_or_else(|| default_adaptive_reasoning_effort(&request.model))
+                .to_string(),
+        );
     }
     if thinking.r#type.as_deref() == Some("enabled") {
         return Some("medium".to_string());
@@ -1242,6 +1258,61 @@ mod tests {
         assert_eq!(info.model, "gpt-5.4-mini");
         assert_eq!(info.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(info.reasoning_source, "explicit:reasoning_effort");
+    }
+
+    #[test]
+    fn request_log_info_matches_adaptive_responses_effort() {
+        for (controls, expected_effort, expected_source) in [
+            (
+                json!({"thinking":{"type":"adaptive"}, "output_config":{"effort":"low"}}),
+                "low",
+                "explicit:output_config.effort",
+            ),
+            (
+                json!({"thinking":{"type":"adaptive"}, "output_config":{"effort":"max"}}),
+                "max",
+                "explicit:output_config.effort",
+            ),
+            (json!({"thinking":{"type":"adaptive"}}), "high", "thinking"),
+            (
+                json!({"thinking":{"type":"adaptive"}, "output_config":{"effort":null}}),
+                "high",
+                "thinking",
+            ),
+            (
+                json!({"thinking":{"type":"disabled"}, "output_config":{"effort":"low"}}),
+                "none",
+                "thinking",
+            ),
+            (
+                json!({"thinking":{"type":"enabled","budget_tokens":8192}, "output_config":{"effort":"low"}}),
+                "medium",
+                "thinking",
+            ),
+            (
+                json!({"thinking":{"type":"adaptive"}, "output_config":{"effort":"low"}, "reasoning_effort":"high"}),
+                "high",
+                "explicit:reasoning_effort",
+            ),
+            (
+                json!({"thinking":{"type":"adaptive"}, "output_config":{"effort":"low"}, "reasoning":{"effort":"medium"}}),
+                "medium",
+                "explicit:reasoning",
+            ),
+        ] {
+            let mut value =
+                json!({"model":"gpt-5.5", "messages":[{"role":"user","content":"local fixture"}]});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(controls.as_object().unwrap().clone());
+            let request: MessagesRequest = serde_json::from_value(value).unwrap();
+            let body = crate::responses::convert_to_responses(&request).unwrap();
+            let info = openai_request_log_info(&request);
+            assert_eq!(body["reasoning"]["effort"], expected_effort);
+            assert_eq!(info.reasoning_effort.as_deref(), Some(expected_effort));
+            assert_eq!(info.reasoning_source, expected_source);
+        }
     }
 
     #[test]

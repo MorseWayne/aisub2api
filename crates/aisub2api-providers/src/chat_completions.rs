@@ -1168,6 +1168,80 @@ mod tests {
     }
 
     #[test]
+    fn community_reasoning_tool_call_and_trailing_text_keep_block_types_and_arguments() {
+        // Regression shape reported in claude-code-router#1397. This is a
+        // synthetic stream, not a copied user trace.
+        let mut converter = StreamConverter::new();
+        let mut events = Vec::new();
+        for (delta, finish_reason) in [
+            (json!({"reasoning_content":"check the command"}), None),
+            (
+                json!({"tool_calls":[{"index":0,"id":"call_local","function":{"name":"Bash","arguments":"{\"command\":\""}}]}),
+                None,
+            ),
+            (
+                json!({"tool_calls":[{"index":0,"function":{"arguments":"printf ok\"}"}}]}),
+                None,
+            ),
+            (json!({"content":"\n"}), None),
+            (json!({}), Some("tool_calls")),
+        ] {
+            let frame = format!(
+                "data: {}",
+                json!({
+                    "id":"local-fixture", "model":"local-reasoning-model",
+                    "choices":[{"index":0,"delta":delta,"finish_reason":finish_reason}]
+                })
+            );
+            events.extend(converter.process_chunk(&parse_openai_chunk(&frame).unwrap()));
+        }
+        let mut open = std::collections::HashMap::new();
+        let mut tool_arguments = String::new();
+        let mut tool_starts = 0;
+        for event in &events {
+            let index = event.data["index"].as_u64().unwrap_or_default();
+            match event.data["type"].as_str() {
+                Some("content_block_start") => {
+                    let kind = event.data["content_block"]["type"].as_str().unwrap();
+                    assert!(open.insert(index, kind).is_none());
+                    if kind == "tool_use" {
+                        tool_starts += 1;
+                        assert_eq!(event.data["content_block"]["name"], "Bash");
+                    }
+                }
+                Some("content_block_delta") => {
+                    let expected = match event.data["delta"]["type"].as_str().unwrap() {
+                        "text_delta" => "text",
+                        "thinking_delta" => "thinking",
+                        "input_json_delta" => {
+                            tool_arguments
+                                .push_str(event.data["delta"]["partial_json"].as_str().unwrap());
+                            "tool_use"
+                        }
+                        other => panic!("unexpected delta {other}"),
+                    };
+                    assert_eq!(open.get(&index), Some(&expected));
+                }
+                Some("content_block_stop") => {
+                    assert!(open.remove(&index).is_some());
+                }
+                _ => {}
+            }
+        }
+        assert!(open.is_empty());
+        assert_eq!(tool_starts, 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&tool_arguments).unwrap(),
+            json!({"command":"printf ok"})
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.data["delta"]["stop_reason"] == "tool_use")
+        );
+    }
+
+    #[test]
     fn test_stream_converter_text() {
         let mut converter = StreamConverter::new();
 
