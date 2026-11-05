@@ -1,5 +1,28 @@
 # Changelog
 
+## v6.0.6 - 2026-11-06
+
+### Fixed
+
+- Recover explicit ChatGPT Messages SSE overloads before output is exposed, with a bounded startup window and a shared HTTP/SSE retry allowance. Text, thinking, tool calls and unknown events commit the stream; requests are not transparently replayed afterward. Native Responses and WebSocket recovery retain their existing behavior.
+- Preserve Anthropic streaming error types, server retry advice and Codex request IDs, including HTTP request-ID fallback when an SSE error already carries metadata. Long Retry-After values are returned without early retry, and capacity-related HTTP 429 remains 429.
+- Preserve upstream HTTP 403 responses and terminal retry guidance across downstream protocols instead of triggering invalid retries.
+
+### Added
+
+- Automatically synchronize Claude Code compatibility defaults after valid CLI/TUI configuration changes and server startup, preserving explicit tool-search choices, output budgets and model roles.
+- Document and validate per-model Full-lane opt-in for Claude Code: GPT-5.6 Sol, GPT-6.1 Sol and Astra can use Full, while Luna retains Lite. Validation includes real Claude Code, deferred MCP tools, multi-turn history, cache accounting and WebSocket continuation.
+
+### Configuration
+
+- Recovery and diagnostic fixes activate on upgrade; no token migration is required.
+- Parallel tools remain opt-in: keep `chatgpt.responses_lite = "auto"` and set `model_capabilities.<upstream model>.responses_lite` per model. Global `on/off` overrides model choices. Merge fields into existing tables and retain Lite for Luna; this policy also affects native Responses on the same provider.
+
+### Validation
+
+- Passed all 662 workspace/all-targets tests. The focused provider/server suite contains 566 tests; the final candidate also passed four isolated HTTP request-ID smoke cases. Workspace Clippy with warnings denied, formatting and release build checks passed.
+- Real-model evidence covers multiple models and transports, including roughly 26K-token histories and on-wire high-effort parameters. These controlled samples do not establish production reliability, quota savings or high-effort reasoning quality; the detailed evidence report records versions and limits.
+
 ## v6.0.5 - 2026-11-05
 
 ### Fixed
