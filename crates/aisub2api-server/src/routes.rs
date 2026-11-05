@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::hash::Hasher;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -199,7 +199,8 @@ pub(crate) async fn execute_messages_request(
 
     // --- Concurrent request deduplication ---
     // Compute a hash of the full request to identify identical inflight requests.
-    let request_hash = compute_request_hash(&resolved.request);
+    let protocol_headers = anthropic_messages_request_headers(&headers, &resolved.provider_type);
+    let request_hash = compute_request_hash(&resolved.request, &protocol_headers);
 
     let broadcast_tx = match register_or_subscribe_inflight_request(&state, request_hash).await {
         InflightRegistration::Leader(sender) => sender,
@@ -287,7 +288,7 @@ pub(crate) async fn execute_messages_request(
 
     // Call provider (registry lock is no longer held)
     match provider
-        .chat_with_observer(resolved.request, provider_observer)
+        .chat_with_headers(resolved.request, protocol_headers, provider_observer)
         .await
     {
         Ok(stream) => {
@@ -634,6 +635,24 @@ fn native_responses_request_headers(headers: &HeaderMap) -> HeaderMap {
     forwarded
 }
 
+fn anthropic_messages_request_headers(
+    headers: &HeaderMap,
+    provider_type: &ProviderType,
+) -> HeaderMap {
+    let mut forwarded = HeaderMap::new();
+    if matches!(
+        provider_type,
+        ProviderType::Anthropic | ProviderType::CustomAnthropic(_)
+    ) {
+        for name in ["anthropic-beta", "anthropic-version"] {
+            for value in headers.get_all(name) {
+                forwarded.append(HeaderName::from_static(name), value.clone());
+            }
+        }
+    }
+    forwarded
+}
+
 fn attach_native_responses_headers(response: &mut Response, upstream: &HeaderMap) {
     for (name, value) in upstream {
         let name_text = name.as_str();
@@ -729,7 +748,11 @@ impl RequestFeatures {
                 .is_some_and(|tools| !tools.is_empty()),
             tool_choice: request.tool_choice.is_some(),
             thinking: request.thinking.is_some(),
-            reasoning_effort: request.extra.contains_key("reasoning_effort"),
+            reasoning_effort: request.extra.contains_key("reasoning_effort")
+                || request
+                    .extra
+                    .get("output_config")
+                    .is_some_and(|config| config.get("effort").is_some()),
             vision: request_uses_vision(request),
             sampling: request.temperature.is_some()
                 || request.top_p.is_some()
@@ -741,7 +764,10 @@ impl RequestFeatures {
             prompt_cache_key: request.extra.contains_key("prompt_cache_key"),
             fast_mode: request.extra.contains_key("service_tier")
                 || request.extra.contains_key("fast_mode"),
-            structured_outputs: request.extra.contains_key("output_config")
+            structured_outputs: request
+                .extra
+                .get("output_config")
+                .is_some_and(|config| config.get("format").is_some())
                 || request.extra.contains_key("response_format"),
             strict_tools: request.extra.get("strict_tools").and_then(Value::as_bool) == Some(true),
             token_efficient_tools: request.extra.contains_key("token_efficient_tools"),
@@ -3091,12 +3117,18 @@ fn merge_usage_snapshot(snapshot: &TokenUsage, usage: &mut TokenUsage) {
 }
 
 /// Compute a hash of the request for deduplication purposes.
-/// Two requests with the same model, messages, system, tools, and parameters
-/// will produce the same hash.
-fn compute_request_hash(request: &MessagesRequest) -> u64 {
+/// Protocol negotiation is part of request identity: requests with different
+/// beta features or API versions must not share an upstream response.
+fn compute_request_hash(request: &MessagesRequest, protocol_headers: &HeaderMap) -> u64 {
     let mut hasher = DefaultHasher::new();
     let mut writer = HashWriter(&mut hasher);
     let _ = serde_json::to_writer(&mut writer, request);
+    for name in ["anthropic-beta", "anthropic-version"] {
+        name.hash(&mut hasher);
+        for value in protocol_headers.get_all(name) {
+            value.hash(&mut hasher);
+        }
+    }
     hasher.finish()
 }
 
@@ -3767,6 +3799,7 @@ mod tests {
         request.thinking = Some(ThinkingConfig {
             r#type: Some("adaptive".to_string()),
             budget_tokens: None,
+            ..Default::default()
         });
         request
             .extra
@@ -4949,6 +4982,7 @@ mod tests {
         request.thinking = Some(ThinkingConfig {
             r#type: Some("enabled".to_string()),
             budget_tokens: Some(1024),
+            ..Default::default()
         });
         request.tools = Some(vec![Tool {
             name: "read".to_string(),
@@ -5004,6 +5038,87 @@ mod tests {
         assert!(features.strict_tools);
         assert!(features.token_efficient_tools);
         assert!(features.context_management);
+    }
+
+    #[test]
+    fn claude_code_effort_does_not_require_structured_outputs() {
+        let request: MessagesRequest = serde_json::from_str(include_str!(
+            "../tests/fixtures/claude_code/messages_request.json"
+        ))
+        .unwrap();
+        let capabilities = ModelCapabilities {
+            features: FeatureCapabilities {
+                reasoning_effort: CapabilityState::Supported,
+                ..Default::default()
+            },
+            quality: QualityGateCapabilities {
+                structured_outputs: CapabilityState::Unsupported,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let features = RequestFeatures::from_request(&request);
+        assert!(features.reasoning_effort);
+        assert!(!features.structured_outputs);
+        validate_request_capabilities("test", &request.model, &capabilities, &features).unwrap();
+
+        let mut request = request;
+        request.extra.get_mut("output_config").unwrap()["format"] =
+            json!({"type": "json_schema", "schema": {"type": "object"}});
+        let error = validate_request_capabilities(
+            "test",
+            &request.model,
+            &capabilities,
+            &RequestFeatures::from_request(&request),
+        )
+        .unwrap_err();
+        assert!(error.error.message.contains("structured outputs"));
+    }
+
+    #[test]
+    fn anthropic_protocol_headers_are_scoped_and_part_of_inflight_identity() {
+        let request = request_with_system(None);
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("effort-2025-11-24"),
+        );
+        headers.append(
+            "anthropic-beta",
+            HeaderValue::from_static("context-management-2025-06-27"),
+        );
+        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static("Bearer client-secret"),
+        );
+        headers.insert("cookie", HeaderValue::from_static("client-cookie"));
+        let forwarded = anthropic_messages_request_headers(&headers, &ProviderType::Anthropic);
+        assert_eq!(forwarded.get_all("anthropic-beta").iter().count(), 2);
+        assert_eq!(forwarded["anthropic-version"], "2023-06-01");
+        assert!(forwarded.get("authorization").is_none());
+        assert!(forwarded.get("cookie").is_none());
+        let baseline = compute_request_hash(&request, &forwarded);
+        let mut other = forwarded.clone();
+        other.insert("anthropic-beta", HeaderValue::from_static("other-beta"));
+        assert_ne!(baseline, compute_request_hash(&request, &other));
+        other = forwarded.clone();
+        other.insert("anthropic-version", HeaderValue::from_static("2026-01-01"));
+        assert_ne!(baseline, compute_request_hash(&request, &other));
+        assert_eq!(
+            anthropic_messages_request_headers(
+                &headers,
+                &ProviderType::CustomAnthropic("gateway".to_string())
+            ),
+            forwarded
+        );
+        for provider in [
+            ProviderType::OpenAI,
+            ProviderType::ChatGPT,
+            ProviderType::Copilot,
+        ] {
+            assert!(anthropic_messages_request_headers(&headers, &provider).is_empty());
+        }
     }
 
     #[test]

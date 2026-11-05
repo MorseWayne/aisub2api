@@ -1,5 +1,9 @@
 # Claude Code Third-Party Provider Quality Gates
 
+> 历史调研记录：以下门控结论来自 2026-05-28，不代表当前 Claude Code。
+> 当前已验证的 2.1.318 行为、适配修复与未覆盖项见
+> [2026-11-05 协议适配调研](../../reviews/2026-11-05-claude-code-rea-alignment.md)。
+
 Date: 2026-05-28
 Status: Research notes for provider design
 Scope: `aisub2api` provider compatibility and Claude Code parity

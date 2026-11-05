@@ -243,6 +243,95 @@ async fn start_proxy(settings: Settings) -> String {
 }
 
 #[tokio::test]
+async fn claude_code_protocol_headers_reach_anthropic_without_client_credentials() {
+    let received = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let capture = received.clone();
+    let mock = Router::new().route(
+        "/v1/messages",
+        post(
+            move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                let capture = capture.clone();
+                async move {
+                    capture.lock().await.push((headers.clone(), body.clone()));
+                    // Keep both identical bodies inflight to exercise header-aware
+                    // deduplication through the real server and provider boundary.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    Json(json!({
+                        "id": "msg-claude-fixture", "type": "message", "role": "assistant",
+                        "model": body["model"], "content": [{"type": "text", "text": "OK"}],
+                        "stop_reason": "end_turn", "stop_sequence": null,
+                        "usage": {"input_tokens": 10, "output_tokens": 1}
+                    }))
+                }
+            },
+        ),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+    let mut settings = test_settings(&upstream, "downstream-token");
+    settings.providers.get_mut("openai").unwrap().provider_type =
+        Some(ProviderType::CustomAnthropic("gateway".to_string()));
+    let proxy = start_proxy(settings).await;
+    let mut body: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/claude_code/messages_request.json")).unwrap();
+    body["model"] = json!("openai/claude-sonnet-4-6");
+    body["stream"] = json!(false);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let call = |beta| {
+        client
+            .post(format!("{proxy}/v1/messages?beta=true"))
+            .header("x-api-key", "downstream-token")
+            .header("authorization", "Bearer downstream-token")
+            .header("cookie", "client-cookie=do-not-forward")
+            .header("anthropic-beta", "context-management-2025-06-27")
+            .header("anthropic-beta", beta)
+            .header("anthropic-version", "2023-01-01")
+            .json(&body)
+            .send()
+    };
+    let (first, second) = tokio::join!(call("effort-2025-11-24"), call("other-client-beta"));
+    for response in [first.unwrap(), second.unwrap()] {
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["content"][0]["text"], "OK");
+    }
+    let captured = received.lock().await;
+    assert_eq!(
+        captured.len(),
+        2,
+        "different beta sets must not share an upstream request"
+    );
+    let mut betas = Vec::new();
+    for (headers, body) in captured.iter() {
+        assert_eq!(headers["x-api-key"], "test-key");
+        assert!(headers.get("authorization").is_none());
+        assert!(headers.get("cookie").is_none());
+        assert_eq!(headers["anthropic-version"], "2023-01-01");
+        let values: Vec<_> = headers
+            .get_all("anthropic-beta")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], "context-management-2025-06-27");
+        betas.push(values[1].to_string());
+        assert_eq!(body["model"], "claude-sonnet-4-6");
+        assert_eq!(body["output_config"]["effort"], "low");
+        assert_eq!(body["thinking"]["display"], "updates");
+        assert_eq!(body["tools"][0]["eager_input_streaming"], true);
+        assert_eq!(body["context_management"]["edits"][0]["keep"], "all");
+        assert!(body.get("anthropic-beta").is_none());
+    }
+    betas.sort();
+    assert_eq!(betas, ["effort-2025-11-24", "other-client-beta"]);
+}
+
+#[tokio::test]
 async fn astra_model_catalog_and_messages_use_responses_capabilities() {
     let mock = Router::new()
         .route("/models", get(|| async { Json(json!({"data":[{"id":"gpt-6-astra"}]})) }))

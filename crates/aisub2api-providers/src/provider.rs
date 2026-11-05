@@ -446,6 +446,17 @@ pub trait Provider: Send + Sync {
         self.chat(request).await
     }
 
+    /// Carry client Messages protocol headers separately from the JSON body.
+    /// Adapters translating to another protocol keep their existing behavior.
+    async fn chat_with_headers(
+        &self,
+        request: MessagesRequest,
+        _headers: HeaderMap,
+        observer: Option<ProviderRequestObserver>,
+    ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
+        self.chat_with_observer(request, observer).await
+    }
+
     /// Send an already-canonical OpenAI Responses request without translating
     /// its input items through the Anthropic Messages representation.
     async fn responses(

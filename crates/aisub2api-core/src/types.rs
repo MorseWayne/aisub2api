@@ -470,12 +470,15 @@ fn take_string(object: &mut serde_json::Map<String, Value>, key: &str) -> Option
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThinkingConfig {
     #[serde(default)]
     pub r#type: Option<String>,
     #[serde(default)]
     pub budget_tokens: Option<u32>,
+    /// Native Anthropic thinking presentation requested by the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
 }
 
 /// A unified SSE event from any provider.
@@ -1278,5 +1281,26 @@ mod tests {
 
         assert_eq!(output, input);
         assert!(output.get("input_schema").is_none());
+    }
+
+    #[test]
+    fn thinking_display_survives_messages_request_round_trip() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": "hello"}],
+            "thinking": {"type": "adaptive", "display": "updates"}
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["thinking"]["display"],
+            "updates"
+        );
+        let thinking: ThinkingConfig = serde_json::from_value(json!({"type": "adaptive"})).unwrap();
+        assert!(
+            serde_json::to_value(thinking)
+                .unwrap()
+                .get("display")
+                .is_none()
+        );
     }
 }

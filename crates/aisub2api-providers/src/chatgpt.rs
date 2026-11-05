@@ -3204,13 +3204,32 @@ fn ensure_chatgpt_stable_client_conversation_id(
         return (request, false);
     }
 
-    let Some(session_id) = synthetic_chatgpt_client_session_id(&request) else {
+    // Claude Code carries its conversation identity inside a JSON-encoded
+    // metadata.user_id. A device/user identity alone is not a conversation.
+    let claude_session_id = request
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("user_id"))
+        .and_then(Value::as_str)
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| {
+            value
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    let synthesized = claude_session_id.is_none();
+    let Some(session_id) =
+        claude_session_id.or_else(|| synthetic_chatgpt_client_session_id(&request))
+    else {
         return (request, false);
     };
     request
         .extra
         .insert("client_session_id".to_string(), Value::String(session_id));
-    (request, true)
+    (request, synthesized)
 }
 
 fn synthetic_chatgpt_client_session_id(request: &MessagesRequest) -> Option<String> {
@@ -5338,6 +5357,7 @@ mod tests {
             thinking: Some(ThinkingConfig {
                 r#type: Some("disabled".to_string()),
                 budget_tokens: None,
+                ..Default::default()
             }),
             metadata: None,
             extra: HashMap::from([("reasoning".to_string(), json!({"effort": "minimal"}))]),
@@ -6015,6 +6035,59 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_uses_claude_code_conversation_identity_across_compaction() {
+        for (session_id, prompt) in [
+            ("claude-session-318", "first task"),
+            ("claude-session-318", "This is a compacted conversation"),
+            ("other-claude-session", "first task"),
+        ] {
+            let request: MessagesRequest = serde_json::from_value(json!({
+                "model": "gpt-5.5",
+                "messages": [{"role": "user", "content": prompt}],
+                "metadata": {"user_id": json!({
+                    "device_id": "same-device", "account_uuid": "", "session_id": session_id
+                }).to_string()}
+            }))
+            .unwrap();
+            let (request, synthesized) = ensure_chatgpt_stable_client_conversation_id(request);
+            assert!(!synthesized);
+            assert_eq!(
+                responses::stable_client_conversation_id_for_continuation(&request).as_deref(),
+                Some(session_id)
+            );
+            let body = build_chatgpt_responses_body(&request);
+            assert_eq!(body["prompt_cache_key"], session_id);
+            assert!(body.get("client_session_id").is_none());
+        }
+    }
+
+    #[test]
+    fn chatgpt_does_not_use_claude_user_or_device_identity_as_conversation() {
+        for user_id in [
+            "client-user",
+            "{",
+            r#"{"device_id":"same-device"}"#,
+            r#"{"session_id":42}"#,
+            r#"{"session_id":"  "}"#,
+        ] {
+            let request: MessagesRequest = serde_json::from_value(json!({
+                "model": "gpt-5.5",
+                "messages": [{"role": "user", "content": "first task"}],
+                "metadata": {"user_id": user_id}
+            }))
+            .unwrap();
+            let (request, synthesized) = ensure_chatgpt_stable_client_conversation_id(request);
+            assert!(synthesized);
+            assert!(
+                request.extra["client_session_id"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("cp-synth-")
+            );
+        }
+    }
+
+    #[test]
     fn chatgpt_preserves_existing_stable_conversation_id() {
         let mut extra = std::collections::HashMap::new();
         extra.insert("client_session_id".to_string(), json!("explicit-session"));
@@ -6034,7 +6107,7 @@ mod tests {
             tools: None,
             tool_choice: None,
             thinking: None,
-            metadata: None,
+            metadata: Some(json!({"user_id": "{\"session_id\":\"claude-session\"}"})),
             extra,
         };
 
@@ -6381,6 +6454,7 @@ mod tests {
             thinking: Some(ThinkingConfig {
                 r#type: Some("adaptive".to_string()),
                 budget_tokens: None,
+                ..Default::default()
             }),
             metadata: None,
             extra: Default::default(),

@@ -16,7 +16,7 @@ use crate::http::{
     ResponsePayloadLimits, apply_extra_ca_certs, fmt_reqwest_err, map_upstream_response,
     next_upstream_stream_item, read_upstream_response_text, send_upstream_request,
 };
-use crate::provider::{Provider, ProviderError, ProviderEvent};
+use crate::provider::{Provider, ProviderError, ProviderEvent, ProviderRequestObserver};
 use crate::sse::{SseDecoder, parse_sse_frame};
 use crate::tool_choice::normalize_for_anthropic_messages;
 
@@ -89,6 +89,16 @@ impl Provider for AnthropicProvider {
         &self,
         request: MessagesRequest,
     ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
+        self.chat_with_headers(request, reqwest::header::HeaderMap::new(), None)
+            .await
+    }
+
+    async fn chat_with_headers(
+        &self,
+        request: MessagesRequest,
+        headers: reqwest::header::HeaderMap,
+        _observer: Option<ProviderRequestObserver>,
+    ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
         let url = format!("{}/v1/messages", self.base_url);
 
         // Serialize request and inject cache_control for prompt caching
@@ -101,7 +111,15 @@ impl Provider for AnthropicProvider {
 
         debug!("Anthropic request to {url}");
 
-        let response = send_upstream_request(self.client.post(&url).json(&body)).await?;
+        let mut upstream_request = self.client.post(&url).json(&body);
+        // Only protocol negotiation belongs to the client. Authentication and
+        // routing continue to come from this provider's configuration.
+        for name in ["anthropic-beta", "anthropic-version"] {
+            for value in headers.get_all(name) {
+                upstream_request = upstream_request.header(name, value.clone());
+            }
+        }
+        let response = send_upstream_request(upstream_request).await?;
 
         if !response.status().is_success() {
             return Err(map_upstream_response(response).await);

@@ -23,6 +23,7 @@ pub(super) fn apply_model_limits(
 
     if request.thinking.is_none() && model_can_think(model_info) {
         request.thinking = Some(ThinkingConfig {
+            display: None,
             r#type: Some(
                 if features.adaptive_thinking.is_supported() {
                     "adaptive"
@@ -280,6 +281,7 @@ mod tests {
         request.thinking = Some(ThinkingConfig {
             r#type: Some("adaptive".to_string()),
             budget_tokens: None,
+            ..Default::default()
         });
         request.extra = HashMap::from([(
             "output_config".to_string(),
@@ -295,6 +297,7 @@ mod tests {
         request.thinking = Some(ThinkingConfig {
             r#type: Some("enabled".to_string()),
             budget_tokens: Some(12_000),
+            ..Default::default()
         });
 
         assert_eq!(
@@ -310,6 +313,7 @@ mod tests {
         request.thinking = Some(ThinkingConfig {
             r#type: Some("disabled".to_string()),
             budget_tokens: None,
+            ..Default::default()
         });
         request.extra = HashMap::from([(
             "output_config".to_string(),

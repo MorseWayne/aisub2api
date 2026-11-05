@@ -351,6 +351,7 @@ mod tests {
         request.thinking = Some(ThinkingConfig {
             r#type: Some("enabled".to_string()),
             budget_tokens: Some(8192),
+            ..Default::default()
         });
         request.extra = HashMap::from([(
             "output_config".to_string(),
@@ -379,6 +380,7 @@ mod tests {
         request.thinking = Some(ThinkingConfig {
             r#type: Some("disabled".to_string()),
             budget_tokens: None,
+            ..Default::default()
         });
 
         let (body, stats) = prepare_messages_request(&mut request, None).expect("body");

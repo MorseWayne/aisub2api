@@ -1,0 +1,17 @@
+{
+  "model": "claude-sonnet-4-6",
+  "messages": [{"role": "user", "content": "Return LOCAL_RESEARCH_OK."}],
+  "system": [{"type": "text", "text": "Local protocol compatibility fixture."}],
+  "tools": [{
+    "name": "Read",
+    "description": "Read a local fixture.",
+    "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]},
+    "eager_input_streaming": true
+  }],
+  "metadata": {"user_id": "{\"device_id\":\"local-fixture\",\"account_uuid\":\"\",\"session_id\":\"00000000-0000-4000-8000-000000000318\"}"},
+  "max_tokens": 32000,
+  "thinking": {"type": "adaptive", "display": "updates"},
+  "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+  "output_config": {"effort": "low"},
+  "stream": true
+}

@@ -1264,6 +1264,7 @@ mod tests {
             thinking: Some(ThinkingConfig {
                 r#type: Some("enabled".to_string()),
                 budget_tokens: Some(4096),
+                ..Default::default()
             }),
             metadata: None,
             extra: Default::default(),
@@ -1302,6 +1303,7 @@ mod tests {
                 thinking: Some(ThinkingConfig {
                     r#type: Some("enabled".to_string()),
                     budget_tokens: Some(budget_tokens),
+                    ..Default::default()
                 }),
                 metadata: None,
                 extra: Default::default(),
@@ -1334,6 +1336,7 @@ mod tests {
             thinking: Some(ThinkingConfig {
                 r#type: Some("enabled".to_string()),
                 budget_tokens: Some(31_999),
+                ..Default::default()
             }),
             metadata: None,
             extra: Default::default(),
@@ -1365,6 +1368,7 @@ mod tests {
             thinking: Some(ThinkingConfig {
                 r#type: Some("adaptive".to_string()),
                 budget_tokens: None,
+                ..Default::default()
             }),
             metadata: None,
             extra: Default::default(),
