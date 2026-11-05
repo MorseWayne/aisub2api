@@ -1819,7 +1819,7 @@ async fn stream_leader_response(
         request_hash,
         broadcast_tx,
         permits,
-        start: _,
+        start,
         observer_state,
         observability,
         stream_config,
@@ -2066,8 +2066,8 @@ async fn stream_leader_response(
         let _ = broadcast_tx.send(InflightEvent::Done);
         inflight_map.lock().await.remove(&request_hash);
         metrics.remove_active_stream(&request_id).await;
-        let latency_ms = task_start.elapsed().as_millis() as u64;
-        timing.stream_duration_ms = latency_ms;
+        timing.stream_duration_ms = task_start.elapsed().as_millis() as u64;
+        let latency_ms = start.elapsed().as_millis() as u64;
         if had_error {
             metrics.record_error();
         }
@@ -2663,6 +2663,10 @@ pub async fn admin_metrics(State(state): State<AppState>, headers: HeaderMap) ->
     let provider_health = state.provider_health_snapshot(provider_ids).await;
     let mut metrics = state.metrics.to_json().await;
     if let Some(object) = metrics.as_object_mut() {
+        object.insert(
+            "server_version".to_string(),
+            json!(env!("CARGO_PKG_VERSION")),
+        );
         object.insert("model_capabilities".to_string(), model_capabilities);
         object.insert(
             "model_cache".to_string(),
@@ -3542,6 +3546,72 @@ mod tests {
         drop(event_tx);
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn stream_latency_includes_time_before_upstream_stream_started() {
+        let state = AppState::new(settings_with_provider(ProviderType::OpenAI), None);
+        let request = RequestMetricsContext {
+            provider_id: "test".to_string(),
+            model: "model".to_string(),
+            initiator: "user",
+        };
+        let (broadcast_tx, _follower) = broadcast::channel::<InflightEvent>(8);
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .unwrap();
+        // Represents time already spent routing/connecting before Provider::chat
+        // returns its stream; no wall-clock sleep is needed for this regression.
+        let start = std::time::Instant::now() - Duration::from_millis(500);
+        let stream = futures::stream::iter([Ok(SseEvent {
+            event: "message_stop".to_string(),
+            data: json!({"type":"message_stop"}),
+        }
+        .into())])
+        .boxed();
+        let response = stream_leader_response(
+            &state,
+            &request,
+            stream,
+            LeaderResponseContext {
+                request_hash: 0x5050,
+                broadcast_tx,
+                permits: StreamPermits {
+                    _request: permit,
+                    _provider: None,
+                },
+                start,
+                observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
+                observability: Some(ObservabilityContext {
+                    request_id: "latency-fixture".to_string(),
+                    provider_id: "test".to_string(),
+                    initiator: "user",
+                    model: "model".to_string(),
+                    stream: true,
+                    start,
+                    provider_setup_ms: 0,
+                    upstream_connect_ms: 500,
+                    idle_gap_ms: 30_000,
+                    payload_stats: Default::default(),
+                    observer_state: Arc::new(StdMutex::new(RequestObserverState::default())),
+                }),
+                stream_config: test_stream_config(),
+                protocol: DownstreamProtocol::anthropic(),
+            },
+        )
+        .await;
+        to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let snapshot = state.metrics.to_json().await;
+        let total = snapshot["avg_latency_ms"].as_u64().unwrap();
+        assert!(
+            total >= 500,
+            "routing/upstream time was excluded: {total} ms"
+        );
+        let observed = &snapshot["observability"]["recent"][0];
+        let stream_duration = observed["stream_duration_ms"].as_u64().unwrap();
+        assert!(total.saturating_sub(stream_duration) >= 500);
+        assert!(observed["total_latency_ms"].as_u64().unwrap() >= total);
     }
 
     #[tokio::test]
@@ -5245,6 +5315,8 @@ mod tests {
             .await
             .unwrap();
         let body: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(body["server_version"], env!("CARGO_PKG_VERSION"));
 
         assert_eq!(
             body["model_capabilities"]["test/gpt-5.5"]["capabilities"]["limits"]["max_output_tokens"],
