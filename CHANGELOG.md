@@ -1,5 +1,20 @@
 # Changelog
 
+## v6.0.5 - 2026-11-05
+
+### Fixed
+
+- Include routing and upstream response-header waiting in successful streaming request latency, keeping persisted usage and average latency consistent with non-stream requests and total request observability. Stream duration remains a separate measurement; historical records are unchanged. Higher reported latency after upgrading reflects corrected accounting rather than slower requests.
+
+### Added
+
+- Expose the running server's package version as `server_version` in authenticated `/admin/metrics`, so diagnostics can distinguish installed binaries from running instances.
+- Document a fixed-window comparison of proxy logs, metrics, and Claude Code sessions, including slow-generation analysis and the limits of version, transport, and cache conclusions.
+
+### Validation
+
+- Passed all 640 workspace/all-targets tests, workspace Clippy with warnings denied, formatting checks, and a release CLI build. A temporary isolated instance verified the version field without live inference; the preceding local build containing these fixes was restarted and its running image digest, health endpoint, and metrics version were verified.
+
 ## v6.0.4 - 2026-11-05
 
 ### Fixed
