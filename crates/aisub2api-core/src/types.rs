@@ -926,6 +926,16 @@ impl ErrorResponse {
         }
     }
 
+    pub fn permission(message: &str) -> Self {
+        Self {
+            r#type: "error".to_string(),
+            error: AnthropicError {
+                error_type: "permission_error".to_string(),
+                message: message.to_string(),
+            },
+        }
+    }
+
     pub fn rate_limit(message: &str) -> Self {
         Self {
             r#type: "error".to_string(),

@@ -331,6 +331,72 @@ async fn upstream_validation_errors_preserve_messages_recovery_contract() {
 }
 
 #[tokio::test]
+async fn upstream_forbidden_response_preserves_status_without_retries() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let captured_calls = calls.clone();
+    let deny = move || {
+        let calls = captured_calls.clone();
+        async move {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("content-type", "text/html")
+                .header("x-request-id", "req-denied")
+                .body(Body::from("<html><body>Unable to load site</body></html>"))
+                .unwrap()
+        }
+    };
+    let mock = Router::new()
+        .route("/v1/messages", post(deny.clone()))
+        .route("/responses", post(deny));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+    let mut settings = test_settings(&upstream, "local-test-key");
+    let mut anthropic = settings.providers["openai"].clone();
+    anthropic.provider_type = Some(ProviderType::Anthropic);
+    settings
+        .providers
+        .insert("anthropic".to_string(), anthropic);
+    let proxy = start_proxy(settings).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    for (index, endpoint) in ["/v1/messages", "/v1/chat/completions", "/v1/responses"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut payload = json!({"model": "anthropic/claude-sonnet-4-6", "stream": true});
+        if endpoint == "/v1/responses" {
+            payload["model"] = json!("openai/gpt-4");
+            payload["input"] = json!("local forbidden fixture");
+        } else {
+            payload["messages"] = json!([{"role": "user", "content": "local forbidden fixture"}]);
+        }
+        let response = client
+            .post(format!("{proxy}{endpoint}"))
+            .header("x-api-key", "local-test-key")
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{endpoint}");
+        assert_eq!(response.headers()["x-should-retry"], "false");
+        assert_eq!(response.headers()["x-upstream-status"], "403");
+        assert_eq!(response.headers()["x-upstream-request-id"], "req-denied");
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "permission_error");
+        assert_eq!(calls.load(Ordering::SeqCst), index + 1);
+    }
+}
+
+#[tokio::test]
 async fn claude_code_protocol_headers_reach_anthropic_without_client_credentials() {
     let received = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let capture = received.clone();

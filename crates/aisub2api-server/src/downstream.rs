@@ -297,6 +297,12 @@ pub(crate) fn provider_error_response(
                         None,
                         false,
                     ),
+                    403 => (
+                        StatusCode::FORBIDDEN,
+                        ErrorResponse::permission(&message),
+                        None,
+                        false,
+                    ),
                     422 => (
                         StatusCode::UNPROCESSABLE_ENTITY,
                         ErrorResponse::invalid_request(&message),
@@ -348,7 +354,7 @@ pub(crate) fn provider_error_response(
             .insert("x-should-retry", HeaderValue::from_static("true"));
     } else if matches!(
         error.without_upstream_metadata(),
-        ProviderError::FlexUnavailable(_)
+        ProviderError::FlexUnavailable(_) | ProviderError::UpstreamError { status: 403, .. }
     ) {
         response
             .headers_mut()
@@ -376,6 +382,7 @@ impl JsonStatusResponse for Json<Value> {
 fn openai_error_mapping(error_type: &str) -> (&'static str, Option<&'static str>) {
     match error_type {
         "authentication_error" => ("invalid_request_error", Some("invalid_api_key")),
+        "permission_error" => ("permission_error", None),
         "rate_limit_error" => ("rate_limit_error", Some("rate_limit_exceeded")),
         "invalid_request_error" => ("invalid_request_error", None),
         "not_found_error" => ("invalid_request_error", Some("model_not_found")),

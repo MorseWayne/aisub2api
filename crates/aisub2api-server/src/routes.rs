@@ -2965,6 +2965,14 @@ fn upstream_error_to_response(status: u16, body: &str) -> Response {
             StatusCode::BAD_REQUEST,
             &ErrorResponse::invalid_request(&message),
         ),
+        403 => {
+            let mut response =
+                error_response(StatusCode::FORBIDDEN, &ErrorResponse::permission(&message));
+            response
+                .headers_mut()
+                .insert("x-should-retry", HeaderValue::from_static("false"));
+            response
+        }
         422 => error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
             &ErrorResponse::invalid_request(&message),
@@ -4655,6 +4663,51 @@ mod tests {
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["error"]["type"], "invalid_request_error");
             assert_eq!(body["error"]["message"], message);
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_forbidden_errors_are_terminal_for_all_downstream_protocols() {
+        for body in [
+            "<html><body>Unable to load site</body></html>".to_string(),
+            json!({"error": {"message": "Access denied"}}).to_string(),
+        ] {
+            let error = ProviderError::UpstreamError {
+                status: 403,
+                body: body.clone(),
+            }
+            .with_upstream_metadata(UpstreamErrorMetadata {
+                status: 403,
+                request_id: Some("req-forbidden".to_string()),
+                ..Default::default()
+            });
+            for response in [
+                provider_error_to_response(&error),
+                crate::downstream::provider_error_response(
+                    &DownstreamProtocol::chat_completions("model", false),
+                    &error,
+                ),
+                crate::downstream::provider_error_response(
+                    &DownstreamProtocol::responses("model", Default::default()),
+                    &error,
+                ),
+            ] {
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                assert_eq!(response.headers()["x-should-retry"], "false");
+                assert_eq!(response.headers()["x-upstream-status"], "403");
+                assert_eq!(response.headers()["x-upstream-request-id"], "req-forbidden");
+                let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let response_body: Value = serde_json::from_slice(&response_body).unwrap();
+                assert_eq!(response_body["error"]["type"], "permission_error");
+                assert_eq!(
+                    response_body["error"]["message"],
+                    if body.starts_with('<') {
+                        body.as_str()
+                    } else {
+                        "Access denied"
+                    }
+                );
+            }
         }
     }
 
