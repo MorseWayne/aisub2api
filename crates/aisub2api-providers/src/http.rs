@@ -253,12 +253,52 @@ pub async fn send_upstream_request_with_policy(
     request: reqwest::RequestBuilder,
     policy: UpstreamRequestPolicy,
 ) -> Result<reqwest::Response, ProviderError> {
-    let mut attempt = 0;
-    let mut connection_attempt = 0;
+    send_upstream_request_with_budget(request, &mut UpstreamRetryBudget::new(policy)).await
+}
+
+/// A request's shared HTTP and pre-output stream retry allowance.
+pub(crate) struct UpstreamRetryBudget {
+    policy: UpstreamRequestPolicy,
+    attempts: usize,
+    connection_attempts: usize,
+}
+
+impl UpstreamRetryBudget {
+    pub(crate) fn new(policy: UpstreamRequestPolicy) -> Self {
+        Self {
+            policy,
+            attempts: 0,
+            connection_attempts: 0,
+        }
+    }
+
+    pub(crate) fn overload_retry_delay(&self, error: &ProviderError) -> Option<Duration> {
+        let ProviderError::Overloaded { retry_after, .. } = error.without_upstream_metadata()
+        else {
+            return None;
+        };
+        if !self.policy.retry_transient_statuses || self.attempts >= self.policy.max_attempts() {
+            return None;
+        }
+        let delay = retry_after.map(Duration::from_secs).unwrap_or_else(|| {
+            self.policy
+                .base_retry_delay
+                .saturating_mul(self.attempts as u32)
+        });
+        (delay <= MAX_RETRY_AFTER_DELAY).then_some(delay)
+    }
+}
+
+pub(crate) async fn send_upstream_request_with_budget(
+    request: reqwest::RequestBuilder,
+    budget: &mut UpstreamRetryBudget,
+) -> Result<reqwest::Response, ProviderError> {
+    let policy = budget.policy;
     let max_attempts = policy.max_attempts();
     let connection_max_attempts = policy.connection_max_attempts();
     loop {
         let Some(next_request) = request.try_clone() else {
+            budget.attempts += 1;
             return send_once(request, policy.attempt_timeout).await;
         };
 
@@ -267,19 +307,24 @@ pub async fn send_upstream_request_with_policy(
             .as_ref()
             .is_err_and(|error| error.connection_failed)
         {
-            connection_attempt += 1;
+            budget.connection_attempts += 1;
             let response = detailed.map_err(|error| error.error);
-            if connection_attempt >= connection_max_attempts || !policy.retry_network_errors {
+            if budget.connection_attempts >= connection_max_attempts || !policy.retry_network_errors
+            {
                 return response;
             }
-            warn_retrying_upstream_request(connection_attempt, connection_max_attempts, &response);
-            sleep(connection_retry_delay(connection_attempt, policy)).await;
+            warn_retrying_upstream_request(
+                budget.connection_attempts,
+                connection_max_attempts,
+                &response,
+            );
+            sleep(connection_retry_delay(budget.connection_attempts, policy)).await;
             continue;
         }
 
-        attempt += 1;
+        budget.attempts += 1;
         let response = detailed.map_err(|error| error.error);
-        if attempt >= max_attempts || !should_retry_result(&response, policy) {
+        if budget.attempts >= max_attempts || !should_retry_result(&response, policy) {
             return response;
         }
 
@@ -293,8 +338,8 @@ pub async fn send_upstream_request_with_policy(
         {
             return response;
         }
-        warn_retrying_upstream_request(attempt, max_attempts, &response);
-        sleep(retry_delay(attempt, response.as_ref().ok(), policy)).await;
+        warn_retrying_upstream_request(budget.attempts, max_attempts, &response);
+        sleep(retry_delay(budget.attempts, response.as_ref().ok(), policy)).await;
     }
 }
 
@@ -714,6 +759,7 @@ fn upstream_request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Opt
         &[
             "request-id",
             "x-request-id",
+            "x-oai-request-id",
             "x-openai-request-id",
             "openai-request-id",
             "x-ms-request-id",
@@ -726,6 +772,7 @@ fn safe_upstream_error_headers(headers: &reqwest::header::HeaderMap) -> Vec<Upst
     [
         "request-id",
         "x-request-id",
+        "x-oai-request-id",
         "x-openai-request-id",
         "openai-request-id",
         "x-ms-request-id",
@@ -1158,6 +1205,36 @@ mod tests {
         assert!(!should_retry_result(
             &Ok(response),
             UpstreamRequestPolicy::default()
+        ));
+    }
+
+    #[tokio::test]
+    async fn codex_capacity_429_preserves_request_id_and_retry_deadline() {
+        let body = r#"{"error":{"type":"rate_limit_error","code":"turn_rate_limit_exceeded","message":"Codex is at capacity, please try again later"}}"#;
+        let response = response_with_status_headers_and_body(
+            "429 Too Many Requests",
+            &[
+                ("x-oai-request-id", "req-codex-capacity"),
+                ("cf-ray", "edge-correlation"),
+                ("Retry-After", "152"),
+            ],
+            body,
+        )
+        .await;
+        let error = map_upstream_response(response).await;
+        assert!(matches!(
+            error.without_upstream_metadata(),
+            ProviderError::RateLimited {
+                retry_after: Some(152)
+            }
+        ));
+        let metadata = error.upstream_metadata().unwrap();
+        assert_eq!(metadata.status, 429);
+        assert_eq!(metadata.request_id.as_deref(), Some("req-codex-capacity"));
+        assert_eq!(metadata.retry_after, Some(152));
+        assert_eq!(metadata.body_preview.as_deref(), Some(body));
+        assert!(metadata.headers.iter().any(
+            |header| header.name == "x-oai-request-id" && header.value == "req-codex-capacity"
         ));
     }
 

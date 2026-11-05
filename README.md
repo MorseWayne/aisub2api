@@ -283,6 +283,47 @@ Model-not-found and audio-validation failures are terminal across HTTP, SSE,
 and WebSocket transports. Policy-restricted capacity remains retryable and is
 returned as 529 with the upstream `Retry-After` advice.
 
+Messages translation over ChatGPT SSE briefly stages known initialization events
+before exposing output for up to five seconds, committing when 64 events or
+256 KiB are reached. An explicit
+overload during this window can retry within the configured HTTP retry budget;
+HTTP failures and stream failures share the attempt allowance. Text, thinking,
+tool calls, unknown events, or a staging limit commit the stream and stop
+transparent recovery. Native Responses and WebSocket requests retain their
+existing behavior. Streamed Anthropic errors preserve provider error classes,
+including `overloaded_error` and `rate_limit_error`.
+
+Responses Lite can be selected per model with `responses_lite = "auto"` and
+`model_capabilities` overrides. The policy also applies to native Responses.
+See the [multi-model Claude Code validation and rollout boundaries](docs/reviews/2026-11-06-codex-claude-code-parallel-recovery.md)
+before enabling Full for particular models.
+
+Upgrading enables startup recovery and error diagnostics automatically; no token
+migration or Claude Code environment changes are required for these fixes.
+Parallel tool calls require an explicit Full-lane opt-in for each supported model:
+
+```toml
+[providers.chatgpt.chatgpt]
+responses_lite = "auto"
+
+[providers.chatgpt.chatgpt.model_capabilities."gpt-5.6-sol"]
+responses_lite = false
+
+[providers.chatgpt.chatgpt.model_capabilities."gpt-6.1-sol"]
+responses_lite = false
+
+[providers.chatgpt.chatgpt.model_capabilities."gpt-6-astra"]
+responses_lite = false
+
+[providers.chatgpt.chatgpt.model_capabilities."gpt-6-luna"]
+responses_lite = true
+```
+
+Merge these fields into existing tables and preserve other capabilities. Global
+`"on"` or `"off"` overrides per-model choices, so mixed policies require `"auto"`.
+Luna retains Lite. This policy also affects native Responses on the same provider;
+model access and Full availability still depend on the upstream account.
+
 Disconnecting the last streaming consumer closes the upstream read immediately;
 other consumers of a shared request can continue. ChatGPT clients retain only the
 upstream `__oailb` routing cookie on known HTTPS/WSS ChatGPT hosts, shared between

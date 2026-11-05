@@ -1,0 +1,15 @@
+--- config.toml
++++ config.toml
+@@ -81,0 +82,12 @@
++
++[providers.chatgpt.chatgpt.model_capabilities."gpt-5.6-sol"]
++responses_lite = false
++
++[providers.chatgpt.chatgpt.model_capabilities."gpt-6.1-sol"]
++responses_lite = false
++
++[providers.chatgpt.chatgpt.model_capabilities."gpt-6-astra"]
++responses_lite = false
++
++[providers.chatgpt.chatgpt.model_capabilities."gpt-6-luna"]
++responses_lite = true

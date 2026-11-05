@@ -11,6 +11,7 @@ pub mod capability_cache;
 mod model_identity;
 mod responses;
 mod routing_cookie;
+mod sse_recovery;
 mod transport;
 
 use std::collections::{BTreeSet, HashMap};
@@ -43,10 +44,11 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::http::{
-    UpstreamRequestPolicy, apply_extra_ca_certs, apply_runtime_request_config, fmt_reqwest_err,
-    is_non_retryable_rate_limit_error_body, is_non_retryable_rate_limit_headers,
+    UpstreamRequestPolicy, UpstreamRetryBudget, apply_extra_ca_certs, apply_runtime_request_config,
+    fmt_reqwest_err, is_non_retryable_rate_limit_error_body, is_non_retryable_rate_limit_headers,
     map_upstream_response, read_upstream_response_json, read_upstream_response_text,
-    send_upstream_request_with_policy, upstream_error_metadata_from_parts,
+    send_upstream_request_with_budget, send_upstream_request_with_policy,
+    upstream_error_metadata_from_parts,
 };
 use crate::openai_compat::{
     CompactRequestKind, apply_openai_intent, classify_compact_request_body,
@@ -1092,6 +1094,7 @@ impl ChatGptProvider {
             context,
             prompt_too_long_attempt,
             None,
+            None,
         )
         .await
     }
@@ -1103,6 +1106,7 @@ impl ChatGptProvider {
         context: ChatGptSseRequestContext,
         prompt_too_long_attempt: usize,
         forwarded_headers: Option<&HeaderMap>,
+        retry_budget: Option<&mut UpstreamRetryBudget>,
     ) -> Result<Response, ProviderError> {
         let ChatGptSseRequestContext {
             compact_request,
@@ -1208,11 +1212,11 @@ impl ChatGptProvider {
         }
 
         let request_builder = apply_runtime_request_config(request_builder, &self.runtime)?;
-        let result = send_upstream_request_with_policy(
-            request_builder.body(request_body.bytes),
-            self.request_policy,
-        )
-        .await;
+        let request_builder = request_builder.body(request_body.bytes);
+        let result = match retry_budget {
+            Some(budget) => send_upstream_request_with_budget(request_builder, budget).await,
+            None => send_upstream_request_with_policy(request_builder, self.request_policy).await,
+        };
 
         match &result {
             Ok(response) => {
@@ -1244,6 +1248,7 @@ impl ChatGptProvider {
         result
     }
 
+    #[cfg(test)]
     async fn send_responses_request_with_prompt_too_long_retry(
         &self,
         body: &mut Value,
@@ -1252,7 +1257,7 @@ impl ChatGptProvider {
         observer: Option<&ProviderRequestObserver>,
     ) -> Result<Response, ProviderError> {
         self.send_responses_request_with_prompt_too_long_retry_and_headers(
-            body, token, context, observer, None,
+            body, token, context, observer, None, None,
         )
         .await
     }
@@ -1264,6 +1269,7 @@ impl ChatGptProvider {
         context: ChatGptSseRequestContext,
         observer: Option<&ProviderRequestObserver>,
         forwarded_headers: Option<&HeaderMap>,
+        retry_budget: Option<&mut UpstreamRetryBudget>,
     ) -> Result<Response, ProviderError> {
         validate_chatgpt_tool_schema_budget(body)?;
         let body_bytes = json_len(body);
@@ -1291,6 +1297,7 @@ impl ChatGptProvider {
                 },
                 0,
                 forwarded_headers,
+                retry_budget,
             )
             .await?;
         let status = response.status();
@@ -1401,76 +1408,7 @@ impl ChatGptProvider {
         prepared: ChatGptPreparedRequest,
         token: ChatGptToken,
     ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
-        let ChatGptPreparedRequest {
-            mut body,
-            responses_correlation,
-            marker_mode,
-            compact_request,
-            request_id,
-            output_token_budget,
-            observer,
-            responses_lite,
-            pending_context_usage,
-            ..
-        } = prepared;
-        let mut response = self
-            .send_responses_request_with_prompt_too_long_retry(
-                &mut body,
-                &token,
-                ChatGptSseRequestContext {
-                    compact_request,
-                    request_id,
-                    budget: output_token_budget,
-                    responses_lite,
-                },
-                observer.as_ref(),
-            )
-            .await?;
-        if response.status() == StatusCode::UNAUTHORIZED {
-            let refreshed = match self.auth.force_refresh_token().await {
-                Ok(token) => token,
-                Err(error) => {
-                    if error.is_authentication() {
-                        self.auth.clear_token().await;
-                    }
-                    return Err(error);
-                }
-            };
-            response = self
-                .send_responses_request_with_prompt_too_long_retry(
-                    &mut body,
-                    &refreshed,
-                    ChatGptSseRequestContext {
-                        compact_request,
-                        request_id,
-                        budget: output_token_budget,
-                        responses_lite,
-                    },
-                    observer.as_ref(),
-                )
-                .await?;
-            if response.status() == StatusCode::UNAUTHORIZED {
-                self.auth.clear_token().await;
-            }
-        }
-
-        if !response.status().is_success() {
-            return Err(map_upstream_response(response).await);
-        }
-
-        Ok(self
-            .stream_sse_response(
-                response,
-                ChatGptSseStreamContext {
-                    marker_mode,
-                    request_id,
-                    compact_request,
-                    observer,
-                    pending_context_usage,
-                    responses_correlation,
-                },
-            )
-            .await)
+        sse_recovery::chat_via_sse(self, prepared, token).await
     }
 
     async fn chat_via_websocket_with_auth_retry(
@@ -1652,6 +1590,7 @@ impl ChatGptProvider {
             pending_context_usage,
             responses_correlation,
         } = context;
+        let response_headers = response.headers().clone();
         let header_snapshots =
             rate_limit_snapshots_from_headers(&self.id, response.headers(), unix_timestamp_secs());
         log_rate_limit_summary(
@@ -1681,7 +1620,11 @@ impl ChatGptProvider {
             responses_correlation,
             self.payload_limits.max_sse_frame_bytes,
             on_event,
-        );
+        )
+        .map(move |result| {
+            result.map_err(|error| sse_recovery::with_http_retry_advice(error, &response_headers))
+        })
+        .boxed();
         wrap_chatgpt_stream_logging(
             stream,
             request_id,
@@ -1894,6 +1837,7 @@ fn upstream_request_id_from_headers(headers: &HeaderMap) -> Option<String> {
         headers,
         &[
             "x-request-id",
+            "x-oai-request-id",
             "x-openai-request-id",
             "openai-request-id",
             "cf-ray",
@@ -2373,6 +2317,7 @@ impl Provider for ChatGptProvider {
                 context,
                 observer.as_ref(),
                 Some(&forwarded_headers),
+                None,
             )
             .await?;
         if response.status() == StatusCode::UNAUTHORIZED {
@@ -2384,6 +2329,7 @@ impl Provider for ChatGptProvider {
                     context,
                     observer.as_ref(),
                     Some(&forwarded_headers),
+                    None,
                 )
                 .await?;
             if response.status() == StatusCode::UNAUTHORIZED {
@@ -6877,6 +6823,7 @@ mod tests {
                 },
                 None,
                 Some(&forwarded_headers),
+                None,
             )
             .await
             .expect("native request should succeed");

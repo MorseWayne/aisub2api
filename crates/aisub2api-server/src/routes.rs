@@ -1734,7 +1734,7 @@ fn join_inflight_stream(
                             break;
                         }
                         Ok(InflightEvent::Error(failure)) => {
-                            let frames = encoder.encode_error(failure.message);
+                            let frames = encoder.encode_provider_error(&failure.error, failure.message);
                             let _ = try_send_stream_frames(&tx, frames);
                             break;
                         }
@@ -1962,9 +1962,9 @@ async fn stream_leader_response(
                             terminal_reason = "stream_error";
                             last_error = Some(error_message.clone());
                             last_error_metadata = e.upstream_metadata().cloned();
+                            let frames = encoder.encode_provider_error(&e, error_message.clone());
                             let _ = broadcast_tx.send(inflight_failure(e, error_message.clone()));
                             if leader_tx_open {
-                                let frames = encoder.encode_error(error_message);
                                 let _ = try_send_stream_frames(&sender, frames);
                             }
                             break;

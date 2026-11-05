@@ -117,6 +117,33 @@ pub(crate) enum StreamEncoder {
 }
 
 impl StreamEncoder {
+    pub(crate) fn encode_provider_error(
+        &mut self,
+        error: &ProviderError,
+        message: impl Into<String>,
+    ) -> Vec<Vec<u8>> {
+        let message = message.into();
+        if !matches!(self, Self::Anthropic) {
+            return self.encode_error(message);
+        }
+        let error_type = match error.without_upstream_metadata() {
+            ProviderError::Overloaded { .. } | ProviderError::PolicyCapacityUnavailable { .. } => {
+                "overloaded_error"
+            }
+            ProviderError::RateLimited { .. } => "rate_limit_error",
+            ProviderError::Authentication(_) => "authentication_error",
+            ProviderError::InvalidRequest(_) | ProviderError::RequestTooLarge(_) => {
+                "invalid_request_error"
+            }
+            ProviderError::ModelNotFound(_) => "not_found_error",
+            _ => "api_error",
+        };
+        vec![format_anthropic_event(&SseEvent {
+            event: "error".to_string(),
+            data: json!({"type": "error", "error": {"type": error_type, "message": message}}),
+        })]
+    }
+
     pub(crate) fn encode_event(&mut self, event: &ProviderEvent) -> Vec<Vec<u8>> {
         match self {
             Self::Anthropic => event
@@ -2016,6 +2043,56 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn anthropic_stream_provider_errors_keep_type_and_safe_message() {
+        let errors = [
+            (
+                ProviderError::Overloaded {
+                    message: "busy".into(),
+                    retry_after: Some(2),
+                },
+                "overloaded_error",
+            ),
+            (
+                ProviderError::PolicyCapacityUnavailable {
+                    message: "capacity".into(),
+                    retry_after: None,
+                },
+                "overloaded_error",
+            ),
+            (
+                ProviderError::RateLimited { retry_after: None },
+                "rate_limit_error",
+            ),
+            (
+                ProviderError::InvalidRequest("policy".into()),
+                "invalid_request_error",
+            ),
+            (ProviderError::Network("disconnected".into()), "api_error"),
+        ];
+        for (error, error_type) in errors {
+            let error = error.with_upstream_metadata(UpstreamErrorMetadata {
+                status: 503,
+                body_preview: Some("private upstream diagnostics".into()),
+                ..Default::default()
+            });
+            let frames =
+                StreamEncoder::Anthropic.encode_provider_error(&error, "client-facing message");
+            assert_eq!(frames.len(), 1);
+            let frame = std::str::from_utf8(&frames[0]).unwrap();
+            let data = frame
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(data).unwrap(),
+                json!({
+                    "type": "error", "error": {"type": error_type, "message": "client-facing message"}
+                })
+            );
+        }
+    }
 
     fn text_events() -> Vec<SseEvent> {
         vec![

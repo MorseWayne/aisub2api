@@ -287,6 +287,29 @@ ChatGPT provider 会优先通过 OAuth 从 Codex `/models` 获取在线模型目
 
 Astra、GPT-6 Sol/Luna 和 GPT-6.1 Sol 的 ChatGPT 回退使用 Codex 目录中的 272K active context；GPT-6.1 Terra 使用 500K active context，均不自动启用可选的 872K 扩展窗口。`openai/gpt-6-astra` 则声明公开 API 的 1,050,000 context、128,000 output 和 `low` 到 `max` 推理能力，Messages 请求也使用 Responses；两种提供商的限制分别处理。
 
+升级后，ChatGPT Messages SSE 的输出前 overload 恢复、Anthropic 错误类型和 request ID 保留自动生效，无需迁移 token 或手工添加 Claude Code 环境变量。恢复窗口最多 5 秒，累计达到 64 个事件或 256 KiB 时交付；HTTP 和 SSE 共用重试次数，文本、thinking、工具调用或未知事件交付后不再透明重放。原生 Responses 和 WebSocket 保留现有恢复行为。
+
+若要在 Claude Code 中启用并行工具调用，需要对支持的模型显式选择 Full。全局保持 `auto`，再按模型设置；Luna 保留 Lite：
+
+```toml
+[providers.chatgpt.chatgpt]
+responses_lite = "auto"
+
+[providers.chatgpt.chatgpt.model_capabilities."gpt-5.6-sol"]
+responses_lite = false
+
+[providers.chatgpt.chatgpt.model_capabilities."gpt-6.1-sol"]
+responses_lite = false
+
+[providers.chatgpt.chatgpt.model_capabilities."gpt-6-astra"]
+responses_lite = false
+
+[providers.chatgpt.chatgpt.model_capabilities."gpt-6-luna"]
+responses_lite = true
+```
+
+合并到已有同名 table，保留其他 capability，不要重复追加 table。全局 `on/off` 会覆盖逐模型选择；同 provider 的原生 Responses 也会使用这份策略。模型访问权限和 Full 可用性仍由上游账号决定。[多模型验证及边界](docs/reviews/2026-11-06-codex-claude-code-parallel-recovery.md)包含真实 CC、MCP、缓存和 WS continuation 的实测范围。
+
 所有新建 ChatGPT 映射默认使用 `high`。TUI 的 Reasoning picker 对所有 Provider 都按当前模型声明的 `reasoning_effort_levels` 过滤，并在打开时按需拉取、缓存模型能力；能力明确为空时只显示 `unset`，拿不到能力或使用目录外的自定义模型时才显示完整兼容列表。以 GPT-5.6 为例，Sol/Terra 显示 `low` 到 `ultra`，Luna 只显示 `low` 到 `max`，不会再给 Luna 显示 `default`、`none` 或 `minimal`。`unset` 用于清除代理侧强制覆盖。`ultra` 遵循 Codex 语义：上游请求发送 `max`；支持 `ultra` 的 Sol/Terra/Astra 模型且请求包含委派工具时，同时启用主动多代理指令，否则仅按 `max` 发送并记录警告。Luna 不支持 `ultra`，会降为 `max`。
 
 #### Claude Code 虚拟 1M 与真实上游窗口
