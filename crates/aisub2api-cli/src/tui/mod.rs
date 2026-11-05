@@ -2256,6 +2256,12 @@ pub(crate) fn sync_claude_code_settings(
         Value::Object(Map::new())
     };
 
+    if !value.is_object() {
+        return Err("Claude Code settings root must be a JSON object".to_string());
+    }
+    if value.get("env").is_some_and(|env| !env.is_object()) {
+        return Err("Claude Code settings env must be a JSON object".to_string());
+    }
     apply_claude_code_env(&mut value, settings);
 
     if let Some(parent) = path.parent() {
@@ -2460,8 +2466,9 @@ fn apply_claude_code_env(value: &mut Value, settings: &Settings) {
     set_env(env, "ANTHROPIC_BASE_URL", &server_client_base_url(settings));
     set_env(env, "ANTHROPIC_API_KEY", &settings.server.auth_token);
     set_env(env, "CLAUDE_CODE_ATTRIBUTION_HEADER", "0");
-    set_env(env, "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "128000");
-    set_default_env(env, "ENABLE_TOOL_SEARCH", "true");
+    set_default_env(env, "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "128000");
+    set_default_env(env, "ENABLE_TOOL_SEARCH", "auto");
+    set_default_env(env, "CLAUDE_CODE_ENABLE_TODO_TOOLS", "1");
     env.remove("ANTHROPIC_AUTH_TOKEN");
     let default_model = aisub2api_providers::chatgpt::claude_code_projected_model(
         settings,
@@ -2471,18 +2478,26 @@ fn apply_claude_code_env(value: &mut Value, settings: &Settings) {
         .model
         .reasoning_name()
         .map(|model| aisub2api_providers::chatgpt::claude_code_projected_model(settings, model));
-    let haiku_model = settings
-        .model
-        .haiku_name()
-        .map(|model| aisub2api_providers::chatgpt::claude_code_projected_model(settings, model));
-    let sonnet_model = settings
-        .model
-        .sonnet_name()
-        .map(|model| aisub2api_providers::chatgpt::claude_code_projected_model(settings, model));
-    let opus_model = settings
-        .model
-        .opus_name()
-        .map(|model| aisub2api_providers::chatgpt::claude_code_projected_model(settings, model));
+    let default_provider_id = Settings::parse_provider_id(&settings.model.default.name);
+    let default_provider_type = settings
+        .providers
+        .get(default_provider_id)
+        .map(|provider| provider.resolve_type(default_provider_id))
+        .unwrap_or_else(|| ProviderType::parse(default_provider_id));
+    // CC otherwise resolves an unset family alias to its built-in Claude ID,
+    // which a third-party provider may not serve. Explicit aliases take priority;
+    // native Anthropic retains its own family defaults.
+    let family_model = |model: Option<&str>| {
+        model
+            .filter(|model| !model.trim().is_empty())
+            .map(|model| aisub2api_providers::chatgpt::claude_code_projected_model(settings, model))
+            .or_else(|| {
+                (default_provider_type != ProviderType::Anthropic).then(|| default_model.clone())
+            })
+    };
+    let haiku_model = family_model(settings.model.haiku_name());
+    let sonnet_model = family_model(settings.model.sonnet_name());
+    let opus_model = family_model(settings.model.opus_name());
 
     set_env(env, "ANTHROPIC_MODEL", &default_model);
     set_optional_env(env, "ANTHROPIC_REASONING_MODEL", reasoning_model.as_deref());
@@ -3067,8 +3082,9 @@ mod tests {
         );
         assert_eq!(
             env.get("ENABLE_TOOL_SEARCH").and_then(|v| v.as_str()),
-            Some("true")
+            Some("auto")
         );
+        assert_eq!(env["CLAUDE_CODE_ENABLE_TODO_TOOLS"], "1");
         assert_eq!(
             env.get("ANTHROPIC_MODEL").and_then(|v| v.as_str()),
             Some("copilot/claude-sonnet-4")
@@ -3230,7 +3246,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_code_env_sync_removes_empty_optional_model_keys() {
+    fn claude_code_env_sync_inherits_main_for_empty_aliases_and_preserves_user_options() {
         let settings = Settings {
             model: ModelConfig {
                 default: ModelAliasConfig::new("openai/gpt-5"),
@@ -3262,16 +3278,99 @@ mod tests {
         assert_eq!(
             env.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS")
                 .and_then(|v| v.as_str()),
-            Some("128000")
+            Some("32000")
         );
         assert_eq!(
             env.get("ENABLE_TOOL_SEARCH").and_then(|v| v.as_str()),
             Some("false")
         );
         assert!(!env.contains_key("ANTHROPIC_REASONING_MODEL"));
-        assert!(!env.contains_key("ANTHROPIC_DEFAULT_OPUS_MODEL"));
-        assert!(!env.contains_key("ANTHROPIC_DEFAULT_SONNET_MODEL"));
-        assert!(!env.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
+        for key in [
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        ] {
+            assert_eq!(env.get(key).and_then(Value::as_str), Some("openai/gpt-5"));
+        }
+    }
+
+    #[test]
+    fn claude_code_env_sync_updates_inherited_aliases_when_main_model_changes() {
+        let mut settings = Settings {
+            model: ModelConfig {
+                default: ModelAliasConfig::new("openai/first-model"),
+                ..ModelConfig::default()
+            },
+            ..Settings::default()
+        };
+        let mut value = json!({
+            "env": {
+                "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8192",
+                "CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING": "0",
+                "CLAUDE_CODE_ENABLE_TODO_TOOLS": "0",
+                "CLAUDE_CODE_ENABLE_TASKS": "0",
+                "ENABLE_TOOL_SEARCH": "auto"
+            },
+            "modelPicker": {"options": [{"model": "openai/custom-model"}]}
+        });
+        apply_claude_code_env(&mut value, &settings);
+        settings.model.default = ModelAliasConfig::new("openai/second-model");
+        apply_claude_code_env(&mut value, &settings);
+
+        for key in [
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        ] {
+            assert_eq!(value["env"][key], "openai/second-model");
+        }
+        assert_eq!(value["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "8192");
+        assert_eq!(
+            value["env"]["CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING"],
+            "0"
+        );
+        assert_eq!(value["env"]["ENABLE_TOOL_SEARCH"], "auto");
+        assert_eq!(value["env"]["CLAUDE_CODE_ENABLE_TODO_TOOLS"], "0");
+        assert_eq!(value["env"]["CLAUDE_CODE_ENABLE_TASKS"], "0");
+        assert_eq!(
+            value["modelPicker"]["options"][0]["model"],
+            "openai/custom-model"
+        );
+    }
+
+    #[test]
+    fn claude_code_env_sync_preserves_native_anthropic_family_defaults() {
+        let mut settings = Settings {
+            model: ModelConfig {
+                default: ModelAliasConfig::new("native/claude-sonnet-4-6"),
+                ..ModelConfig::default()
+            },
+            ..Settings::default()
+        };
+        settings.providers.insert(
+            "native".to_string(),
+            ProviderConfig {
+                api_key: "fixture-key".to_string(),
+                base_url: "https://api.anthropic.com".to_string(),
+                proxy: String::new(),
+                provider_type: Some(ProviderType::Anthropic),
+                copilot: None,
+                chatgpt: None,
+                runtime: Default::default(),
+                reasoning_markers: Default::default(),
+            },
+        );
+        let mut value = json!({"env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "old-proxy-model"}});
+        apply_claude_code_env(&mut value, &settings);
+        assert_eq!(value["env"]["ANTHROPIC_MODEL"], "native/claude-sonnet-4-6");
+        for key in [
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        ] {
+            assert!(value["env"].get(key).is_none());
+        }
     }
 
     #[test]

@@ -1236,6 +1236,22 @@ fn save_settings(settings: &aisub2api_config::Settings) {
         std::fs::create_dir_all(parent).expect("failed to create config directory");
     }
     std::fs::write(&path, settings.to_toml()).expect("failed to write config file");
+    // Provider setup can save an incomplete configuration before a model is
+    // selected. Sync ready configurations without making the user restart the
+    // server merely to update Claude's startup settings.
+    if settings.validate().is_ok()
+        && settings
+            .providers
+            .contains_key(aisub2api_config::Settings::parse_provider_id(
+                &settings.model.default.name,
+            ))
+        && let Err(error) = tui::sync_claude_code_settings(settings, false)
+    {
+        eprintln!(
+            "{} Config saved, but Claude Code settings sync failed: {error}",
+            "Warning:".yellow().bold()
+        );
+    }
 }
 
 fn config_path_or_exit() -> PathBuf {

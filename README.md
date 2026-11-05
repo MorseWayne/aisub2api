@@ -64,6 +64,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:8082
 export ANTHROPIC_API_KEY=freecc
 ```
 
+For model aliases, tool availability, context sizing, and provider-specific limits, see the [Claude Code + third-party provider guide](docs/guides/claude-code-third-party.md).
+
 ## CLI Commands
 
 ### Provider Management
