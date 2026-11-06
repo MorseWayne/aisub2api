@@ -334,6 +334,7 @@ enum ResponsesLiteDecisionSource {
     ForcedOff,
     OverrideEnabled,
     OverrideDisabled,
+    DefaultPolicy,
     ModelCapability,
     UnknownModel,
 }
@@ -363,9 +364,20 @@ impl ResponsesLiteDecision {
             ResponsesLiteDecisionSource::ForcedOff => "forced_off",
             ResponsesLiteDecisionSource::OverrideEnabled => "override_enabled",
             ResponsesLiteDecisionSource::OverrideDisabled => "override_disabled",
+            ResponsesLiteDecisionSource::DefaultPolicy => "default_policy",
             ResponsesLiteDecisionSource::ModelCapability => "model_capability",
             ResponsesLiteDecisionSource::UnknownModel => "unknown_model",
         }
+    }
+}
+
+fn default_chatgpt_responses_lite(model: &str) -> Option<bool> {
+    // Only models verified on the Full lane override the upstream lane hint.
+    // Keep the raw catalog intact; explicit user choices still take precedence.
+    match model {
+        "gpt-5.6-sol" | "gpt-6.1-sol" | "gpt-6-astra" => Some(false),
+        "gpt-6-luna" => Some(true),
+        _ => None,
     }
 }
 
@@ -773,6 +785,13 @@ impl ChatGptProvider {
                 ResponsesLiteDecision::enabled(ResponsesLiteDecisionSource::OverrideEnabled)
             } else {
                 ResponsesLiteDecision::disabled(ResponsesLiteDecisionSource::OverrideDisabled)
+            };
+        }
+
+        if let Some(enabled) = default_chatgpt_responses_lite(normalized_model) {
+            return ResponsesLiteDecision {
+                enabled,
+                source: ResponsesLiteDecisionSource::DefaultPolicy,
             };
         }
 
@@ -4880,8 +4899,8 @@ mod tests {
         assert_eq!(gpt54.source_str(), "unknown_model");
 
         let sol = provider.responses_lite_decision("chatgpt/gpt-5.6-sol");
-        assert!(sol.is_enabled());
-        assert_eq!(sol.source_str(), "model_capability");
+        assert!(!sol.is_enabled());
+        assert_eq!(sol.source_str(), "default_policy");
 
         let spark = provider.responses_lite_decision("gpt-5.3-codex-spark");
         assert!(!spark.is_enabled());
@@ -5000,11 +5019,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn astra_chatgpt_catalog_and_lite_normalization_follow_codex() {
+    async fn astra_catalog_retains_codex_metadata_while_default_requests_use_full() {
         let provider = test_chatgpt_provider("http://127.0.0.1:1/responses".to_string()).await;
         let model = provider.model_info("gpt-6-astra").unwrap();
         assert_eq!(model.capabilities.limits.context_window, Some(272_000));
-        assert!(provider.responses_lite_decision("gpt-6-astra").is_enabled());
+        let decision = provider.responses_lite_decision("gpt-6-astra");
+        assert!(!decision.is_enabled());
         let remote: ChatGptRemoteModel = serde_json::from_value(json!({
             "slug":"gpt-6-astra", "visibility":"list", "context_window":272_000,
             "max_context_window":872_000, "use_responses_lite":true,
@@ -5019,14 +5039,11 @@ mod tests {
         );
         assert!(catalog.responses_lite);
         assert_eq!(catalog.visibility.as_deref(), Some("list"));
-        let mut body = json!({"model":"gpt-6-astra", "input":"hi", "reasoning":{"effort":"ultra"}});
+        let mut body = json!({"model":"gpt-6-astra", "input":"hi", "reasoning":{"effort":"ultra"}, "parallel_tool_calls":true});
         normalize_chatgpt_native_reasoning(&mut body, "gpt-6-astra");
-        normalize_chatgpt_native_responses_body(&mut body, catalog.responses_lite);
-        assert_eq!(
-            body["reasoning"],
-            json!({"effort":"max", "context":"all_turns"})
-        );
-        assert_eq!(body["parallel_tool_calls"], false);
+        normalize_chatgpt_native_responses_body(&mut body, decision.is_enabled());
+        assert_eq!(body["reasoning"], json!({"effort":"max"}));
+        assert_eq!(body["parallel_tool_calls"], true);
     }
 
     #[test]

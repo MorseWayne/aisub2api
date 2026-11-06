@@ -2,13 +2,160 @@ use super::*;
 use serde_json::json;
 
 #[tokio::test]
-async fn new_codex_models_use_lite_requests_and_catalog_tiers() {
+async fn default_lane_policy_applies_without_overrides_and_precedes_remote_lane_metadata() {
+    let provider = tests::test_chatgpt_provider("http://127.0.0.1:1/responses".into()).await;
+    assert!(provider.chatgpt_config.model_capabilities.is_empty());
+    let cases = [
+        ("gpt-5.6-sol", false),
+        ("gpt-6.1-sol", false),
+        ("gpt-6-astra", false),
+        ("gpt-6-luna", true),
+    ];
+    for online_catalog in [false, true] {
+        if online_catalog {
+            let mut catalog = provider.remote_models.write().unwrap();
+            catalog.identity = provider.model_cache_identity();
+            for (model, lite) in cases {
+                let remote = serde_json::from_value(json!({
+                    "slug": model, "use_responses_lite": !lite,
+                    "supports_parallel_tool_calls": true
+                }))
+                .unwrap();
+                catalog.models.insert(
+                    model.into(),
+                    chatgpt_catalog_model_from_remote(remote, &provider.chatgpt_config),
+                );
+            }
+        }
+        for (model, lite) in cases {
+            let decision = provider.responses_lite_decision(model);
+            assert_eq!(
+                decision.is_enabled(),
+                lite,
+                "{model}, online={online_catalog}"
+            );
+            assert_eq!(decision.source_str(), "default_policy");
+            assert_eq!(
+                provider
+                    .responses_lite_decision(&format!("chatgpt/{model}"))
+                    .is_enabled(),
+                lite
+            );
+            let request = serde_json::from_value(json!({
+                "model": model, "messages": [{"role": "user", "content": "Read the value."}],
+                "tools": [{"name": "Read", "input_schema": {"type": "object", "properties": {}}}]
+            }))
+            .unwrap();
+            let body = responses::build_body_with_context(
+                &request,
+                DEFAULT_CHATGPT_INSTRUCTIONS,
+                responses::CodexRequestContext {
+                    responses_lite: decision.is_enabled(),
+                    supports_parallel_tool_calls: provider.supports_parallel_tool_calls(model),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(body["parallel_tool_calls"], !lite);
+            assert_eq!(
+                body["reasoning"]["context"].as_str(),
+                lite.then_some("all_turns")
+            );
+            let mut native = json!({"model": model, "input": "hi", "parallel_tool_calls": true});
+            normalize_chatgpt_native_responses_body(&mut native, decision.is_enabled());
+            assert_eq!(native["parallel_tool_calls"], !lite);
+        }
+    }
+}
+
+#[tokio::test]
+async fn default_lane_policy_respects_user_choices_and_leaves_other_models_on_auto() {
+    let mut provider = tests::test_chatgpt_provider("http://127.0.0.1:1/responses".into()).await;
+    provider.chatgpt_config.model_capabilities.insert(
+        "gpt-5.6-sol".into(),
+        ChatGptModelCapabilityOverride {
+            context_window: Some(872_000),
+            ..Default::default()
+        },
+    );
+    assert!(!provider.responses_lite_decision("gpt-5.6-sol").is_enabled());
+    for (model, lite) in [("gpt-5.6-sol", true), ("gpt-6-luna", false)] {
+        provider.chatgpt_config.model_capabilities.insert(
+            model.into(),
+            ChatGptModelCapabilityOverride {
+                responses_lite: Some(lite),
+                ..Default::default()
+            },
+        );
+        assert_eq!(provider.responses_lite_decision(model).is_enabled(), lite);
+        provider.chatgpt_config.responses_lite = ResponsesLiteMode::On;
+        assert!(provider.responses_lite_decision(model).is_enabled());
+        provider.chatgpt_config.responses_lite = ResponsesLiteMode::Off;
+        assert!(!provider.responses_lite_decision(model).is_enabled());
+        provider.chatgpt_config.responses_lite = ResponsesLiteMode::Auto;
+    }
+    assert!(provider.responses_lite_decision("gpt-6-sol").is_enabled());
+    assert!(
+        !provider
+            .responses_lite_decision("unknown-model")
+            .is_enabled()
+    );
+    {
+        let mut catalog = provider.remote_models.write().unwrap();
+        catalog.identity = provider.model_cache_identity();
+        for (model, lite) in [("gpt-6-sol", false), ("new-catalog-model", true)] {
+            let remote =
+                serde_json::from_value(json!({"slug": model, "use_responses_lite": lite})).unwrap();
+            catalog.models.insert(
+                model.into(),
+                chatgpt_catalog_model_from_remote(remote, &provider.chatgpt_config),
+            );
+        }
+    }
+    assert!(!provider.responses_lite_decision("gpt-6-sol").is_enabled());
+    assert!(
+        provider
+            .responses_lite_decision("new-catalog-model")
+            .is_enabled()
+    );
+
+    // Full permits batching but must not override upstream or client restrictions.
+    let remote = serde_json::from_value(json!({
+        "slug": "gpt-6.1-sol", "use_responses_lite": true, "supports_parallel_tool_calls": false
+    }))
+    .unwrap();
+    provider.remote_models.write().unwrap().models.insert(
+        "gpt-6.1-sol".into(),
+        chatgpt_catalog_model_from_remote(remote, &provider.chatgpt_config),
+    );
+    assert!(!provider.responses_lite_decision("gpt-6.1-sol").is_enabled());
+    let request = serde_json::from_value(json!({
+        "model": "gpt-6.1-sol", "messages": [{"role": "user", "content": "Read a value."}],
+        "tools": [{"name": "Read", "input_schema": {"type": "object", "properties": {}}}],
+        "parallel_tool_calls": true
+    }))
+    .unwrap();
+    let body = responses::build_body_with_context(
+        &request,
+        DEFAULT_CHATGPT_INSTRUCTIONS,
+        responses::CodexRequestContext {
+            responses_lite: provider.responses_lite_decision("gpt-6.1-sol").is_enabled(),
+            supports_parallel_tool_calls: provider.supports_parallel_tool_calls("gpt-6.1-sol"),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(body["parallel_tool_calls"], false);
+}
+
+#[tokio::test]
+async fn new_codex_models_use_default_lanes_and_catalog_tiers() {
     let provider = tests::test_chatgpt_provider("http://127.0.0.1:1/responses".to_string()).await;
-    for (model, context_window) in [
-        ("gpt-6-sol", 272_000),
-        ("gpt-6-luna", 272_000),
-        ("gpt-6.1-sol", 272_000),
-        ("gpt-6.1-terra", 500_000),
+    for (model, context_window, expected_lite) in [
+        ("gpt-6-sol", 272_000, true),
+        ("gpt-6-luna", 272_000, true),
+        ("gpt-6.1-sol", 272_000, false),
+        ("gpt-6.1-terra", 500_000, true),
     ] {
         let mut request: MessagesRequest = serde_json::from_value(json!({
             "model": model, "messages":[{"role":"user","content":"hi"}],
@@ -19,6 +166,7 @@ async fn new_codex_models_use_lite_requests_and_catalog_tiers() {
         assert!(normalize_chatgpt_reasoning(&mut request));
         let info = provider.model_info(model).unwrap();
         let lite = provider.responses_lite_decision(model).is_enabled();
+        assert_eq!(lite, expected_lite);
         let tier = provider.codex_service_tier(model);
         let body = responses::build_body_with_context(
             &request,
@@ -31,11 +179,18 @@ async fn new_codex_models_use_lite_requests_and_catalog_tiers() {
             },
         )
         .unwrap();
-        assert_eq!(body["input"][0]["type"], "additional_tools");
-        assert_eq!(body["input"][1]["role"], "developer");
+        if expected_lite {
+            assert_eq!(body["input"][0]["type"], "additional_tools");
+            assert_eq!(body["input"][1]["role"], "developer");
+        } else {
+            assert!(!body["tools"].as_array().unwrap().is_empty());
+        }
         assert_eq!(body["reasoning"]["effort"], "max");
-        assert_eq!(body["reasoning"]["context"], "all_turns");
-        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(
+            body["reasoning"]["context"].as_str(),
+            expected_lite.then_some("all_turns")
+        );
+        assert_eq!(body["parallel_tool_calls"], !expected_lite);
         assert!(body.get("temperature").is_none());
         assert!(body.get("top_p").is_none());
         assert_eq!(

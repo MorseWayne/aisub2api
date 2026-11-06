@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Make Auto use Full by default for the verified `gpt-5.6-sol`, `gpt-6.1-sol` and `gpt-6-astra` models, while keeping `gpt-6-luna` on Lite. Users no longer need per-model opt-in for these defaults; other models retain their existing catalog-based behavior.
+- Preserve global forced modes and explicit per-model lane overrides ahead of the default policy. The policy applies to Messages, native Responses and WebSocket requests without modifying stored configuration or the raw upstream catalog; logs identify it as `default_policy`.
+
+### Validation
+
+- Passed all 664 workspace/all-targets tests, including no-override defaults, contradictory upstream lane hints, user overrides and parallel-call restrictions. Eight isolated gateway smoke cases verified actual Messages/native Responses headers, JSON and completion; the upstream and credentials were local fixtures, and live/Claude Code configuration remained unchanged.
+
 ## v6.0.6 - 2026-11-06
 
 ### Fixed

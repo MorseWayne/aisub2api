@@ -267,48 +267,41 @@ ChatGPT 使用 OAuth，因此 Providers 详情里的 **API Key** 会显示为 `O
 context_window = 872000
 image_input = true
 reasoning_effort_levels = ["low", "medium", "high", "xhigh", "max", "ultra"]
-responses_lite = true
+# responses_lite = true # 按需显式选择 Lite；省略则采用默认策略
 ```
 
-ChatGPT provider 会优先通过 OAuth 从 Codex `/models` 获取在线模型目录，并把最近一次成功获取的上下文能力写入 XDG cache 下的 `aisub2api/chatgpt/model-capabilities.json`。能力来源优先级为：显式 `model_capabilities` 覆盖 > 同 provider / Base URL / 身份摘要 / 模型的远端缓存 > 内置能力表。身份摘要包含可用的账号、用户、邮箱、套餐及额外路由头信息；已知身份的普通 token 轮换可以继续复用，身份改变或 provider 被替换后，旧刷新结果会被拒绝。持久化缓存已升级到 v2，旧条目会重新获取，token 存储格式不变。对 GPT-5.6，在线目录同时返回 `context_window` 与 `max_context_window` 时，默认采用后者的 872K 支持上限；其他模型仍优先使用 `context_window`。缓存不保存原始账号或 token，并采用临时文件加原子重命名写入。
+ChatGPT provider 会优先通过 OAuth 从 Codex `/models` 获取在线模型目录，并把最近一次成功获取的上下文能力写入 XDG cache 下的 `aisub2api/chatgpt/model-capabilities.json`。上下文、图片和推理能力的来源优先级为：显式 `model_capabilities` 覆盖 > 同 provider / Base URL / 身份摘要 / 模型的远端缓存 > 内置能力表；Lite/Full 的默认策略见下文。身份摘要包含可用的账号、用户、邮箱、套餐及额外路由头信息；已知身份的普通 token 轮换可以继续复用，身份改变或 provider 被替换后，旧刷新结果会被拒绝。持久化缓存已升级到 v2，旧条目会重新获取，token 存储格式不变。对 GPT-5.6，在线目录同时返回 `context_window` 与 `max_context_window` 时，默认采用后者的 872K 支持上限；其他模型仍优先使用 `context_window`。缓存不保存原始账号或 token，并采用临时文件加原子重命名写入。
 
 当前内置 ChatGPT 回退能力如下：
 
-| 模型 | 用途 | Context | 推理强度 | Responses Lite |
+| 模型 | 用途 | Context | 推理强度 | Auto 默认路径 |
 |------|------|---------|----------|----------------|
-| `gpt-5.6-sol` | 默认 / Reasoning / Opus | 872k | `low`…`ultra` | 是 |
-| `gpt-5.6-terra` | Sonnet | 872k | `low`…`ultra` | 是 |
-| `gpt-5.6-luna` | Haiku | 872k | `low`…`max` | 是 |
-| `gpt-6-astra` | 可选高级模型 | 272k | `low`…`ultra` | 是 |
-| `gpt-6-sol` | 可选通用模型 | 272k | `low`…`ultra` | 是 |
-| `gpt-6-luna` | 可选轻量模型 | 272k | `low`…`max` | 是 |
-| `gpt-6.1-sol` | 可选通用模型 | 272k | `low`…`ultra` | 是 |
-| `gpt-6.1-terra` | 可选通用模型 | 500k | `low`…`ultra` | 是 |
+| `gpt-5.6-sol` | 默认 / Reasoning / Opus | 872k | `low`…`ultra` | Full |
+| `gpt-5.6-terra` | Sonnet | 872k | `low`…`ultra` | Lite（跟随目录） |
+| `gpt-5.6-luna` | Haiku | 872k | `low`…`max` | Lite（跟随目录） |
+| `gpt-6-astra` | 可选高级模型 | 272k | `low`…`ultra` | Full |
+| `gpt-6-sol` | 可选通用模型 | 272k | `low`…`ultra` | Lite（跟随目录） |
+| `gpt-6-luna` | 可选轻量模型 | 272k | `low`…`max` | Lite |
+| `gpt-6.1-sol` | 可选通用模型 | 272k | `low`…`ultra` | Full |
+| `gpt-6.1-terra` | 可选通用模型 | 500k | `low`…`ultra` | Lite（跟随目录） |
 
 Astra、GPT-6 Sol/Luna 和 GPT-6.1 Sol 的 ChatGPT 回退使用 Codex 目录中的 272K active context；GPT-6.1 Terra 使用 500K active context，均不自动启用可选的 872K 扩展窗口。`openai/gpt-6-astra` 则声明公开 API 的 1,050,000 context、128,000 output 和 `low` 到 `max` 推理能力，Messages 请求也使用 Responses；两种提供商的限制分别处理。
 
 升级后，ChatGPT Messages SSE 的输出前 overload 恢复、Anthropic 错误类型和 request ID 保留自动生效，无需迁移 token 或手工添加 Claude Code 环境变量。恢复窗口最多 5 秒，累计达到 64 个事件或 256 KiB 时交付；HTTP 和 SSE 共用重试次数，文本、thinking、工具调用或未知事件交付后不再透明重放。原生 Responses 和 WebSocket 保留现有恢复行为。
 
-若要在 Claude Code 中启用并行工具调用，需要对支持的模型显式选择 Full。全局保持 `auto`，再按模型设置；Luna 保留 Lite：
+默认 `responses_lite = "auto"` 时，`gpt-5.6-sol`、`gpt-6.1-sol`、`gpt-6-astra` 自动选择 Full，`gpt-6-luna` 选择 Lite，无需手写逐模型配置；其他模型继续按在线目录或内置回退判断。Full 允许并行，仍尊重上游的并行能力和客户端显式限制，不强制模型每轮合并调用。
+
+用户显式配置仍然优先。例如，要把 Astra 改回 Lite：
 
 ```toml
 [providers.chatgpt.chatgpt]
 responses_lite = "auto"
 
-[providers.chatgpt.chatgpt.model_capabilities."gpt-5.6-sol"]
-responses_lite = false
-
-[providers.chatgpt.chatgpt.model_capabilities."gpt-6.1-sol"]
-responses_lite = false
-
 [providers.chatgpt.chatgpt.model_capabilities."gpt-6-astra"]
-responses_lite = false
-
-[providers.chatgpt.chatgpt.model_capabilities."gpt-6-luna"]
 responses_lite = true
 ```
 
-合并到已有同名 table，保留其他 capability，不要重复追加 table。全局 `on/off` 会覆盖逐模型选择；同 provider 的原生 Responses 也会使用这份策略。模型访问权限和 Full 可用性仍由上游账号决定。[多模型验证及边界](docs/reviews/2026-11-06-codex-claude-code-parallel-recovery.md)包含真实 CC、MCP、缓存和 WS continuation 的实测范围。
+覆盖项合并到已有同名 table，保留其他 capability，不要重复追加 table。优先级为：全局 `on/off` > 逐模型 `responses_lite` > 上述默认策略 > 在线目录或内置回退。已有显式 Lite 配置不会因升级被忽略；同 provider 的原生 Responses 也使用这份策略。模型访问权限和 Full 可用性仍由上游账号决定。[多模型验证及边界](docs/reviews/2026-11-06-codex-claude-code-parallel-recovery.md)包含真实 CC、MCP、缓存和 WS continuation 的实测范围。
 
 所有新建 ChatGPT 映射默认使用 `high`。TUI 的 Reasoning picker 对所有 Provider 都按当前模型声明的 `reasoning_effort_levels` 过滤，并在打开时按需拉取、缓存模型能力；能力明确为空时只显示 `unset`，拿不到能力或使用目录外的自定义模型时才显示完整兼容列表。以 GPT-5.6 为例，Sol/Terra 显示 `low` 到 `ultra`，Luna 只显示 `low` 到 `max`，不会再给 Luna 显示 `default`、`none` 或 `minimal`。`unset` 用于清除代理侧强制覆盖。`ultra` 遵循 Codex 语义：上游请求发送 `max`；支持 `ultra` 的 Sol/Terra/Astra 模型且请求包含委派工具时，同时启用主动多代理指令，否则仅按 `max` 发送并记录警告。Luna 不支持 `ultra`，会降为 `max`。
 
@@ -541,8 +534,8 @@ WebSocket；GET 探测会返回 `426 Upgrade Required`，让 Codex 立即改走 
 Outputs 能力和不支持的参数。每个模型还会返回 `provider` 和可直接路由的
 `qualified_id`，调用方无需再从未限定的模型名猜测 Provider 能力。
 
-对于 ChatGPT Provider，字符串 `input` 会自动归一化为输入项列表，Responses Lite
-要求的 `reasoning.context=all_turns` 和 `parallel_tool_calls=false` 也会自动补齐。
+对于 ChatGPT Provider，字符串 `input` 会自动归一化为输入项列表。仅在选择 Lite 时，
+才自动补齐 `reasoning.context=all_turns` 和 `parallel_tool_calls=false`。
 Codex 后端不接受 `max_output_tokens`；Proxy 会在 `unsupported_parameters` 中声明并在
 转发前移除。原生 OpenAI Provider 仍会原样收到 `max_output_tokens`。
 

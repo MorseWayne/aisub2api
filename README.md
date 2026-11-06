@@ -162,7 +162,7 @@ base_url = "https://chatgpt.com/backend-api/codex"
 context_window = 872000
 image_input = true
 reasoning_effort_levels = ["low", "medium", "high", "xhigh", "max", "ultra"]
-responses_lite = true
+# responses_lite = true                 # Optional explicit Lite override
 
 [model]
 default = "openai/gpt-4.1"
@@ -253,8 +253,8 @@ unsupported parameters. Each model also includes `provider` and a routable
 `qualified_id`, so clients do not have to infer provider-specific behavior from
 an unqualified model name.
 
-For the ChatGPT provider, string `input` is normalized to an input-item list and
-Responses Lite requirements (`reasoning.context=all_turns` and
+For the ChatGPT provider, string `input` is normalized to an input-item list.
+When Lite is selected, its requirements (`reasoning.context=all_turns` and
 `parallel_tool_calls=false`) are applied automatically. The Codex backend does
 not accept `max_output_tokens`; the proxy advertises it in
 `unsupported_parameters` and removes it before forwarding. Native OpenAI
@@ -268,7 +268,8 @@ overrides take precedence. These provider limits are separate.
 
 The ChatGPT fallback catalog also includes `gpt-6-sol`, `gpt-6-luna`, and
 `gpt-6.1-sol` with the 272,000-token active context, plus `gpt-6.1-terra` with
-the Codex catalog's 500,000-token active context. All use Responses Lite.
+the Codex catalog's 500,000-token active context. Lane selection follows the
+default policy below.
 Service tiers are sent only when requested or configured; an explicit `flex`
 tier is retained even when the catalog omits it. Flex capacity failures return
 503 with `x-should-retry: false` before streaming begins.
@@ -300,29 +301,27 @@ before enabling Full for particular models.
 
 Upgrading enables startup recovery and error diagnostics automatically; no token
 migration or Claude Code environment changes are required for these fixes.
-Parallel tool calls require an explicit Full-lane opt-in for each supported model:
+With the default `responses_lite = "auto"`, `gpt-5.6-sol`, `gpt-6.1-sol`, and
+`gpt-6-astra` use Full, while `gpt-6-luna` uses Lite. No per-model configuration
+is required for these defaults. Other models retain their catalog-based lane
+selection. Full permits parallel tools while respecting the model's parallel
+capability and explicit client restrictions; it does not force the model to batch.
+
+Explicit user settings take precedence. For example, to keep Astra on Lite:
 
 ```toml
 [providers.chatgpt.chatgpt]
 responses_lite = "auto"
 
-[providers.chatgpt.chatgpt.model_capabilities."gpt-5.6-sol"]
-responses_lite = false
-
-[providers.chatgpt.chatgpt.model_capabilities."gpt-6.1-sol"]
-responses_lite = false
-
 [providers.chatgpt.chatgpt.model_capabilities."gpt-6-astra"]
-responses_lite = false
-
-[providers.chatgpt.chatgpt.model_capabilities."gpt-6-luna"]
 responses_lite = true
 ```
 
-Merge these fields into existing tables and preserve other capabilities. Global
-`"on"` or `"off"` overrides per-model choices, so mixed policies require `"auto"`.
-Luna retains Lite. This policy also affects native Responses on the same provider;
-model access and Full availability still depend on the upstream account.
+Merge overrides into existing tables and preserve other capabilities. Priority is:
+global `"on"`/`"off"`, per-model `responses_lite`, the defaults above, then the
+remote/fallback catalog. Existing explicit Lite settings remain effective after
+upgrading. The policy also affects native Responses on the same provider; model
+access and Full availability still depend on the upstream account.
 
 Disconnecting the last streaming consumer closes the upstream read immediately;
 other consumers of a shared request can continue. ChatGPT clients retain only the
