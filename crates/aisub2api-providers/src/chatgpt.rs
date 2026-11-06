@@ -6913,11 +6913,14 @@ mod tests {
 
     #[tokio::test]
     async fn chatgpt_websocket_success_streams_response_events() {
-        let (endpoint, requests, handshakes) = websocket_events_server(vec![
+        // Legitimate metadata at the startup event limit must still be delivered
+        // before the response rather than causing a fallback or a deadlock.
+        let mut upstream_events = vec![json!({"type":"codex.response.metadata"}); 64];
+        upstream_events.extend([
             websocket_response_created("resp-ws-1"),
             websocket_response_completed("resp-ws-1"),
-        ])
-        .await;
+        ]);
+        let (endpoint, requests, handshakes) = websocket_events_server(upstream_events).await;
         let mut provider = test_chatgpt_provider(endpoint).await;
         provider.transport = ChatGptTransport::Websocket;
         let stream = provider
@@ -7865,6 +7868,124 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert!(requests[0].headers.starts_with("GET "));
         assert!(requests[1].headers.starts_with("POST "));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_auto_transport_bounds_startup_metadata_before_fallback() {
+        for prelude in [
+            vec![json!({"type":"codex.rate_limits"}); 1601],
+            vec![json!({"type":"codex.response.metadata", "padding":"x".repeat(256 * 1024)})],
+        ] {
+            assert_websocket_startup_falls_back(StartupFixture::Prelude(prelude), None).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn chatgpt_auto_transport_bounds_startup_without_response_progress() {
+        for behavior in [
+            StartupFixture::Silent,
+            StartupFixture::Heartbeats,
+            StartupFixture::PeriodicMetadata,
+        ] {
+            assert_websocket_startup_falls_back(behavior, Some(1)).await;
+        }
+    }
+
+    async fn assert_websocket_startup_falls_back(
+        behavior: StartupFixture,
+        startup_timeout_seconds: Option<u64>,
+    ) {
+        let (endpoint, websocket_requests, sse_requests) =
+            websocket_startup_fixture(behavior).await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Auto;
+        provider.chatgpt_config.websocket_startup_timeout_seconds = startup_timeout_seconds;
+        provider.runtime.request.stream_idle_timeout_seconds = Some(3);
+        let prime = provider
+            .chat_prepared_with_token(chatgpt_test_prepared_request(401), chatgpt_test_token())
+            .await
+            .unwrap();
+        assert!(
+            collect_stream_results(prime)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+
+        let mut body = chatgpt_websocket_test_body();
+        body["input"] = json!([
+            {"role":"user","content":"hi"},
+            {"role":"assistant","content":"hello"},
+            {"role":"user","content":"next"}
+        ]);
+        let stream = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.chat_prepared_with_token(
+                chatgpt_test_prepared_request_with_body(
+                    402,
+                    body.clone(),
+                    Some("conversation-test"),
+                ),
+                chatgpt_test_token(),
+            ),
+        )
+        .await
+        .expect("startup metadata must not deadlock before the consumer is started")
+        .expect("Auto should recover over SSE");
+        assert!(
+            collect_stream_results(stream)
+                .await
+                .iter()
+                .all(Result::is_ok)
+        );
+        assert_eq!(provider.effective_transport(), ChatGptTransport::Sse);
+        {
+            let websocket_requests = websocket_requests.lock().unwrap();
+            assert_eq!(websocket_requests.len(), 2);
+            assert_eq!(
+                websocket_requests[1]["previous_response_id"],
+                "startup-prime"
+            );
+            assert_eq!(websocket_requests[1]["input"].as_array().unwrap().len(), 1);
+        }
+        let sse_requests = sse_requests.lock().await;
+        assert_eq!(sse_requests.len(), 1);
+        let recovered = request_body_json(&sse_requests[0]);
+        assert_eq!(recovered["input"], body["input"]);
+        assert!(recovered.get("previous_response_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn chatgpt_websocket_startup_budget_stops_after_response_begins() {
+        let (endpoint, websocket_requests, sse_requests) = websocket_startup_fixture(
+            StartupFixture::DelayedCompletion(Duration::from_millis(1200)),
+        )
+        .await;
+        let mut provider = test_chatgpt_provider(endpoint).await;
+        provider.transport = ChatGptTransport::Auto;
+        provider.chatgpt_config.websocket_startup_timeout_seconds = Some(1);
+        provider.runtime.request.stream_idle_timeout_seconds = Some(3);
+        for id in [403, 404] {
+            let stream = provider
+                .chat_prepared_with_token(chatgpt_test_prepared_request(id), chatgpt_test_token())
+                .await
+                .expect("response.created must finish startup");
+            let events =
+                tokio::time::timeout(Duration::from_secs(3), collect_stream_results(stream))
+                    .await
+                    .expect("active response should complete after its startup budget elapsed");
+            assert!(events.iter().all(Result::is_ok));
+            assert!(
+                events
+                    .iter()
+                    .filter_map(|event| event.as_ref().ok())
+                    .any(|event| event.event == "message_stop")
+            );
+        }
+        assert_eq!(provider.effective_transport(), ChatGptTransport::Auto);
+        assert_eq!(provider.websocket_stats.snapshot().fallbacks, 0);
+        assert_eq!(websocket_requests.lock().unwrap().len(), 2);
+        assert!(sse_requests.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -9157,6 +9278,151 @@ mod tests {
             "http://chatgpt.test/responses".to_string(),
             format!("http://{addr}"),
             connect_requests,
+        )
+    }
+
+    enum StartupFixture {
+        Prelude(Vec<Value>),
+        Silent,
+        Heartbeats,
+        PeriodicMetadata,
+        DelayedCompletion(Duration),
+    }
+
+    async fn websocket_startup_fixture(
+        behavior: StartupFixture,
+    ) -> (
+        String,
+        Arc<StdMutex<Vec<Value>>>,
+        Arc<Mutex<Vec<CapturedHttpRequest>>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let websocket_requests = Arc::new(StdMutex::new(Vec::new()));
+        let sse_requests = Arc::new(Mutex::new(Vec::new()));
+        let captured_ws = websocket_requests.clone();
+        let captured_sse = sse_requests.clone();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_hdr_async(
+                socket,
+                |_request: &WsServerRequest, response: WsServerResponse| Ok(response),
+            )
+            .await
+            .unwrap();
+            for request_index in 0..2 {
+                let Some(Ok(WsMessage::Text(text))) = websocket.next().await else {
+                    return;
+                };
+                captured_ws
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&text).unwrap());
+                if request_index == 0 {
+                    for event in [
+                        websocket_response_created("startup-prime"),
+                        websocket_response_completed_with_output(
+                            "startup-prime",
+                            json!([{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]),
+                        ),
+                    ] {
+                        websocket
+                            .send(WsMessage::Text(event.to_string().into()))
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+            tokio::spawn(async move {
+                if matches!(
+                    behavior,
+                    StartupFixture::Heartbeats | StartupFixture::PeriodicMetadata
+                ) {
+                    let metadata = matches!(behavior, StartupFixture::PeriodicMetadata);
+                    let mut interval = tokio::time::interval(Duration::from_millis(50));
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                let message = if metadata {
+                                    WsMessage::Text(json!({"type":"codex.rate_limits"}).to_string().into())
+                                } else {
+                                    WsMessage::Ping(Vec::new().into())
+                                };
+                                if websocket.send(message).await.is_err() {
+                                    break;
+                                }
+                            }
+                            message = websocket.next() => {
+                                if !matches!(message, Some(Ok(_))) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+                if let StartupFixture::Prelude(prelude) = behavior {
+                    for event in prelude {
+                        if websocket
+                            .send(WsMessage::Text(event.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    // This used to block while placing startup events into a
+                    // bounded channel before its consumer existed.
+                    let _ = websocket
+                        .send(WsMessage::Text(
+                            websocket_response_created("startup-burst")
+                                .to_string()
+                                .into(),
+                        ))
+                        .await;
+                } else if let StartupFixture::DelayedCompletion(delay) = behavior {
+                    if websocket
+                        .send(WsMessage::Text(
+                            websocket_response_created("startup-slow")
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(delay).await;
+                    let _ = websocket
+                        .send(WsMessage::Text(
+                            websocket_response_completed("startup-slow")
+                                .to_string()
+                                .into(),
+                        ))
+                        .await;
+                }
+                let _ = websocket.next().await;
+            });
+            let (mut socket, _) = listener.accept().await.unwrap();
+            captured_sse
+                .lock()
+                .await
+                .push(read_http_request_allow_empty_body(&mut socket).await);
+            let body = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                websocket_response_created("startup-sse"),
+                websocket_response_completed("startup-sse")
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (
+            format!("http://{addr}/responses"),
+            websocket_requests,
+            sse_requests,
         )
     }
 

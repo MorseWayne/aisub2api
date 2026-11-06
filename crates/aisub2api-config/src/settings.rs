@@ -173,6 +173,10 @@ pub struct ChatGptProviderConfig {
     /// Transport used for ChatGPT Codex Responses streams.
     #[serde(default)]
     pub transport: ChatGptTransport,
+    /// Total time allowed to send a WebSocket request and receive its first
+    /// response event. None uses the provider's automatic startup budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket_startup_timeout_seconds: Option<u64>,
     /// Responses Lite policy for ChatGPT Codex requests.
     #[serde(default)]
     pub responses_lite: ResponsesLiteMode,
@@ -193,6 +197,7 @@ impl Default for ChatGptProviderConfig {
             originator: default_empty(),
             user_agent: default_empty(),
             transport: ChatGptTransport::default(),
+            websocket_startup_timeout_seconds: None,
             responses_lite: ResponsesLiteMode::Auto,
             fast_mode: false,
             claude_code_context: ClaudeCodeContextMode::Auto,
@@ -1100,6 +1105,18 @@ impl Settings {
                 "http.max_sse_frame_bytes must be > 0".to_string(),
             ));
         }
+        for (provider_id, provider) in &self.providers {
+            if provider.resolve_type(provider_id) == ProviderType::ChatGPT
+                && provider
+                    .chatgpt
+                    .as_ref()
+                    .is_some_and(|config| config.websocket_startup_timeout_seconds == Some(0))
+            {
+                return Err(ConfigError::Validation(format!(
+                    "providers.{provider_id}.chatgpt.websocket_startup_timeout_seconds must be > 0"
+                )));
+            }
+        }
         // Validate model format: must contain provider_id/model_name
         let models = [
             ("model.default", Some(&self.model.default)),
@@ -1648,6 +1665,45 @@ claude_code_context = "standard"
                 .unwrap()
                 .claude_code_context,
             ClaudeCodeContextMode::Standard
+        );
+    }
+
+    #[test]
+    fn chatgpt_websocket_startup_budget_is_optional_and_positive() {
+        let mut settings = Settings::from_toml(
+            r#"
+[providers.chatgpt]
+provider_type = "chatgpt"
+[providers.chatgpt.chatgpt]
+websocket_startup_timeout_seconds = 45
+"#,
+            Path::new("test.toml"),
+        )
+        .unwrap();
+        assert!(settings.validate().is_ok());
+        let encoded = settings.to_toml();
+        let restored = Settings::from_toml(&encoded, Path::new("test.toml")).unwrap();
+        assert_eq!(
+            restored.providers["chatgpt"]
+                .chatgpt
+                .as_ref()
+                .unwrap()
+                .websocket_startup_timeout_seconds,
+            Some(45)
+        );
+        settings
+            .providers
+            .get_mut("chatgpt")
+            .unwrap()
+            .chatgpt
+            .as_mut()
+            .unwrap()
+            .websocket_startup_timeout_seconds = Some(0);
+        assert!(settings.validate().is_err());
+        assert!(
+            !toml::to_string(&ChatGptProviderConfig::default())
+                .unwrap()
+                .contains("websocket_startup_timeout_seconds")
         );
     }
 

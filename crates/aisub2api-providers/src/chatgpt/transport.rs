@@ -38,6 +38,9 @@ const OPENAI_BETA_HEADER: &str = "openai-beta";
 const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
 const CHATGPT_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const CHATGPT_WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const CHATGPT_WEBSOCKET_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const CHATGPT_WEBSOCKET_STARTUP_MAX_EVENTS: usize = 64;
+const CHATGPT_WEBSOCKET_STARTUP_MAX_BYTES: usize = 256 * 1024;
 const CHATGPT_WEBSOCKET_SESSION_IDLE_TTL: Duration = Duration::from_secs(60);
 const CHATGPT_CONTINUATION_SCHEMA_VERSION: &str = "chatgpt-continuation-v1";
 const WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY: &str =
@@ -260,6 +263,7 @@ impl ChatGptWebSocketSession {
         body: &Value,
         stable_client_conversation_id: Option<&str>,
         active_connection_id: Option<u64>,
+        request_id: u64,
     ) -> ContinuationAttempt {
         self.prune_expired_continuations();
         let Some(key) = continuation_key(provider, token, body, stable_client_conversation_id)
@@ -346,6 +350,13 @@ impl ChatGptWebSocketSession {
                     &key,
                 ) =>
             {
+                info!(
+                    request_id,
+                    transport = "websocket",
+                    websocket_connection_id = active_connection_id,
+                    changed_fields = ?continuation_body_mismatch_fields(&cached.canonical_body, &canonical_body),
+                    "ChatGPT websocket continuation body changed"
+                );
                 self.clear_continuation_for_key(&active_key);
                 disabled_reason = ContinuationDisabledReason::BodyMismatch;
             }
@@ -761,6 +772,30 @@ fn canonical_body_without_prompt_cache_key(body: &Value) -> Value {
     body
 }
 
+/// Diagnose a mismatch without logging prompts, tools, identities or values.
+fn continuation_body_mismatch_fields(cached: &Value, current: &Value) -> Vec<String> {
+    let mut fields = std::collections::BTreeSet::new();
+    for key in cached
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.keys())
+        .chain(
+            current
+                .as_object()
+                .into_iter()
+                .flat_map(|object| object.keys()),
+        )
+    {
+        if cached.get(key) != current.get(key) {
+            fields.insert(key.chars().take(64).collect::<String>());
+            if fields.len() >= 16 {
+                break;
+            }
+        }
+    }
+    fields.into_iter().collect()
+}
+
 fn continuation_delta(cached: &CachedContinuation, full_input: &[Value]) -> Option<Vec<Value>> {
     if !cached.assistant_output_items.is_empty() {
         let mut baseline = cached.full_input.clone();
@@ -1034,12 +1069,14 @@ where
             &body,
             stable_client_conversation_id,
             checked_out_connection_id,
+            request_id,
         );
     let upstream_send_body_bytes =
         serde_json::to_vec(&continuation.send_body).map_or(0, |bytes| bytes.len());
     let continuation_used = continuation.used;
     let continuation_disabled_reason = continuation.disabled_reason.as_str();
     info!(
+        request_id,
         transport = "websocket",
         continuation_key_present = continuation.key.is_some(),
         continuation_used = continuation.used,
@@ -1075,65 +1112,104 @@ where
             return Err(error);
         }
     };
-    if let Err(error) = send_websocket_request(&mut stream, request_text, idle_timeout).await {
-        provider
-            .websocket_session
-            .lock()
-            .await
-            .fail_continuation_for_connection(&continuation, checked_out_connection_id);
-        return Err(ChatGptWebSocketStartError::with_phase(
-            error,
-            true,
-            ChatGptWebSocketPhase::Send,
-        ));
-    }
-
     let mut startup_events = Vec::new();
-    let first_event = loop {
-        match read_next_json_event(&mut stream, idle_timeout, true).await {
-            Ok(event) => {
-                if websocket_event_can_emit_downstream_sse(&event) {
-                    break event;
-                }
-                info!(
-                    request_id,
-                    transport = "websocket",
-                    event_type = event
-                        .get("type")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("unknown"),
-                    websocket_prelude_events = startup_events.len() + 1,
-                    "ChatGPT websocket prelude upstream event received before downstream stream start"
-                );
-                startup_events.push(event);
+    let mut startup_bytes = 0_usize;
+    let mut startup_phase = ChatGptWebSocketPhase::Send;
+    let startup_timeout = provider
+        .chatgpt_config
+        .websocket_startup_timeout_seconds
+        .map(Duration::from_secs)
+        .unwrap_or(CHATGPT_WEBSOCKET_STARTUP_TIMEOUT);
+    let startup_started = Instant::now();
+    // One budget covers sending and every prelude/control frame. Individual
+    // ping/pong or metadata messages must not extend startup indefinitely.
+    let startup = tokio::time::timeout(startup_timeout, async {
+        send_websocket_request(&mut stream, request_text, idle_timeout)
+            .await
+            .map_err(|error| {
+                ChatGptWebSocketStartError::with_phase(error, true, ChatGptWebSocketPhase::Send)
+            })?;
+        startup_phase = ChatGptWebSocketPhase::FirstEvent;
+        loop {
+            let event = read_next_json_event(&mut stream, idle_timeout, true).await?;
+            if websocket_event_can_emit_downstream_sse(&event) {
+                return Ok(event);
             }
-            Err(mut error) => {
-                if continuation_error_allows_sse_fallback(&continuation, &error.error) {
-                    provider
-                        .websocket_session
-                        .lock()
-                        .await
-                        .fail_continuation_for_connection(&continuation, checked_out_connection_id);
-                    info!(
-                        request_id,
-                        transport = "websocket",
-                        websocket_reused = reused,
-                        websocket_connection_id = checked_out_connection_id.unwrap_or(0),
-                        continuation_used = continuation.used,
-                        websocket_prelude_events = startup_events.len(),
-                        "ChatGPT websocket continuation response id was rejected"
-                    );
-                    close_or_release_websocket(stream).await;
-                    error.fallback_allowed = true;
-                    return Err(error);
-                }
+            let event_bytes = event.to_string().len();
+            if startup_events.len() >= CHATGPT_WEBSOCKET_STARTUP_MAX_EVENTS
+                || event_bytes > CHATGPT_WEBSOCKET_STARTUP_MAX_BYTES.saturating_sub(startup_bytes)
+            {
+                return Err(ChatGptWebSocketStartError::with_phase(
+                    ProviderError::Network(
+                        "ChatGPT websocket startup prelude exceeded its buffer limit".to_string(),
+                    ),
+                    true,
+                    ChatGptWebSocketPhase::FirstEvent,
+                ));
+            }
+            info!(
+                request_id,
+                transport = "websocket",
+                event_type = event
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown"),
+                websocket_prelude_events = startup_events.len() + 1,
+                "ChatGPT websocket prelude upstream event received before downstream stream start"
+            );
+            startup_bytes += event_bytes;
+            startup_events.push(event);
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(ChatGptWebSocketStartError::with_phase(
+            ProviderError::Timeout,
+            true,
+            startup_phase,
+        ))
+    });
+    let first_event = match startup {
+        Ok(event) => event,
+        Err(mut error) => {
+            info!(
+                request_id,
+                transport = "websocket",
+                websocket_failure_phase = error.phase.as_str(),
+                websocket_reused = reused,
+                websocket_connection_id = checked_out_connection_id.unwrap_or(0),
+                continuation_used = continuation.used,
+                startup_elapsed_ms = startup_started.elapsed().as_millis() as u64,
+                startup_timeout_ms = startup_timeout.as_millis() as u64,
+                websocket_prelude_events = startup_events.len(),
+                websocket_prelude_bytes = startup_bytes,
+                "ChatGPT websocket startup did not complete"
+            );
+            if continuation_error_allows_sse_fallback(&continuation, &error.error) {
                 provider
                     .websocket_session
                     .lock()
                     .await
                     .fail_continuation_for_connection(&continuation, checked_out_connection_id);
+                info!(
+                    request_id,
+                    transport = "websocket",
+                    websocket_reused = reused,
+                    websocket_connection_id = checked_out_connection_id.unwrap_or(0),
+                    continuation_used = continuation.used,
+                    websocket_prelude_events = startup_events.len(),
+                    "ChatGPT websocket continuation response id was rejected"
+                );
+                close_or_release_websocket(stream).await;
+                error.fallback_allowed = true;
                 return Err(error);
             }
+            provider
+                .websocket_session
+                .lock()
+                .await
+                .fail_continuation_for_connection(&continuation, checked_out_connection_id);
+            return Err(error);
         }
     };
     let first_event_terminal = is_terminal_response_event(&first_event);
@@ -2465,6 +2541,32 @@ mod tests {
 
         assert_eq!(first, second);
         assert_ne!(first, changed);
+        assert_eq!(
+            continuation_body_mismatch_fields(&first, &changed),
+            ["text"]
+        );
+    }
+
+    #[test]
+    fn continuation_mismatch_diagnostics_are_bounded_and_only_name_fields() {
+        let cached = json!({"instructions":"private prompt", "tools":[{"name":"private-tool"}]});
+        let current = json!({"instructions":"new private prompt", "reasoning":{"effort":"high"}});
+        assert_eq!(
+            continuation_body_mismatch_fields(&cached, &current),
+            ["instructions", "reasoning", "tools"]
+        );
+        let mut changed = Map::new();
+        for index in 0..30 {
+            changed.insert(format!("field-{index:02}"), json!("private value"));
+        }
+        assert_eq!(
+            continuation_body_mismatch_fields(&json!({}), &Value::Object(changed)).len(),
+            16
+        );
+        let long_key = "模".repeat(80);
+        let changed = Value::Object(Map::from_iter([(long_key, json!("private value"))]));
+        let names = continuation_body_mismatch_fields(&json!({}), &changed);
+        assert_eq!(names[0].chars().count(), 64);
     }
 
     #[test]

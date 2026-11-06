@@ -154,6 +154,7 @@ base_url = "https://chatgpt.com/backend-api/codex"
 # originator = "codex_cli_rs"
 # user_agent = "codex_cli_rs/1.0.0 (aisub2api)"
 # transport = "auto"       # "auto", "websocket", or "sse"
+# websocket_startup_timeout_seconds = 30 # Total send/first-response budget; generation uses its existing idle timeout.
 # responses_lite = "auto"  # "auto", "on", or "off"
 
 # Optional: override ChatGPT/Codex model capabilities when upstream changes ahead of a release.
@@ -343,6 +344,12 @@ capability caches are refreshed after upgrading to the new identity-scoped forma
 With `transport = "auto"`, a fallback-eligible WebSocket failure switches that
 provider instance to HTTP/SSE until the provider is reloaded; there is no timed
 WebSocket recovery or `generate=false` prewarm path.
+
+WebSocket startup has a 30-second total budget for sending the request and
+receiving its first response event; ping/pong and prelude metadata do not extend
+it. Active generation keeps its existing idle timeout. The optional positive
+`chatgpt.websocket_startup_timeout_seconds` overrides this budget. Startup metadata
+is limited to 64 events and 256 KiB of serialized metadata before a response starts.
 
 ### OpenAI Client Setup
 
