@@ -2272,35 +2272,9 @@ pub(crate) fn sync_claude_code_settings(
     mark_onboarding_complete: bool,
 ) -> Result<PathBuf, String> {
     let path = claude_code_settings_path()?;
-    let mut value = if path.exists() {
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| format!("failed to read Claude Code settings: {e}"))?;
-        if content.trim().is_empty() {
-            Value::Object(Map::new())
-        } else {
-            serde_json::from_str(&content)
-                .map_err(|e| format!("failed to parse Claude Code settings JSON: {e}"))?
-        }
-    } else {
-        Value::Object(Map::new())
-    };
-
-    if !value.is_object() {
-        return Err("Claude Code settings root must be a JSON object".to_string());
-    }
-    if value.get("env").is_some_and(|env| !env.is_object()) {
-        return Err("Claude Code settings env must be a JSON object".to_string());
-    }
+    let mut value = crate::claude_config::read_settings(&path)?;
     apply_claude_code_env(&mut value, settings);
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create Claude Code config directory: {e}"))?;
-    }
-    let content = serde_json::to_string_pretty(&value)
-        .map_err(|e| format!("failed to serialize Claude Code settings: {e}"))?;
-    std::fs::write(&path, format!("{content}\n"))
-        .map_err(|e| format!("failed to write Claude Code settings: {e}"))?;
+    crate::claude_config::write_settings(&path, &value)?;
     sync_claude_user_config(&settings.server.auth_token, mark_onboarding_complete)?;
     Ok(path)
 }
@@ -2448,7 +2422,7 @@ fn claude_user_config_path_for_dir(dir: &Path) -> Result<PathBuf, String> {
     Ok(parent.join(format!("{}.json", file_name.to_string_lossy())))
 }
 
-fn claude_code_settings_path() -> Result<PathBuf, String> {
+pub(crate) fn claude_code_settings_path() -> Result<PathBuf, String> {
     let dir = claude_code_config_dir()?;
     let settings = dir.join("settings.json");
     if settings.exists() {
@@ -2479,7 +2453,7 @@ fn home_dir() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
-fn apply_claude_code_env(value: &mut Value, settings: &Settings) {
+pub(crate) fn apply_claude_code_env(value: &mut Value, settings: &Settings) {
     if !value.is_object() {
         *value = Value::Object(Map::new());
     }

@@ -7,6 +7,7 @@ use aisub2api_config::settings::{ModelReasoningEffort, ProviderConfig, ProviderT
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 
+mod claude_config;
 mod logging;
 mod tui;
 
@@ -120,8 +121,14 @@ enum ConfigAction {
     Show,
     /// Open config in $EDITOR
     Edit,
-    /// Validate the configuration
+    /// Validate aisub2api and inspect Claude Code user settings (read-only)
     Validate,
+    /// Sync Claude Code settings, or explicitly configure its WebFetch domain check
+    Claude {
+        /// Set only WebFetch's domain check: check (default behavior) or skip
+        #[arg(long, value_enum)]
+        webfetch_preflight: Option<WebFetchPreflight>,
+    },
     /// Print the config file path
     Path,
     /// Export config to a file
@@ -134,6 +141,12 @@ enum ConfigAction {
         /// Input file path
         path: PathBuf,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum WebFetchPreflight {
+    Check,
+    Skip,
 }
 
 #[derive(Subcommand)]
@@ -735,7 +748,32 @@ async fn handle_config(action: ConfigAction) {
         ConfigAction::Validate => match aisub2api_config::Settings::config_file_path() {
             Some(path) if path.exists() => match aisub2api_config::Settings::load(&path) {
                 Ok(settings) => match settings.validate() {
-                    Ok(()) => println!("{} Configuration is valid.", "✓".green()),
+                    Ok(()) => {
+                        println!("{} aisub2api configuration is valid.", "✓".green());
+                        match claude_config::check(&settings) {
+                            Ok((path, diagnostics)) => {
+                                println!("Claude Code user settings: {}", path.display());
+                                println!(
+                                    "Scope: user settings only; project, managed, shell/CLI overrides and running sessions are not evaluated."
+                                );
+                                for diagnostic in diagnostics {
+                                    let label = if diagnostic.warning {
+                                        "Warning:".yellow()
+                                    } else {
+                                        "Info:".normal()
+                                    };
+                                    println!("  {label} {}", diagnostic.message);
+                                }
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "{} Claude Code settings validation failed: {error}",
+                                    "✗".red()
+                                );
+                                process::exit(1);
+                            }
+                        }
+                    }
                     Err(e) => {
                         eprintln!("{} Validation failed: {e}", "✗".red());
                         process::exit(1);
@@ -751,6 +789,54 @@ async fn handle_config(action: ConfigAction) {
                 process::exit(1);
             }
         },
+        ConfigAction::Claude { webfetch_preflight } => {
+            let result = if let Some(preflight) = webfetch_preflight {
+                claude_config::set_webfetch_preflight(matches!(preflight, WebFetchPreflight::Skip))
+            } else {
+                let settings = load_settings_or_exit();
+                if let Err(error) = settings.validate() {
+                    eprintln!("{} Validation failed: {error}", "✗".red());
+                    process::exit(1);
+                }
+                if !settings
+                    .providers
+                    .contains_key(aisub2api_config::Settings::parse_provider_id(
+                        &settings.model.default.name,
+                    ))
+                {
+                    eprintln!(
+                        "{} Configure the default model's provider before syncing Claude Code.",
+                        "✗".red()
+                    );
+                    process::exit(1);
+                }
+                tui::sync_claude_code_settings(&settings, false)
+            };
+            match result {
+                Ok(path) => {
+                    println!(
+                        "{} Updated Claude Code settings: {}",
+                        "✓".green(),
+                        path.display()
+                    );
+                    if let Some(preflight) = webfetch_preflight {
+                        match preflight {
+                            WebFetchPreflight::Skip => println!(
+                                "WebFetch will skip Anthropic's domain blocklist check; WebFetch permission rules still apply."
+                            ),
+                            WebFetchPreflight::Check => println!(
+                                "WebFetch will check domains with Anthropic before fetching."
+                            ),
+                        }
+                    }
+                    println!("Start a new Claude Code session to verify the settings.");
+                }
+                Err(error) => {
+                    eprintln!("{} Claude Code settings update failed: {error}", "✗".red());
+                    process::exit(1);
+                }
+            }
+        }
         ConfigAction::Path => {
             let path = config_file_path_or_exit();
             println!("{}", path.display());

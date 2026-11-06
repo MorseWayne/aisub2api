@@ -2,6 +2,30 @@
 
 本指南基于 Claude Code 2.1.318 的实际请求与隔离实验。Claude Code 的本地工具、代理公开的协议、上游模型能力是不同层；成功返回文本不代表三层全部等价。[调研与验证范围](../reviews/2026-11-05-claude-code-third-party-experience.md)记录了版本、来源及实测结果。
 
+## 按功能异常定位配置
+
+| 症状 | 对应配置或处理 | aisub2api 当前行为 |
+| --- | --- | --- |
+| 没有 TaskCreate / TaskUpdate | `env.CLAUDE_CODE_ENABLE_TODO_TOOLS=1` | 已自动补缺省值；保留显式禁用 |
+| 主对话成功，切换角色或后台请求 model_not_found | 配置 Haiku / Sonnet / Opus 角色到实际可用 ID | 第三方未配置角色已自动继承主模型 |
+| 工具发现失败或上游拒绝工具引用 | 排查 `ENABLE_TOOL_SEARCH`；必要时用 `false` 对照直接加载 | 默认 auto，保留已有选择 |
+| WebFetch 报域名无法验证 | 检查 Anthropic 域名检查服务；必要时顶层设置 `skipWebFetchPreflight=true` | 不全局跳过域名检查，详见下文 |
+| `/model` 没显示 GPT | 使用完整 ID、角色或自定义 picker；模型发现另有名称过滤 | 保留用户 picker；发现开关不能消除过滤 |
+| 输出或上下文提前触顶 | 分别核对输出预算、真实模型窗口及代理投影 | 保留输出覆盖，按已知 ChatGPT 模型应用现有投影 |
+
+[第三方差别待遇与功能开关核查](../reviews/2026-11-06-claude-code-chatgpt-restrictions.md)记录了每项证据及限制。功能异常优先对应具体配置，不需要把所有兼容开关一起打开。
+
+### 先检查，再按需修复
+
+```sh
+aisub2api config validate
+aisub2api config claude
+```
+
+`config validate` 校验代理配置，并只读检查 Claude 用户设置中的路由、凭据是否一致、任务工具、工具搜索、WebFetch 设置位置和已知无效开关。它显示实际检查的文件路径，不打印凭据或配置原值；项目设置、组织策略、shell / CLI 覆盖和运行中会话不在本次检查范围内。兼容性提醒不改变成功退出码，Claude JSON 损坏或 WebFetch 值类型错误会返回失败。
+
+`config claude` 将已有代理配置重新同步到 Claude，补充缺省任务工具和搜索策略、更新模型及角色路由。已有的显式功能开关、picker、权限规则和 WebFetch 选择会保留。这个命令需要已完成的 provider / 主模型配置；它不会启动服务。
+
 ## 只选择 provider 和主模型即可
 
 在 TUI 或 CLI 中完成 provider 和主模型配置后，aisub2api 自动生成 Claude Code 的兼容配置：
@@ -76,6 +100,42 @@ aisub2api 已自动补充以下设置，无需手动开启：
 
 OpenAI/ChatGPT 转换链路会按上游流式事件输出工具参数增量，不需要为这条链路额外开启 Anthropic 专用字段。原生 Messages 链路可以对已确认支持的上游测试 `CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1`，2.1.318 会在自定义地址下发送 `eager_input_streaming`；这个请求提示不是 OpenAI 上游的同名能力。aisub2api 保留用户开关，不对未知原生上游强加字段，也不保证打开开关就减少生成延迟。
 
+### WebFetch 报域名无法验证时
+
+即使模型接到第三方接口，WebFetch 默认仍会先向 `api.anthropic.com` 检查目标域名。检查服务不可达或返回错误时，客户端会在请求目标网页前停止，常见错误为 `Unable to verify if domain ... is safe to fetch`。单独关闭 telemetry 或设置 `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 不会关闭该检查。
+
+如果故障已定位到这个检查，使用显式修复入口：
+
+```sh
+aisub2api config claude --webfetch-preflight skip
+```
+
+恢复原有域名检查：
+
+```sh
+aisub2api config claude --webfetch-preflight check
+```
+
+带此选项的命令只修改 Claude 用户设置中的 WebFetch 域名检查，并清理误放在 env 中的同名项；不同步模型、认证或其他配置，也可在代理尚未配置时使用。后续常规配置同步保留这一选择。新开 Claude 会话核对效果。
+
+对应 Claude settings 的顶层布尔设置如下；它与 `env` 同级：
+
+```json
+{
+  "skipWebFetchPreflight": true
+}
+```
+
+本轮模拟检查服务失败时，GPT 和原生 Claude 都抓取失败；设置该项后，GPT 路径恢复并且不再请求检查接口。它跳过 Anthropic 域名黑名单查询，抓取仍遵循 WebFetch 权限规则。此设置不提供 WebSearch，也不修复目标站点连接或模型摘要错误。aisub2api 不为所有第三方连接自动启用它。[官方说明](https://code.claude.com/docs/en/settings-reference#skipwebfetchpreflight)。
+
+### capability 与 thinking 开关的适用范围
+
+在本指南使用的普通 `ANTHROPIC_BASE_URL` 接入方式下，`ANTHROPIC_DEFAULT_*_MODEL_SUPPORTED_CAPABILITIES` 不参与能力覆盖。它们主要用于 Bedrock、Google Cloud、Foundry 等接入方式；给这里的 GPT ID 添加声明不会恢复功能，也不会按声明删掉其余能力。
+
+2.1.318 的 `CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1` 只对特定已知 Claude ID 生效，不能作为 GPT / 陌生模型的通用降级开关。本轮 GPT 仍发送 adaptive，Sonnet 4.6 对照则改成固定 thinking budget。`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` 会删除 context management 等字段，但仍可能保留 adaptive thinking、effort 和部分 beta header。上游拒绝字段时，应按具体协议与模型能力处理，不能仅凭开关名称认定已经降级。
+
+关闭 telemetry、growthbook 或 nonessential traffic 还可能停止远端 feature flag 获取，让依赖它的部分功能不可用。这些设置不作为第三方接入的默认修复。[官方功能开关依赖](https://code.claude.com/docs/en/env-vars#features-that-need-feature-flag-fetching)。
+
 ## 自动上下文策略与高级覆盖
 
 日常使用无需填写窗口变量。已知 ChatGPT 模型继续采用 aisub2api 原有的自动投影和真实上游窗口检查；未知容量保持保守行为。以下矩阵用于解释高级覆盖，不能据此把声明值当作上游实际容量。
@@ -101,3 +161,16 @@ OpenAI/ChatGPT 转换链路会按上游流式事件输出工具参数增量，�
 WebSearch 等工具的出现也不保证其服务端能力可用。可以选择确实支持相应工具的上游，或使用自己配置的搜索 MCP；后者是独立工具，不会自动等价于 Anthropic 服务端搜索。订阅云功能、Remote Control、云端任务和某些后台服务还依赖 Anthropic 登录与服务，API 转换无法补齐这些依赖。[官方功能矩阵](https://code.claude.com/docs/en/feature-availability)。
 
 不要默认关闭全部 experimental betas：这会同时关闭部分有用能力，而且不保证移除 adaptive thinking 或 effort。仅在已确定某上游拒绝这些字段时选择兼容配置，优先保留原始错误让客户端按已支持的恢复路径降级。
+
+## 升级 Claude 后运行本地兼容验收
+
+仓库内脚本使用已安装的 Claude Code、新构建的 aisub2api、虚构凭据、临时配置以及本地 Messages / MCP / HTTPS fixture。需要 Python 3.10+、OpenSSL 和回环 socket 权限：
+
+```sh
+cargo build --locked -p aisub2api-cli
+python3 -I scripts/claude-compat-smoke.py --aisub2api target/debug/aisub2api
+```
+
+可用 `--claude /path/to/claude` 指定客户端，`--output /tmp/claude-smoke.json` 保存摘要。摘要记录版本、两个可执行文件的 SHA-256 和逐项结果；失败返回非零。脚本有每次客户端调用的超时，清理临时目录、模拟服务和超时子进程，使用虚构凭据和独立配置，不安装客户端或复用现有登录凭据。
+
+五组场景覆盖自动生成配置后的 TaskCreate → Read、ToolSearch → 实际 MCP 调用，以及 WebFetch 检查失败、显式跳过和恢复检查。WebFetch 失败对照必须观察到工具错误，不能只因最终会话成功就判定通过。HTTPS fixture 不转发外网；子进程使用单独的信任证书和代理配置，没有安装系统证书。它验证客户端配置和工具执行，不验证真实模型质量、账户权限或上游协议转换，也不代表操作系统级断网隔离。
