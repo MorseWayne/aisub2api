@@ -495,7 +495,7 @@ All admin endpoints require `Authorization: Bearer <admin_token>`. Falls back to
 
 ## Build from Source
 
-Build an optimized binary and install it locally in one command:
+From the repository root, build an optimized binary and install it locally in one command:
 
 ```bash
 cargo install-local

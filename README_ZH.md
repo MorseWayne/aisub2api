@@ -734,7 +734,7 @@ for await (const event of stream) {
 
 ## 从源码构建
 
-一条命令完成 Release 编译并安装到本地：
+在仓库根目录运行，一条命令完成 Release 编译并安装到本地：
 
 ```bash
 cargo install-local
