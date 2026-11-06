@@ -303,6 +303,13 @@ responses_lite = true
 
 覆盖项合并到已有同名 table，保留其他 capability，不要重复追加 table。优先级为：全局 `on/off` > 逐模型 `responses_lite` > 上述默认策略 > 在线目录或内置回退。已有显式 Lite 配置不会因升级被忽略；同 provider 的原生 Responses 也使用这份策略。模型访问权限和 Full 可用性仍由上游账号决定。[多模型验证及边界](docs/reviews/2026-11-06-codex-claude-code-parallel-recovery.md)包含真实 CC、MCP、缓存和 WS continuation 的实测范围。
 
+也可以直接在 TUI 查看和编辑：
+
+- **Providers**：选中 ChatGPT provider，进入详情，编辑 **Responses Lane**。`Auto` 使用逐模型策略；`Full`、`Lite` 强制该 provider 的所有模型采用对应路径。
+- **Model**：用左右键移到 **Responses** 列，按 Enter 或 `e` 选择 `Default`、`Full`、`Lite`，Ctrl+S 保存。`Default` 清除该模型的路径覆盖，保留上下文、图片和推理能力等其他配置。
+
+显示中的 `default`、`override`、`provider` 分别表示工具默认、逐模型覆盖和全局强制；`Auto (catalog)` 表示还需由 provider 的目录决定，界面不会猜测结果。覆盖项属于同一个 provider/model，所有引用它的别名共享；这也影响该 provider 的原生 Responses 请求。
+
 所有新建 ChatGPT 映射默认使用 `high`。TUI 的 Reasoning picker 对所有 Provider 都按当前模型声明的 `reasoning_effort_levels` 过滤，并在打开时按需拉取、缓存模型能力；能力明确为空时只显示 `unset`，拿不到能力或使用目录外的自定义模型时才显示完整兼容列表。以 GPT-5.6 为例，Sol/Terra 显示 `low` 到 `ultra`，Luna 只显示 `low` 到 `max`，不会再给 Luna 显示 `default`、`none` 或 `minimal`。`unset` 用于清除代理侧强制覆盖。`ultra` 遵循 Codex 语义：上游请求发送 `max`；支持 `ultra` 的 Sol/Terra/Astra 模型且请求包含委派工具时，同时启用主动多代理指令，否则仅按 `max` 发送并记录警告。Luna 不支持 `ultra`，会降为 `max`。
 
 #### Claude Code 虚拟 1M 与真实上游窗口

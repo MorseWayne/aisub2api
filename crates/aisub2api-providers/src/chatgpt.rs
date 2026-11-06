@@ -381,6 +381,50 @@ fn default_chatgpt_responses_lite(model: &str) -> Option<bool> {
     }
 }
 
+/// Resolve forced modes, per-model overrides and built-in defaults without I/O.
+/// `None` means the lane must be selected from the runtime model catalog.
+pub fn configured_responses_lite(config: &ChatGptProviderConfig, model: &str) -> Option<bool> {
+    configured_responses_lite_decision(config, model).map(ResponsesLiteDecision::is_enabled)
+}
+
+fn configured_responses_lite_decision(
+    config: &ChatGptProviderConfig,
+    model: &str,
+) -> Option<ResponsesLiteDecision> {
+    match config.responses_lite {
+        ResponsesLiteMode::On => {
+            return Some(ResponsesLiteDecision::enabled(
+                ResponsesLiteDecisionSource::ForcedOn,
+            ));
+        }
+        ResponsesLiteMode::Off => {
+            return Some(ResponsesLiteDecision::disabled(
+                ResponsesLiteDecisionSource::ForcedOff,
+            ));
+        }
+        ResponsesLiteMode::Auto => {}
+    }
+    let model = normalize_chatgpt_model_id(model);
+    if let Some(enabled) = config
+        .model_capabilities
+        .get(model)
+        .and_then(|capability| capability.responses_lite)
+    {
+        return Some(ResponsesLiteDecision {
+            enabled,
+            source: if enabled {
+                ResponsesLiteDecisionSource::OverrideEnabled
+            } else {
+                ResponsesLiteDecisionSource::OverrideDisabled
+            },
+        });
+    }
+    default_chatgpt_responses_lite(model).map(|enabled| ResponsesLiteDecision {
+        enabled,
+        source: ResponsesLiteDecisionSource::DefaultPolicy,
+    })
+}
+
 #[derive(Clone)]
 struct ChatGptPreparedRequest {
     body: Value,
@@ -762,39 +806,12 @@ impl ChatGptProvider {
     }
 
     pub(super) fn responses_lite_decision(&self, model: &str) -> ResponsesLiteDecision {
-        match self.chatgpt_config.responses_lite {
-            ResponsesLiteMode::On => {
-                ResponsesLiteDecision::enabled(ResponsesLiteDecisionSource::ForcedOn)
-            }
-            ResponsesLiteMode::Off => {
-                ResponsesLiteDecision::disabled(ResponsesLiteDecisionSource::ForcedOff)
-            }
-            ResponsesLiteMode::Auto => self.auto_responses_lite_decision(model),
-        }
+        configured_responses_lite_decision(&self.chatgpt_config, model)
+            .unwrap_or_else(|| self.catalog_responses_lite_decision(model))
     }
 
-    fn auto_responses_lite_decision(&self, model: &str) -> ResponsesLiteDecision {
+    fn catalog_responses_lite_decision(&self, model: &str) -> ResponsesLiteDecision {
         let normalized_model = normalize_chatgpt_model_id(model);
-        if let Some(override_value) = self
-            .chatgpt_config
-            .model_capabilities
-            .get(normalized_model)
-            .and_then(|capability| capability.responses_lite)
-        {
-            return if override_value {
-                ResponsesLiteDecision::enabled(ResponsesLiteDecisionSource::OverrideEnabled)
-            } else {
-                ResponsesLiteDecision::disabled(ResponsesLiteDecisionSource::OverrideDisabled)
-            };
-        }
-
-        if let Some(enabled) = default_chatgpt_responses_lite(normalized_model) {
-            return ResponsesLiteDecision {
-                enabled,
-                source: ResponsesLiteDecisionSource::DefaultPolicy,
-            };
-        }
-
         if let Some(model) = self.remote_model(normalized_model) {
             return if model.responses_lite {
                 ResponsesLiteDecision::enabled(ResponsesLiteDecisionSource::ModelCapability)

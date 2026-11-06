@@ -177,6 +177,13 @@ pub enum PickerAction {
     SetModelReasoningEffort {
         section: EditableSection,
     },
+    SetModelResponsesLite {
+        provider_id: String,
+        model_id: String,
+    },
+    SetProviderResponsesLite {
+        provider_id: String,
+    },
     /// Pick a log level value
     SetLogLevel,
     /// Add a new provider of the selected type
@@ -568,7 +575,7 @@ impl App {
             .nth(self.content_idx)
             .map(|(id, cfg)| {
                 if cfg.resolve_type(id) == ProviderType::ChatGPT {
-                    7
+                    8
                 } else {
                     5
                 }
@@ -582,7 +589,7 @@ impl App {
             self.content_idx = count.saturating_sub(1);
         }
         let detail_max = match self.nav {
-            NavItem::Model => 2,
+            NavItem::Model => 3,
             _ => self.provider_detail_field_count(),
         };
         if self.detail_idx >= detail_max {

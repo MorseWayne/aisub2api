@@ -138,7 +138,7 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
     let pt = cfg.resolve_type(id);
     let is_chatgpt = pt == ProviderType::ChatGPT;
 
-    let rows = widgets::field_rows(inner, if is_chatgpt { 11 } else { 9 });
+    let rows = widgets::field_rows(inner, if is_chatgpt { 12 } else { 9 });
 
     widgets::render_field(
         f,
@@ -199,10 +199,10 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
         false,
     );
 
-    let check_row = if is_chatgpt { 7 } else { 5 };
-    let status_row = if is_chatgpt { 8 } else { 6 };
-    let info_row = if is_chatgpt { 9 } else { 7 };
-    let hints_row = if is_chatgpt { 10 } else { 8 };
+    let check_row = if is_chatgpt { 8 } else { 5 };
+    let status_row = if is_chatgpt { 9 } else { 6 };
+    let info_row = if is_chatgpt { 10 } else { 7 };
+    let hints_row = if is_chatgpt { 11 } else { 8 };
 
     if is_chatgpt {
         let fast_mode = cfg.chatgpt.as_ref().is_some_and(|c| c.fast_mode);
@@ -229,6 +229,24 @@ fn render_provider_detail(f: &mut Frame, app: &App, area: Rect) {
             context_label,
             detail_focused && app.detail_idx == 6,
             false,
+        );
+        let mode = cfg
+            .chatgpt
+            .as_ref()
+            .map(|c| c.responses_lite)
+            .unwrap_or_default();
+        widgets::render_field(
+            f,
+            rows[7],
+            "Responses Lane",
+            super::super::responses_lane::provider_label(mode),
+            detail_focused && app.detail_idx == 7,
+            false,
+        );
+        f.render_widget(
+            Paragraph::new("  Auto uses model policy; Full/Lite force all models.")
+                .style(widgets::dim_style()),
+            rows[info_row],
         );
     }
 

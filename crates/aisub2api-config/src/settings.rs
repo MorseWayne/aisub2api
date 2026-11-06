@@ -218,7 +218,7 @@ pub enum ResponsesLiteMode {
     Off,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ChatGptModelCapabilityOverride {
     #[serde(default)]
     pub responses_lite: Option<bool>,

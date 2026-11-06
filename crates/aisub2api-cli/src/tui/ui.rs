@@ -127,6 +127,14 @@ fn get_footer_hints(app: &App) -> (Vec<HintPair>, Vec<HintPair>) {
                         ("?", "help"),
                     ],
                 }
+            } else if app.nav == NavItem::Model {
+                vec![
+                    ("↑/↓", "alias"),
+                    ("←/→", "field"),
+                    ("Enter/e", "edit"),
+                    ("Ctrl+S", "save"),
+                    ("?", "help"),
+                ]
             } else {
                 let mut base = vec![("e", "edit"), ("Ctrl+S", "save"), ("Esc", "back")];
                 if app.nav == NavItem::Log {

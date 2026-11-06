@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Add a ChatGPT **Responses Lane** editor in provider details and a per-model **Responses** column with Default/Full/Lite choices. Show default, override and provider-forced sources, while catalog-dependent choices remain explicitly Auto.
+- Share lane policy resolution with the provider, preserve capability overrides when clearing a model's lane, and apply edits to the canonical provider/model shared by aliases. Changes use the existing Ctrl+S save flow.
+
+### Validation
+
+- Passed all 670 workspace/all-targets tests, including six new TUI tests for keyboard editing, shared aliases, configuration round trips, global precedence and common terminal sizes. Workspace Clippy with warnings denied and formatting checks passed.
+- An actual TUI pseudo-terminal smoke test saved per-model Lite, cleared it back to Default without deleting other capabilities, and saved provider Lite/Auto with Ctrl+S. XDG/Claude settings were isolated; live configuration remained unchanged.
+
 ## v6.0.7 - 2026-11-06
 
 ### Changed

@@ -1,5 +1,6 @@
 pub mod app;
 pub mod pages;
+mod responses_lane;
 pub mod theme;
 pub mod ui;
 pub mod widgets;
@@ -350,7 +351,7 @@ fn handle_content_key(app: &mut App, code: KeyCode, _key: event::KeyEvent) {
                 app.focus = Focus::Nav;
             }
         }
-        KeyCode::Right if app.nav == NavItem::Model && app.detail_idx < 1 => {
+        KeyCode::Right if app.nav == NavItem::Model && app.detail_idx < 2 => {
             app.detail_idx += 1;
         }
         KeyCode::Enter | KeyCode::Char('e')
@@ -622,6 +623,21 @@ fn handle_overlay_key(app: &mut App, key: event::KeyEvent) {
                                 display_reasoning_effort_value(&selected)
                             )));
                         }
+                        PickerAction::SetModelResponsesLite {
+                            provider_id,
+                            model_id,
+                        } => {
+                            let index = picker.selected;
+                            app.overlay = None;
+                            app.focus = Focus::Content;
+                            responses_lane::apply_model_choice(app, &provider_id, &model_id, index);
+                        }
+                        PickerAction::SetProviderResponsesLite { provider_id } => {
+                            let index = picker.selected;
+                            app.overlay = None;
+                            app.focus = Focus::Content;
+                            responses_lane::apply_provider_choice(app, &provider_id, index);
+                        }
                         PickerAction::SetLogLevel => {
                             app.overlay = None;
                             app.focus = Focus::Content;
@@ -801,6 +817,12 @@ fn request_quit(app: &mut App) {
 fn start_editing(app: &mut App) {
     // For provider page: edit the selected provider's field based on detail_idx
     if app.nav == NavItem::Providers {
+        if app.detail_idx == 7
+            && let Some(id) = selected_chatgpt_provider_id(app)
+        {
+            responses_lane::show_provider_picker(app, &id);
+            return;
+        }
         if toggle_selected_chatgpt_setting(app) {
             return;
         }
@@ -867,6 +889,13 @@ fn start_editing(app: &mut App) {
     }
 
     if app.nav == NavItem::Model {
+        if app.detail_idx == 2 {
+            if let Some(section) = model_section_for_cell(app.content_idx, 0) {
+                let model_ref = model_name_value(&app.settings.model, &section);
+                responses_lane::show_model_picker(app, &model_ref);
+            }
+            return;
+        }
         let Some(section) = model_section_for_cell(app.content_idx, app.detail_idx) else {
             return;
         };
@@ -4059,7 +4088,7 @@ mod tests {
         app.provider_focus = ProviderFocus::Detail;
         app.detail_idx = 5;
 
-        assert_eq!(app.provider_detail_field_count(), 7);
+        assert_eq!(app.provider_detail_field_count(), 8);
 
         handle_providers_key(&mut app, KeyCode::Char(' '));
         assert!(

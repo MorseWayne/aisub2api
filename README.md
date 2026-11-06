@@ -323,6 +323,16 @@ remote/fallback catalog. Existing explicit Lite settings remain effective after
 upgrading. The policy also affects native Responses on the same provider; model
 access and Full availability still depend on the upstream account.
 
+The TUI supports these settings directly. In **Providers**, select a ChatGPT
+provider, open its details, and edit **Responses Lane** (`Auto`, global `Full`,
+or global `Lite`). In **Model**, move right to the **Responses** column and press
+Enter or `e` to choose `Default`, `Full`, or `Lite`, then Ctrl+S to save.
+`Default` removes the model's lane override while preserving other capabilities.
+Values identify their source as `default`, `override`, or `provider`; `Auto
+(catalog)` means the provider must resolve the lane from its catalog. Overrides
+are shared by every alias pointing to the same provider/model, including native
+Responses requests.
+
 Disconnecting the last streaming consumer closes the upstream read immediately;
 other consumers of a shared request can continue. ChatGPT clients retain only the
 upstream `__oailb` routing cookie on known HTTPS/WSS ChatGPT hosts, shared between

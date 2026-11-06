@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Cell, Paragraph, Row, Table},
+    widgets::{Cell, Paragraph, Row, Table, Wrap},
 };
 
 use super::super::app::{App, Focus, NavItem};
@@ -274,23 +274,26 @@ fn render_model_page(f: &mut Frame, app: &App, area: Rect) {
             };
             let model_style = cell_style(row_selected && app.detail_idx == 0);
             let effort_style = cell_style(row_selected && app.detail_idx == 1);
+            let lane_style = cell_style(row_selected && app.detail_idx == 2);
             Row::new(vec![
                 Cell::from(format!(" {}", label)).style(label_style),
                 Cell::from((*model).to_string()).style(model_style),
                 Cell::from((*effort).to_string()).style(effort_style),
+                Cell::from(super::super::responses_lane::model_label(app, model)).style(lane_style),
             ])
         });
 
     let table = Table::new(
         table_rows,
         [
-            Constraint::Length(14),
-            Constraint::Percentage(56),
-            Constraint::Percentage(24),
+            Constraint::Length(10),
+            Constraint::Fill(1),
+            Constraint::Length(9),
+            Constraint::Length(18),
         ],
     )
     .header(
-        Row::new(vec![" Alias", "Model", "Reasoning Effort"]).style(
+        Row::new(vec![" Alias", "Model", "Effort", "Responses"]).style(
             Style::default()
                 .fg(theme::FG_DIM)
                 .add_modifier(Modifier::BOLD),
@@ -299,6 +302,19 @@ fn render_model_page(f: &mut Frame, app: &App, area: Rect) {
     .column_spacing(2);
     f.render_widget(table, rows_area[0].union(rows_area[4]));
 
+    if app.detail_idx == 2 {
+        let hint = aliases
+            .get(app.content_idx)
+            .map(|(_, model, _)| super::super::responses_lane::model_hint(app, model))
+            .unwrap_or_default();
+        f.render_widget(
+            Paragraph::new(hint)
+                .style(widgets::dim_style())
+                .wrap(Wrap { trim: true }),
+            rows_area[5],
+        );
+        return;
+    }
     let hint = aliases
         .get(app.content_idx)
         .and_then(|(_, model, _)| claude_context_projection_hint(app, model))
