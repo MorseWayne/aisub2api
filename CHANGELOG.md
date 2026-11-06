@@ -1,5 +1,29 @@
 # Changelog
 
+## v6.0.9 - 2026-11-06
+
+### Fixed
+
+- Bound ChatGPT Messages WebSocket startup with an independent 30-second send/first-response budget and bounded metadata buffering, preventing long startup stalls and consumer-start deadlocks. Auto mode retains the existing pre-output SSE fallback; generation idle timeouts and continuation matching remain unchanged.
+- Restore the documented `cargo install-local` shortcut with a repository Cargo alias, and clarify that it runs from the repository root.
+
+### Added
+
+- Add `aisub2api config claude` to synchronize Claude Code settings independently, and `--webfetch-preflight skip|check` to explicitly switch its domain check while preserving unrelated settings. Normal synchronization retains this choice and never opts out by default.
+- Extend `config validate` with read-only Claude user-settings diagnostics for route/credential mismatches, task tools, tool search, misplaced WebFetch settings and known ineffective compatibility switches. Diagnostic output excludes credentials and configuration values.
+- Add a repeatable local Claude compatibility script covering TaskCreate, Read, deferred MCP discovery/execution, and WebFetch failure, opt-out and restoration, plus evidence and troubleshooting documentation.
+
+### Configuration
+
+- WebSocket startup protection activates automatically. `chatgpt.websocket_startup_timeout_seconds` optionally overrides the budget with a positive value.
+- Use `aisub2api config claude --webfetch-preflight skip` only when opting out of Anthropic's domain blocklist check; `check` restores it. WebFetch permission rules still apply. This option changes only the user's WebFetch setting, while the command without options synchronizes model routes and compatibility defaults.
+- Claude configuration diagnostics inspect the user settings file only; project, managed, shell/CLI overrides and running sessions are outside their scope. Warnings preserve a successful exit; malformed Claude JSON or an invalid WebFetch boolean returns failure.
+
+### Validation
+
+- Passed all 682 local workspace/all-targets tests, workspace Clippy with warnings denied, formatting and version/lockfile consistency checks.
+- Five real Claude Code 2.1.318 cases with isolated generated settings and synthetic Messages/MCP/HTTPS fixtures passed, including the expected WebFetch error and successful recovery. These fixtures do not establish real-model quality, account availability or production reliability.
+
 ## v6.0.8 - 2026-11-06
 
 ### Added
