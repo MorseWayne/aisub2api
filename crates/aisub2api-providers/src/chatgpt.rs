@@ -4055,6 +4055,11 @@ fn normalize_chatgpt_native_responses_body(
     // field upstream. The limitation is advertised in /v1/models.
     object.remove("max_output_tokens");
 
+    // Tool reviewers can send sampling settings even with temperature=0.
+    // The Codex backend rejects these fields in both Full and Lite requests.
+    object.remove("temperature");
+    object.remove("top_p");
+
     if responses_lite {
         object.insert("parallel_tool_calls".to_string(), Value::Bool(false));
         let reasoning = object
@@ -4215,7 +4220,11 @@ fn chatgpt_model_info_from_parts(
                 ..Default::default()
             },
             responses: Some(ResponsesCapabilities {
-                unsupported_parameters: vec!["max_output_tokens".to_string()],
+                unsupported_parameters: vec![
+                    "max_output_tokens".to_string(),
+                    "temperature".to_string(),
+                    "top_p".to_string(),
+                ],
                 ..ResponsesCapabilities::streaming_stateless(CapabilityState::Supported)
             }),
             supported_parameters: vec![
@@ -5019,7 +5028,10 @@ mod tests {
                 responses.input_formats,
                 vec![ResponsesInputFormat::String, ResponsesInputFormat::Items]
             );
-            assert_eq!(responses.unsupported_parameters, vec!["max_output_tokens"]);
+            assert_eq!(
+                responses.unsupported_parameters,
+                vec!["max_output_tokens", "temperature", "top_p"]
+            );
         }
         assert_eq!(
             sol.capabilities.limits.reasoning_effort_levels,
@@ -5401,6 +5413,34 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["reasoning"]["context"], "all_turns");
         assert_eq!(body["text"]["format"]["type"], "json_schema");
+    }
+
+    #[test]
+    fn chatgpt_native_responses_omits_sampling_parameters_for_both_lanes() {
+        for responses_lite in [false, true] {
+            for effort in [None, Some("low")] {
+                let mut body = json!({
+                    "model": "gpt-6.1-sol",
+                    "input": [{"role": "user", "content": "Review this tool call."}],
+                    "stream": true,
+                    "temperature": 0,
+                    "top_p": 1,
+                    "future_option": {"enabled": true}
+                });
+                if let Some(effort) = effort {
+                    body["reasoning"] = json!({"effort": effort});
+                }
+                let input = body["input"].clone();
+
+                normalize_chatgpt_native_responses_body(&mut body, responses_lite);
+
+                assert!(body.get("temperature").is_none());
+                assert!(body.get("top_p").is_none());
+                assert_eq!(body["input"], input);
+                assert_eq!(body["future_option"], json!({"enabled": true}));
+                assert_eq!(body["reasoning"]["effort"].as_str(), effort);
+            }
+        }
     }
 
     #[test]
@@ -6828,6 +6868,8 @@ mod tests {
             "model": "gpt-5.6-sol",
             "stream": true,
             "store": false,
+            "temperature": 0,
+            "top_p": 1,
             "future_option": {"enabled": true},
             "input": [
                 {"id": "at-stable", "type": "additional_tools", "role": "developer", "tools": []},
@@ -6842,6 +6884,9 @@ mod tests {
             "x-codex-beta-features",
             "remote_compaction_v2".parse().unwrap(),
         );
+
+        let input = body["input"].clone();
+        normalize_chatgpt_native_responses_body(&mut body, true);
 
         let response = provider
             .send_responses_request_with_prompt_too_long_retry_and_headers(
@@ -6869,6 +6914,9 @@ mod tests {
         assert!(captured_headers.contains("x-codex-turn-state: turn-state-1"));
         assert!(captured_headers.contains("x-codex-beta-features: remote_compaction_v2"));
         let captured_body = request_body_json(captured);
+        assert!(captured_body.get("temperature").is_none());
+        assert!(captured_body.get("top_p").is_none());
+        assert_eq!(captured_body["input"], input);
         assert_eq!(captured_body, body);
     }
 

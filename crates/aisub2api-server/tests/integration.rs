@@ -144,6 +144,8 @@ async fn mock_responses(headers: HeaderMap, Json(payload): Json<serde_json::Valu
         == Some(true)
     {
         assert_eq!(payload["max_output_tokens"], 512);
+        assert_eq!(payload["temperature"], 0.2);
+        assert_eq!(payload["top_p"], 0.9);
         assert_eq!(payload["text"]["format"]["type"], "json_schema");
         assert_eq!(payload["text"]["format"]["name"], "verification");
         assert_eq!(
@@ -938,6 +940,8 @@ async fn test_openai_responses_streaming_preserves_structured_outputs_request() 
             "stream": true,
             "future_option": {"enabled": true},
             "max_output_tokens": 512,
+            "temperature": 0.2,
+            "top_p": 0.9,
             "metadata": {"verify_structured_outputs": true},
             "text": {
                 "format": {

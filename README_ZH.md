@@ -543,8 +543,9 @@ Outputs 能力和不支持的参数。每个模型还会返回 `provider` 和可
 
 对于 ChatGPT Provider，字符串 `input` 会自动归一化为输入项列表。仅在选择 Lite 时，
 才自动补齐 `reasoning.context=all_turns` 和 `parallel_tool_calls=false`。
-Codex 后端不接受 `max_output_tokens`；Proxy 会在 `unsupported_parameters` 中声明并在
-转发前移除。原生 OpenAI Provider 仍会原样收到 `max_output_tokens`。
+Codex 后端不接受 `max_output_tokens`、`temperature` 或 `top_p`；Proxy 会在
+`unsupported_parameters` 中声明并在转发前移除，即使传入的是 `temperature: 0`。
+原生 OpenAI Provider 仍会原样收到这些字段。
 
 服务档位只在请求或配置指定时发送；显式 `flex` 不会因为目录缺少该档位而被移除，目录中的默认档位提示也不会隐式启用 priority。Flex 容量不足在开流前返回 HTTP 503 和 `x-should-retry: false`。
 

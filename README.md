@@ -257,9 +257,9 @@ an unqualified model name.
 For the ChatGPT provider, string `input` is normalized to an input-item list.
 When Lite is selected, its requirements (`reasoning.context=all_turns` and
 `parallel_tool_calls=false`) are applied automatically. The Codex backend does
-not accept `max_output_tokens`; the proxy advertises it in
-`unsupported_parameters` and removes it before forwarding. Native OpenAI
-providers continue to receive `max_output_tokens` unchanged.
+not accept `max_output_tokens`, `temperature`, or `top_p`; the proxy advertises
+them in `unsupported_parameters` and removes them before forwarding, including
+`temperature: 0`. Native OpenAI providers receive these fields unchanged.
 
 `openai/gpt-6-astra` advertises Responses and reasoning capabilities, including
 the public API's 1,050,000-token context and 128,000-token output limit. Messages
