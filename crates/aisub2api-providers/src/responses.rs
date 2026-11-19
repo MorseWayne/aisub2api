@@ -35,6 +35,16 @@ use correlation::IDENTIFIER_MAX_BYTES as RESPONSES_IDENTIFIER_MAX_BYTES;
 pub use correlation::ResponsesCorrelation;
 use signature::is_gpt_signature;
 
+pub fn native_failure_metadata(value: &Value) -> Option<crate::provider::UpstreamErrorMetadata> {
+    if !matches!(value["type"].as_str(), Some("error" | "response.failed")) {
+        return None;
+    }
+    let mut metadata = responses_error_event(value)?.upstream_metadata()?.clone();
+    // A native response frame can carry response content alongside its error.
+    metadata.body_preview = None;
+    Some(metadata)
+}
+
 const RECENT_TOOL_OUTPUTS_TO_KEEP: usize = 12;
 const MAX_HISTORICAL_TOOL_OUTPUT_BYTES: usize = 4096;
 const MAX_CURRENT_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
@@ -1448,13 +1458,23 @@ pub fn stream_native_responses_response_with_provider_observer(
     observer: Option<ProviderRequestObserver>,
     max_sse_frame_bytes: u64,
 ) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
+    stream_native_responses_response(response, max_sse_frame_bytes, move |event| {
+        notify_stream_metadata(observer.as_ref(), event)
+    })
+}
+
+pub(crate) fn stream_native_responses_response(
+    response: reqwest::Response,
+    max_sse_frame_bytes: u64,
+    on_event: impl Fn(&Value) + Send + Sync + 'static,
+) -> BoxStream<'static, Result<ProviderEvent, ProviderError>> {
     stream_responses_response_with_context_and_error_policy(
         response,
         ReasoningMarkerMode::Strict,
         ResponsesCorrelation::default(),
         max_sse_frame_bytes,
         true,
-        move |event| notify_stream_metadata(observer.as_ref(), event),
+        on_event,
     )
 }
 

@@ -281,7 +281,11 @@ pub(crate) async fn execute_messages_request(
         model: resolved.request.model.clone(),
         initiator: resolved.initiator,
     };
-    let payload_stats = request_payload_stats(&resolved.request);
+    let payload_stats = if observability_enabled {
+        request_payload_stats(&resolved.request)
+    } else {
+        RequestPayloadStats::default()
+    };
     let observer_state = Arc::new(StdMutex::new(RequestObserverState::default()));
     let provider_observer = Some(provider_request_observer(observer_state.clone()));
     let upstream_connect_start = std::time::Instant::now();
@@ -485,7 +489,11 @@ pub(crate) async fn execute_responses_request(
         model: upstream_model,
         initiator,
     };
-    let payload_stats = responses_payload_stats(&body);
+    let payload_stats = if observability_enabled {
+        responses_payload_stats(&body)
+    } else {
+        RequestPayloadStats::default()
+    };
     let observer_state = Arc::new(StdMutex::new(RequestObserverState::default()));
     let provider_observer = Some(provider_request_observer(observer_state.clone()));
     let upstream_connect_start = std::time::Instant::now();
@@ -679,35 +687,30 @@ fn attach_native_responses_headers(response: &mut Response, upstream: &HeaderMap
 
 fn responses_payload_stats(body: &Value) -> RequestPayloadStats {
     let input = body.get("input");
-    let items = input.and_then(Value::as_array);
-    RequestPayloadStats {
-        messages: items.map_or(0, |items| items.len() as u64),
-        content_blocks: items
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|item| {
-                        item.get("content")
-                            .and_then(Value::as_array)
-                            .map_or(1, Vec::len)
-                    })
-                    .sum::<usize>() as u64
-            })
-            .unwrap_or_else(|| u64::from(input.is_some())),
-        tool_results: items
-            .map(|items| {
-                items
-                    .iter()
-                    .filter(|item| {
-                        item.get("type")
-                            .and_then(Value::as_str)
-                            .is_some_and(|kind| kind.ends_with("_call_output"))
-                    })
-                    .count() as u64
-            })
-            .unwrap_or(0),
+    let mut stats = RequestPayloadStats {
         text_bytes: input.map_or(0, json_text_bytes),
+        ..Default::default()
+    };
+    let Some(items) = input.and_then(Value::as_array) else {
+        stats.content_blocks = u64::from(input.is_some());
+        return stats;
+    };
+    stats.messages = items.len() as u64;
+    for item in items {
+        let content = item.get("content");
+        stats.content_blocks += content.and_then(Value::as_array).map_or(1, Vec::len) as u64;
+        if item.get("role").and_then(Value::as_str) == Some("user") && content.is_some() {
+            stats.history_tool_result_bytes = stats.tool_result_bytes;
+        }
+        if item
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.ends_with("_call_output"))
+        {
+            stats.record_tool_result(item.get("output").or(content));
+        }
     }
+    stats
 }
 
 struct ResolvedUpstreamRequest {
@@ -1229,22 +1232,30 @@ fn build_observability_event(
         request_messages: context.payload_stats.messages,
         request_content_blocks: context.payload_stats.content_blocks,
         request_tool_results: context.payload_stats.tool_results,
+        request_tool_result_bytes: Some(context.payload_stats.tool_result_bytes),
+        request_history_tool_result_bytes: Some(context.payload_stats.history_tool_result_bytes),
+        request_largest_tool_result_bytes: Some(context.payload_stats.largest_tool_result_bytes),
         request_text_bytes: context.payload_stats.text_bytes,
     }
 }
 
 fn upstream_error_code(error_metadata: Option<&UpstreamErrorMetadata>) -> Option<String> {
     let metadata = error_metadata?;
-    metadata
-        .body_preview
-        .as_deref()
-        .and_then(|body| serde_json::from_str::<Value>(body).ok())
-        .and_then(|value| {
-            ["/error/code", "/error/type", "/code", "/type"]
-                .iter()
-                .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
-                .map(str::to_string)
-        })
+    metadata.code.clone().or_else(|| {
+        let value = serde_json::from_str::<Value>(metadata.body_preview.as_deref()?).ok()?;
+        [
+            "/error/code",
+            "/detail/code",
+            "/response/error/code",
+            "/code",
+            "/error/type",
+            "/type",
+        ]
+        .iter()
+        .filter_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+        .find(|code| !matches!(*code, "error" | "response.failed"))
+        .map(str::to_string)
+    })
 }
 
 fn upstream_error_message_class(error_metadata: Option<&UpstreamErrorMetadata>) -> Option<String> {
@@ -1300,6 +1311,20 @@ fn request_payload_stats(request: &MessagesRequest) -> RequestPayloadStats {
         }
     }
     for message in &request.messages {
+        if message.role == Role::User
+            && match &message.content {
+                MessageContent::Text(text) => !text.is_empty(),
+                MessageContent::Blocks(blocks) => blocks.iter().any(|block| match block {
+                    Content::Text { text } => !text.is_empty(),
+                    Content::Unknown(value) => {
+                        matches!(value["type"].as_str(), Some("image" | "document"))
+                    }
+                    _ => false,
+                }),
+            }
+        {
+            stats.history_tool_result_bytes = stats.tool_result_bytes;
+        }
         match &message.content {
             MessageContent::Text(text) => {
                 stats.content_blocks += 1;
@@ -1325,7 +1350,7 @@ fn add_content_stats(content: &Content, stats: &mut RequestPayloadStats) {
             stats.text_bytes += thinking.len() as u64;
         }
         Content::ToolResult { content, .. } => {
-            stats.tool_results += 1;
+            stats.record_tool_result(content.as_ref());
             if let Some(content) = content {
                 stats.text_bytes += json_text_bytes(content);
             }
@@ -1849,6 +1874,7 @@ async fn stream_leader_response(
         let mut timing = ObservabilityTiming::default();
         let mut usage = TokenUsage::default();
         let mut had_error = false;
+        let mut downstream_backpressure = false;
         let mut terminal_reason = "completed";
         let mut last_error = None;
         let mut last_error_metadata = None;
@@ -1907,10 +1933,11 @@ async fn stream_leader_response(
                             for normalized in event.normalized_events() {
                                 extract_usage_from_event(&normalized.data, &mut usage);
                             }
-                            if let Some(message) = native_response_failure_message(&event) {
+                            if let Some(metadata) = native_response_failure_metadata(&event) {
                                 had_error = true;
                                 terminal_reason = "response_failed";
-                                last_error = Some(message);
+                                last_error = Some(metadata.message.clone().unwrap_or_else(|| "upstream response failed".into()));
+                                last_error_metadata = Some(metadata);
                                 tool_use_pending = false;
                             }
                             if provider_event_starts_tool_use(&event) {
@@ -1942,6 +1969,7 @@ async fn stream_leader_response(
                                 && let Err(send_error) = try_send_stream_frames(&sender, frames)
                             {
                                 leader_tx_open = false;
+                                downstream_backpressure = matches!(send_error, StreamSendError::Full);
                                 terminal_reason = match send_error {
                                     StreamSendError::Full => "downstream_backpressure",
                                     StreamSendError::Closed => "client_disconnected",
@@ -1978,6 +2006,7 @@ async fn stream_leader_response(
                         vec![SSE_HEARTBEAT_FRAME.to_vec()],
                     ) {
                         leader_tx_open = false;
+                        downstream_backpressure = matches!(send_error, StreamSendError::Full);
                         terminal_reason = match send_error {
                             StreamSendError::Full => "downstream_backpressure",
                             StreamSendError::Closed => "client_disconnected",
@@ -2058,6 +2087,7 @@ async fn stream_leader_response(
         if !had_error && leader_tx_open {
             let frames = encoder.finish();
             if let Err(send_error) = try_send_stream_frames(&sender, frames) {
+                downstream_backpressure = matches!(send_error, StreamSendError::Full);
                 terminal_reason = match send_error {
                     StreamSendError::Full => "downstream_backpressure",
                     StreamSendError::Closed => "client_disconnected",
@@ -2069,14 +2099,19 @@ async fn stream_leader_response(
         metrics.remove_active_stream(&request_id).await;
         timing.stream_duration_ms = task_start.elapsed().as_millis() as u64;
         let latency_ms = start.elapsed().as_millis() as u64;
-        if had_error {
+        let is_error = had_error || downstream_backpressure;
+        if is_error {
             metrics.record_error();
         }
         if let Some(error) = last_error {
             health_state
-                .record_provider_error(&provider_id, &error)
+                .record_provider_error_with_metadata(
+                    &provider_id,
+                    &error,
+                    last_error_metadata.clone(),
+                )
                 .await;
-        } else {
+        } else if !downstream_backpressure {
             health_state.record_provider_success(&provider_id).await;
         }
         merge_observer_usage(&observer_state, &mut usage);
@@ -2087,10 +2122,16 @@ async fn stream_leader_response(
                 initiator,
                 model: &model_name,
                 usage: &usage,
-                is_error: had_error,
+                is_error,
                 latency_ms,
                 terminal_reason,
-                error_kind: if had_error { "stream" } else { "" },
+                error_kind: if had_error {
+                    "stream"
+                } else if downstream_backpressure {
+                    "downstream_backpressure"
+                } else {
+                    ""
+                },
             })
             .await;
         if let Some(context) = observability {
@@ -2099,7 +2140,7 @@ async fn stream_leader_response(
                     build_observability_event(
                         context,
                         timing,
-                        had_error,
+                        is_error,
                         terminal_reason,
                         last_error_metadata.as_ref(),
                     ),
@@ -2805,21 +2846,9 @@ fn provider_event_type(event: &ProviderEvent) -> String {
     }
 }
 
-fn native_response_failure_message(event: &ProviderEvent) -> Option<String> {
+fn native_response_failure_metadata(event: &ProviderEvent) -> Option<UpstreamErrorMetadata> {
     let aisub2api_providers::NativeProviderEvent::OpenAiResponses(event) = event.native_event()?;
-    let message_paths = match event.data.get("type").and_then(Value::as_str) {
-        Some("response.failed") => &["/response/error/message"][..],
-        Some("error") => &["/error/message", "/message"][..],
-        _ => return None,
-    };
-    Some(
-        message_paths
-            .iter()
-            .filter_map(|path| event.data.pointer(path).and_then(Value::as_str))
-            .find(|message| !message.trim().is_empty())
-            .unwrap_or("upstream response failed")
-            .to_string(),
-    )
+    aisub2api_providers::native_responses_failure_metadata(&event.data)
 }
 
 fn format_timeout_duration(duration: Duration) -> String {
@@ -4403,7 +4432,14 @@ mod tests {
         }
 
         assert_eq!(received, 70);
-        drop(response);
+        to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            state
+                .metrics
+                .errors_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]
@@ -5429,5 +5465,52 @@ mod tests {
             model["capabilities"]["responses"]["unsupported_parameters"][0],
             "max_output_tokens"
         );
+    }
+}
+#[test]
+fn tool_result_byte_metrics_follow_the_latest_user_input() {
+    let old = json!({"text": "historical result"});
+    let latest = json!("short result");
+    let old_bytes = old.to_string().len() as u64;
+    let latest_bytes = latest.to_string().len() as u64;
+    let native = responses_payload_stats(&json!({"input": [
+        {"type": "function_call_output", "output": old},
+        {"type": "message", "role": "user", "content": "next task"},
+        {"type": "custom_tool_call_output", "output": latest},
+    ]}));
+    let request: MessagesRequest = serde_json::from_value(json!({"model": "test", "messages": [
+            {"role":"user", "content":[{"type":"tool_result", "tool_use_id":"old", "content":old}]},
+            {"role":"user", "content":"next task"},
+            {"role":"user", "content":[{"type":"tool_result", "tool_use_id":"latest", "content":latest}]},
+        ]})).unwrap();
+    for stats in [native, request_payload_stats(&request)] {
+        assert_eq!(stats.tool_results, 2);
+        assert_eq!(stats.tool_result_bytes, old_bytes + latest_bytes);
+        assert_eq!(stats.history_tool_result_bytes, old_bytes);
+        assert_eq!(stats.largest_tool_result_bytes, old_bytes);
+    }
+}
+
+#[test]
+fn native_stream_failure_keeps_structured_code_without_a_body_preview() {
+    for data in [
+        json!({"type":"error", "status":503, "error":{"headers":{"Retry-After":3,"X-Request-Id":"req-test"},"code":"policy_capacity_unavailable", "message":"retry"}, "extra":"x".repeat(3_000)}),
+        json!({"type":"response.failed", "response":{"error":{"headers":{"Retry-After":3,"X-Request-Id":"req-test"},"code":"policy_capacity_unavailable", "message":"retry"}}, "extra":"x".repeat(3_000)}),
+    ] {
+        let event = ProviderEvent::openai_responses(
+            SseEvent {
+                event: data["type"].as_str().unwrap().into(),
+                data,
+            },
+            Vec::new(),
+        );
+        let metadata = native_response_failure_metadata(&event).unwrap();
+        assert!(metadata.body_preview.is_none());
+        assert_eq!(
+            upstream_error_code(Some(&metadata)).as_deref(),
+            Some("policy_capacity_unavailable")
+        );
+        assert_eq!(metadata.retry_after, Some(3));
+        assert_eq!(metadata.request_id.as_deref(), Some("req-test"));
     }
 }

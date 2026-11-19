@@ -474,6 +474,7 @@ All admin endpoints require `Authorization: Bearer <admin_token>`. Falls back to
 ```
 
 - Top-level fields: current process session statistics
+- `observability.recent` reports tool-result payload bytes, including the total, the bytes that precede the latest user input, and the largest single result. SQLite rows collected before these fields were added have no values for them.
 - `active_streams`: currently open streaming requests with request/provider/model/age/last event diagnostics only (no prompt content), useful for debugging long-session stalls
 - `stored` field: all-time cumulative data persisted in SQLite (survives restarts)
 - Dashboard automatically merges both layers to show totals

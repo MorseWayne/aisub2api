@@ -14,7 +14,7 @@ mod routing_cookie;
 mod sse_recovery;
 mod transport;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 #[cfg(not(test))]
 use std::process::Command;
@@ -70,8 +70,11 @@ const CHATGPT_CONNECTION_MAX_ATTEMPTS: usize = 4;
 const CHATGPT_CONNECTION_BASE_RETRY_DELAY: Duration = Duration::from_secs(5);
 const CHATGPT_CONNECTION_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const CHATGPT_USAGE_FETCH_INTERVAL: Duration = Duration::from_secs(60);
-const CHATGPT_REQUEST_WARNING_RATIO: usize = 80;
-const CHATGPT_BYTES_PER_ESTIMATED_TOKEN: usize = 4;
+const CHATGPT_CONTEXT_WARNING_PERCENT: u64 = 80;
+const CONTEXT_USAGE_TTL: Duration = Duration::from_secs(3600);
+const CONTEXT_USAGE_MAX_ENTRIES: usize = 64;
+const CONTEXT_USAGE_MAX_ITEMS: usize = 4096;
+const CONTEXT_USAGE_MAX_CONVERSATION_ID_BYTES: usize = 256;
 const CHATGPT_TOOL_SCHEMA_BUDGET_BYTES: usize = 256 * 1024;
 const CHATGPT_SYNTHETIC_SESSION_HASH_BYTES: usize = 16;
 const CHATGPT_SSE_REQUEST_ZSTD_LEVEL: i32 = 3;
@@ -441,6 +444,7 @@ struct ChatGptPreparedRequest {
     stable_client_conversation_id: Option<String>,
     responses_lite: ResponsesLiteDecision,
     observer: Option<ProviderRequestObserver>,
+    model_context_window: Option<u32>,
     pending_context_usage: Option<PendingContextUsage>,
 }
 
@@ -449,6 +453,7 @@ struct ChatGptSseStreamContext {
     request_id: u64,
     compact_request: bool,
     observer: Option<ProviderRequestObserver>,
+    model_context_window: Option<u32>,
     pending_context_usage: Option<PendingContextUsage>,
     responses_correlation: crate::responses::ResponsesCorrelation,
 }
@@ -463,18 +468,116 @@ struct ContextUsageKey {
 
 #[derive(Debug, Clone)]
 struct ContextUsageBaseline {
-    static_body: Value,
-    context_items: Vec<Value>,
+    static_body: [u8; 32],
+    context_items: Vec<[u8; 32]>,
+    input_item_count: usize,
+    input_tokens: u64,
     total_tokens: u64,
+    request_started_at: Instant,
     updated_at: Instant,
 }
 
 #[derive(Debug, Clone)]
 struct PendingContextUsage {
     key: ContextUsageKey,
-    static_body: Value,
-    full_input: Vec<Value>,
+    static_body: [u8; 32],
+    full_input: Vec<[u8; 32]>,
     compact_kind: CompactRequestKind,
+    started_at: Instant,
+}
+
+impl PendingContextUsage {
+    fn matches_account(&self, token: &ChatGptToken) -> bool {
+        capability_cache::account_hash(token.account_id.as_deref()).as_deref()
+            == Some(&self.key.account_hash)
+    }
+}
+
+impl ContextUsageBaseline {
+    fn matching_prefix(
+        &self,
+        pending: &PendingContextUsage,
+        allow_input_prefix: bool,
+    ) -> Option<(usize, u64)> {
+        if self.updated_at.elapsed() > CONTEXT_USAGE_TTL || self.static_body != pending.static_body
+        {
+            return None;
+        }
+        if pending.full_input.starts_with(&self.context_items) {
+            return Some((self.context_items.len(), self.total_tokens));
+        }
+        (allow_input_prefix
+            && pending
+                .full_input
+                .starts_with(&self.context_items[..self.input_item_count]))
+        .then_some((self.input_item_count, self.input_tokens))
+    }
+}
+
+fn record_context_usage(
+    cache: &StdMutex<HashMap<ContextUsageKey, ContextUsageBaseline>>,
+    pending: Option<&PendingContextUsage>,
+    event: &Value,
+) -> Option<u64> {
+    if !matches!(
+        event["type"].as_str(),
+        Some("response.completed" | "response.incomplete")
+    ) {
+        return None;
+    }
+    let response = event.get("response").unwrap_or(event);
+    let input_tokens = response
+        .pointer("/usage/input_tokens")
+        .and_then(Value::as_u64)?;
+    let Some(pending) =
+        pending.filter(|pending| pending.compact_kind != CompactRequestKind::SummaryGeneration)
+    else {
+        return Some(input_tokens);
+    };
+    let mut context_items = pending.full_input.clone();
+    let mut total_tokens = input_tokens;
+    if let Some(output) = response["output"].as_array()
+        && output.len() <= CONTEXT_USAGE_MAX_ITEMS - context_items.len()
+    {
+        context_items.extend(output.iter().map(context_value_hash));
+        total_tokens = total_tokens.saturating_add(
+            response
+                .pointer("/usage/output_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+    }
+    let mut cache = cache
+        .lock()
+        .expect("ChatGPT context usage cache lock poisoned");
+    if cache
+        .get(&pending.key)
+        .is_some_and(|baseline| baseline.request_started_at > pending.started_at)
+    {
+        return Some(input_tokens);
+    }
+    if cache.len() >= CONTEXT_USAGE_MAX_ENTRIES
+        && !cache.contains_key(&pending.key)
+        && let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, baseline)| baseline.updated_at)
+            .map(|(key, _)| key.clone())
+    {
+        cache.remove(&oldest);
+    }
+    cache.insert(
+        pending.key.clone(),
+        ContextUsageBaseline {
+            static_body: pending.static_body,
+            context_items,
+            input_item_count: pending.full_input.len(),
+            input_tokens,
+            total_tokens,
+            request_started_at: pending.started_at,
+            updated_at: Instant::now(),
+        },
+    );
+    Some(input_tokens)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -511,6 +614,7 @@ struct ChatGptUpstreamEventContext {
     thinking_diagnostics: Arc<ChatGptThinkingDiagnostics>,
     stream_started_at: Instant,
     observer: Option<ProviderRequestObserver>,
+    model_context_window: Option<u32>,
     pending_context_usage: Option<PendingContextUsage>,
 }
 
@@ -522,6 +626,7 @@ struct ChatGptUpstreamEventHandlerState {
     thinking_diagnostics: Arc<ChatGptThinkingDiagnostics>,
     stream_started_at: Instant,
     observer: Option<ProviderRequestObserver>,
+    model_context_window: Option<u32>,
     cache: Arc<Mutex<CachedRateLimits>>,
     provider_id: String,
     runtime_ids: Arc<RwLock<ChatGptRuntimeIds>>,
@@ -540,72 +645,24 @@ impl ChatGptUpstreamEventHandlerState {
         self.record_reasoning_delta(event_type, event);
         self.cache_stream_rate_limit(event);
         self.notify_observer(event);
-        self.record_upstream_context_overflow(event);
+        notify_stream_context_overflow(self.observer.as_ref(), event);
         self.record_context_usage(event);
         self.log_terminal_event(event);
     }
 
     fn record_context_usage(&self, event: &Value) {
-        let Some(pending) = self.pending_context_usage.as_ref() else {
-            return;
-        };
-        let event_type = event.get("type").and_then(Value::as_str);
-        if !matches!(
-            event_type,
-            Some("response.completed" | "response.incomplete")
+        if let Some(input_tokens) = record_context_usage(
+            &self.context_usage,
+            self.pending_context_usage.as_ref(),
+            event,
         ) {
-            return;
+            warn_for_observed_context_usage(
+                self.request_id,
+                chatgpt_sse_model(event).unwrap_or("unknown"),
+                self.model_context_window,
+                input_tokens,
+            );
         }
-        let response = event.get("response").unwrap_or(event);
-        let Some(input_tokens) = response
-            .pointer("/usage/input_tokens")
-            .and_then(Value::as_u64)
-        else {
-            return;
-        };
-        let output_tokens = response
-            .pointer("/usage/output_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-
-        let mut cache = self
-            .context_usage
-            .lock()
-            .expect("ChatGPT context usage cache lock poisoned");
-        if pending.compact_kind == CompactRequestKind::SummaryGeneration {
-            cache.remove(&pending.key);
-            return;
-        }
-        let mut context_items = pending.full_input.clone();
-        if let Some(output) = response.get("output").and_then(Value::as_array) {
-            context_items.extend(output.iter().cloned());
-        }
-        cache.insert(
-            pending.key.clone(),
-            ContextUsageBaseline {
-                static_body: pending.static_body.clone(),
-                context_items,
-                total_tokens: input_tokens.saturating_add(output_tokens),
-                updated_at: Instant::now(),
-            },
-        );
-    }
-
-    fn record_upstream_context_overflow(&self, event: &Value) {
-        let status = crate::responses::responses_error_status(event)
-            .and_then(|status| StatusCode::from_u16(status).ok())
-            .unwrap_or(StatusCode::OK);
-        let body = event.to_string();
-        if !is_prompt_too_long_error(status, &body) {
-            return;
-        }
-        notify_request_metadata_observer(
-            self.observer.as_ref(),
-            ProviderRequestMetadata {
-                context_upstream_overflow: Some(true),
-                ..ProviderRequestMetadata::default()
-            },
-        );
     }
 
     fn log_first_event(&self, event_type: &str) {
@@ -917,52 +974,28 @@ impl ChatGptProvider {
         model_context_window: u32,
         compact_kind: CompactRequestKind,
     ) -> VirtualContextEstimate {
-        let static_body = context_static_body(body);
         let full_input = body
             .get("input")
             .and_then(Value::as_array)
-            .cloned()
+            .map(Vec::as_slice)
             .unwrap_or_default();
         let compressible_history = compact_kind == CompactRequestKind::CompactedContinuation
-            || input_has_compressible_history(&full_input);
-        let key = stable_client_conversation_id
-            .zip(capability_cache::account_hash(token.account_id.as_deref()))
-            .map(
-                |(stable_client_conversation_id, account_hash)| ContextUsageKey {
-                    provider_id: self.id.clone(),
-                    account_hash,
-                    model: body
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    stable_client_conversation_id: stable_client_conversation_id.to_string(),
-                },
-            );
-
-        let mut source = ContextEstimatorSource::FullRough;
-        let mut estimated_tokens = estimate_context_value_tokens(body);
-        if let Some(key) = key.as_ref() {
-            let mut cache = self
-                .context_usage
-                .lock()
-                .expect("ChatGPT context usage cache lock poisoned");
-            cache.retain(|_, baseline| baseline.updated_at.elapsed() <= Duration::from_secs(3600));
-            if compact_kind != CompactRequestKind::None {
-                cache.remove(key);
-            } else if let Some(baseline) = cache.get(key)
-                && baseline.static_body == static_body
-                && full_input.starts_with(&baseline.context_items)
-            {
-                estimated_tokens = baseline.total_tokens.saturating_add(
-                    full_input[baseline.context_items.len()..]
-                        .iter()
-                        .map(estimate_context_value_tokens)
-                        .sum(),
-                );
-                source = ContextEstimatorSource::UsagePlusDelta;
-            }
-        }
+            || input_has_compressible_history(full_input);
+        let (estimated_from_usage, pending_usage) = self.context_usage_estimate(
+            body,
+            token,
+            stable_client_conversation_id,
+            compact_kind,
+            false,
+        );
+        let (estimated_tokens, source) = if let Some(tokens) = estimated_from_usage {
+            (tokens, ContextEstimatorSource::UsagePlusDelta)
+        } else {
+            (
+                estimate_context_value_tokens(body),
+                ContextEstimatorSource::FullRough,
+            )
+        };
 
         let reserve = match compact_kind {
             CompactRequestKind::SummaryGeneration => CLAUDE_CODE_COMPACT_SUMMARY_OUTPUT_RESERVE,
@@ -983,12 +1016,6 @@ impl ChatGptProvider {
             )
             .unwrap_or(u32::MAX),
         );
-        let pending_usage = key.map(|key| PendingContextUsage {
-            key,
-            static_body,
-            full_input,
-            compact_kind,
-        });
         VirtualContextEstimate {
             estimated_tokens,
             safe_input_limit,
@@ -998,6 +1025,63 @@ impl ChatGptProvider {
             compressible_history,
             pending_usage,
         }
+    }
+
+    fn context_usage_estimate(
+        &self,
+        body: &Value,
+        token: &ChatGptToken,
+        conversation_id: Option<&str>,
+        compact_kind: CompactRequestKind,
+        allow_input_prefix: bool,
+    ) -> (Option<u64>, Option<PendingContextUsage>) {
+        let (Some(conversation_id), Some(account_hash), Some(model), Some(input)) = (
+            conversation_id
+                .filter(|id| !id.is_empty() && id.len() <= CONTEXT_USAGE_MAX_CONVERSATION_ID_BYTES),
+            capability_cache::account_hash(token.account_id.as_deref()),
+            body["model"].as_str(),
+            body["input"].as_array(),
+        ) else {
+            return (None, None);
+        };
+        if input.len() > CONTEXT_USAGE_MAX_ITEMS {
+            return (None, None);
+        }
+        let key = ContextUsageKey {
+            provider_id: self.id.clone(),
+            account_hash,
+            model: model.to_string(),
+            stable_client_conversation_id: conversation_id.to_string(),
+        };
+        let started_at = Instant::now();
+        let pending = PendingContextUsage {
+            key,
+            static_body: context_static_body(body),
+            full_input: input.iter().map(context_value_hash).collect(),
+            compact_kind,
+            started_at,
+        };
+        let base = {
+            let mut cache = self
+                .context_usage
+                .lock()
+                .expect("ChatGPT context usage cache lock poisoned");
+            if compact_kind != CompactRequestKind::None {
+                cache.remove(&pending.key);
+                None
+            } else {
+                cache
+                    .get(&pending.key)
+                    .and_then(|baseline| baseline.matching_prefix(&pending, allow_input_prefix))
+            }
+        };
+        let estimate = base.map(|(items, tokens)| {
+            input[items..]
+                .iter()
+                .map(estimate_context_value_tokens)
+                .fold(tokens, u64::saturating_add)
+        });
+        (estimate, Some(pending))
     }
 
     fn remote_model(&self, model: &str) -> Option<ChatGptCatalogModel> {
@@ -1172,17 +1256,6 @@ impl ChatGptProvider {
             .get("model")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown");
-        let model_context_window = self
-            .model_info(model)
-            .and_then(|info| info.capabilities.limits.context_window);
-        warn_if_request_nears_context_window(
-            request_id,
-            compact_request,
-            prompt_too_long_attempt,
-            model,
-            model_context_window,
-            body_bytes,
-        );
         let started_at = Instant::now();
         let runtime_ids = self.runtime_ids_snapshot();
         let session_id = responses::codex_client_metadata_value(body, "session_id")
@@ -1560,6 +1633,7 @@ impl ChatGptProvider {
             stable_client_conversation_id,
             responses_lite,
             pending_context_usage,
+            model_context_window,
             ..
         } = prepared;
         let final_reasoning = chatgpt_reasoning_log_value(&body);
@@ -1578,7 +1652,9 @@ impl ChatGptProvider {
             thinking_diagnostics: Arc::clone(&thinking_diagnostics),
             stream_started_at,
             observer,
-            pending_context_usage,
+            model_context_window,
+            pending_context_usage: pending_context_usage
+                .filter(|pending| pending.matches_account(token)),
         });
         let websocket_start = transport::open_websocket_stream(
             self,
@@ -1665,6 +1741,7 @@ impl ChatGptProvider {
             compact_request,
             observer,
             pending_context_usage,
+            model_context_window,
             responses_correlation,
         } = context;
         let response_headers = response.headers().clone();
@@ -1689,6 +1766,7 @@ impl ChatGptProvider {
             thinking_diagnostics: Arc::clone(&thinking_diagnostics),
             stream_started_at,
             observer,
+            model_context_window,
             pending_context_usage,
         });
         let stream = responses::stream_response_with_marker_mode_and_context(
@@ -1725,6 +1803,7 @@ impl ChatGptProvider {
             thinking_diagnostics,
             stream_started_at,
             observer,
+            model_context_window,
             pending_context_usage,
         } = context;
         let state = ChatGptUpstreamEventHandlerState {
@@ -1735,6 +1814,7 @@ impl ChatGptProvider {
             thinking_diagnostics,
             stream_started_at,
             observer,
+            model_context_window,
             cache: Arc::clone(&self.cached_rate_limits),
             provider_id: self.id.clone(),
             runtime_ids: self.runtime_ids_handle(),
@@ -2250,39 +2330,52 @@ impl Provider for ChatGptProvider {
         let compact_request = compact_kind != CompactRequestKind::None;
         log_compact_request_observability("chatgpt", "/responses", &body, compact_request);
 
+        let model_context_window = model_info
+            .as_ref()
+            .and_then(|model| model.capabilities.limits.context_window);
         let virtual_context = virtual_context_requested
-            && model_info
-                .as_ref()
-                .and_then(|model| model.capabilities.limits.context_window)
+            && model_context_window
                 .is_some_and(|window| window > CLAUDE_CODE_DEFAULT_CONTEXT_WINDOW);
         let context_estimate = virtual_context.then(|| {
             self.virtual_context_estimate(
                 &body,
                 &token,
                 stable_client_conversation_id.as_deref(),
-                model_info
-                    .as_ref()
-                    .and_then(|model| model.capabilities.limits.context_window)
-                    .expect("virtual context requires a known context window"),
+                model_context_window.expect("virtual context requires a known context window"),
                 compact_kind,
             )
         });
+        let (observed_estimate, observed_pending) =
+            if !virtual_context && model_context_window.is_some() {
+                self.context_usage_estimate(
+                    &body,
+                    &token,
+                    stable_client_conversation_id.as_deref(),
+                    compact_kind,
+                    true,
+                )
+            } else {
+                (None, None)
+            };
         notify_request_metadata_observer(
             observer.as_ref(),
             ProviderRequestMetadata {
                 virtual_context_1m: Some(virtual_context),
                 context_estimated_tokens: context_estimate
                     .as_ref()
-                    .map(|estimate| estimate.estimated_tokens),
+                    .map(|estimate| estimate.estimated_tokens)
+                    .or(observed_estimate),
                 context_safe_input_limit: context_estimate
                     .as_ref()
                     .map(|estimate| u64::from(estimate.safe_input_limit)),
-                context_model_window: context_estimate
-                    .as_ref()
-                    .map(|estimate| u64::from(estimate.model_context_window)),
+                context_model_window: model_context_window.map(u64::from),
                 context_estimator_source: context_estimate
                     .as_ref()
-                    .map(|estimate| estimate.estimator_source.as_str().to_string()),
+                    .map(|estimate| estimate.estimator_source.as_str().to_string())
+                    .or_else(|| {
+                        observed_estimate
+                            .map(|_| ContextEstimatorSource::UsagePlusDelta.as_str().into())
+                    }),
                 context_compact_kind: context_estimate
                     .as_ref()
                     .map(|estimate| estimate.compact_kind.as_str().to_string()),
@@ -2338,8 +2431,10 @@ impl Provider for ChatGptProvider {
                     stable_client_conversation_id,
                     responses_lite,
                     observer,
+                    model_context_window,
                     pending_context_usage: context_estimate
-                        .and_then(|estimate| estimate.pending_usage),
+                        .and_then(|estimate| estimate.pending_usage)
+                        .or(observed_pending),
                 },
                 token,
             )
@@ -2374,7 +2469,8 @@ impl Provider for ChatGptProvider {
         let output_token_budget =
             normalize_chatgpt_native_responses_body(&mut body, responses_lite.is_enabled());
         normalize_chatgpt_native_reasoning(&mut body, &model);
-        let compact_request = classify_compact_request_body(&body) != CompactRequestKind::None;
+        let compact_kind = classify_compact_request_body(&body);
+        let compact_request = compact_kind != CompactRequestKind::None;
         let request_id = next_chatgpt_request_id();
         validate_chatgpt_tool_schema_budget(&body)?;
         log_request_observability("chatgpt", "/responses", &body, Some(request_id));
@@ -2386,7 +2482,23 @@ impl Provider for ChatGptProvider {
             budget: output_token_budget,
             responses_lite,
         };
+        let model_context_window = self
+            .model_info(&model)
+            .and_then(|info| info.capabilities.limits.context_window);
+        let context_usage = |body: &Value, token: &ChatGptToken| {
+            if model_context_window.is_none() {
+                return (None, None);
+            }
+            self.context_usage_estimate(
+                body,
+                token,
+                native_context_conversation_id(body, &forwarded_headers),
+                compact_kind,
+                true,
+            )
+        };
         let mut token = self.auth.get_existing_token().await?;
+        let (mut estimated_tokens, mut pending_usage) = context_usage(&body, &token);
         let mut response = self
             .send_responses_request_with_prompt_too_long_retry_and_headers(
                 &mut body,
@@ -2399,6 +2511,7 @@ impl Provider for ChatGptProvider {
             .await?;
         if response.status() == StatusCode::UNAUTHORIZED {
             token = self.auth.force_refresh_token().await?;
+            (estimated_tokens, pending_usage) = context_usage(&body, &token);
             response = self
                 .send_responses_request_with_prompt_too_long_retry_and_headers(
                     &mut body,
@@ -2421,10 +2534,34 @@ impl Provider for ChatGptProvider {
         let header_snapshots =
             rate_limit_snapshots_from_headers(&self.id, &headers, unix_timestamp_secs());
         self.cache_rate_limits(header_snapshots).await;
-        let stream = crate::responses::stream_native_responses_response_with_provider_observer(
+        notify_request_metadata_observer(
+            observer.as_ref(),
+            ProviderRequestMetadata {
+                context_estimated_tokens: estimated_tokens,
+                context_model_window: model_context_window.map(u64::from),
+                context_estimator_source: estimated_tokens
+                    .map(|_| ContextEstimatorSource::UsagePlusDelta.as_str().into()),
+                ..ProviderRequestMetadata::default()
+            },
+        );
+        let usage_cache = Arc::clone(&self.context_usage);
+        let stream = crate::responses::stream_native_responses_response(
             response,
-            observer,
             self.payload_limits.max_sse_frame_bytes,
+            move |event| {
+                crate::responses::notify_stream_metadata(observer.as_ref(), event);
+                notify_stream_context_overflow(observer.as_ref(), event);
+                if let Some(input_tokens) =
+                    record_context_usage(&usage_cache, pending_usage.as_ref(), event)
+                {
+                    warn_for_observed_context_usage(
+                        request_id,
+                        &model,
+                        model_context_window,
+                        input_tokens,
+                    );
+                }
+            },
         );
         Ok(NativeResponsesResponse { headers, stream })
     }
@@ -3490,6 +3627,39 @@ fn notify_request_metadata_observer(
     });
 }
 
+fn notify_stream_context_overflow(observer: Option<&ProviderRequestObserver>, event: &Value) {
+    if observer.is_none() || !matches!(event["type"].as_str(), Some("error" | "response.failed")) {
+        return;
+    }
+    let status = crate::responses::responses_error_status(event)
+        .and_then(|status| StatusCode::from_u16(status).ok())
+        .unwrap_or(StatusCode::OK);
+    if is_prompt_too_long_error(status, &event.to_string()) {
+        notify_request_metadata_observer(
+            observer,
+            ProviderRequestMetadata {
+                context_upstream_overflow: Some(true),
+                ..ProviderRequestMetadata::default()
+            },
+        );
+    }
+}
+
+fn native_context_conversation_id<'a>(body: &'a Value, headers: &'a HeaderMap) -> Option<&'a str> {
+    [("thread-id", "thread_id"), ("session-id", "session_id")]
+        .into_iter()
+        .find_map(|(header, field)| {
+            headers
+                .get(header)
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    responses::codex_client_metadata_value(body, field)
+                        .filter(|value| !value.is_empty())
+                })
+        })
+}
+
 fn validate_chatgpt_tool_schema_budget(body: &Value) -> Result<(), ProviderError> {
     let (tools_count, tools_schema_bytes) = chatgpt_tool_schema_stats(body);
     if tools_schema_bytes <= CHATGPT_TOOL_SCHEMA_BUDGET_BYTES {
@@ -3515,20 +3685,30 @@ fn json_len(value: &Value) -> usize {
     serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
 }
 
-fn context_static_body(body: &Value) -> Value {
-    let mut body = body.clone();
-    if let Some(object) = body.as_object_mut() {
-        for key in [
-            "input",
-            "max_output_tokens",
-            "previous_response_id",
-            "prompt_cache_key",
-            "stream",
-        ] {
-            object.remove(key);
-        }
-    }
-    body
+fn context_static_body(body: &Value) -> [u8; 32] {
+    let fields: BTreeMap<_, _> = body
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "input"
+                    | "max_output_tokens"
+                    | "previous_response_id"
+                    | "prompt_cache_key"
+                    | "stream"
+            )
+        })
+        .collect();
+    context_value_hash(&fields)
+}
+
+fn context_value_hash(value: &impl Serialize) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    serde_json::to_writer(&mut hash, value)
+        .expect("JSON request items can be written to the digest");
+    hash.finalize().into()
 }
 
 fn input_has_compressible_history(input: &[Value]) -> bool {
@@ -3635,76 +3815,30 @@ where
     }
 }
 
-#[cfg(test)]
-fn chatgpt_request_warning_threshold(model: &str, config: &ChatGptProviderConfig) -> Option<usize> {
-    let context_window = chatgpt_model_info(model, config)?
-        .capabilities
-        .limits
-        .context_window?;
-    chatgpt_request_warning_threshold_for_window(context_window)
+fn context_warning_threshold(context_window: u32) -> u64 {
+    u64::from(context_window) * CHATGPT_CONTEXT_WARNING_PERCENT / 100
 }
 
-fn chatgpt_request_warning_threshold_for_window(context_window: u32) -> Option<usize> {
-    let context_window = context_window as usize;
-    Some(
-        context_window
-            .saturating_mul(CHATGPT_REQUEST_WARNING_RATIO)
-            .saturating_div(100)
-            .saturating_mul(CHATGPT_BYTES_PER_ESTIMATED_TOKEN),
-    )
-}
-
-#[cfg(test)]
-fn request_size_warning(
-    model: &str,
-    config: &ChatGptProviderConfig,
-    body_bytes: usize,
-) -> Option<(usize, usize)> {
-    let threshold_bytes = chatgpt_request_warning_threshold(model, config)?;
-    (body_bytes >= threshold_bytes).then_some((
-        threshold_bytes,
-        body_bytes / CHATGPT_BYTES_PER_ESTIMATED_TOKEN,
-    ))
-}
-
-fn request_size_warning_for_window(
-    context_window: u32,
-    body_bytes: usize,
-) -> Option<(usize, usize)> {
-    let threshold_bytes = chatgpt_request_warning_threshold_for_window(context_window)?;
-    (body_bytes >= threshold_bytes).then_some((
-        threshold_bytes,
-        body_bytes / CHATGPT_BYTES_PER_ESTIMATED_TOKEN,
-    ))
-}
-
-fn warn_if_request_nears_context_window(
+fn warn_for_observed_context_usage(
     request_id: u64,
-    compact_request: bool,
-    prompt_too_long_attempt: usize,
     model: &str,
     context_window: Option<u32>,
-    body_bytes: usize,
+    input_tokens: u64,
 ) {
-    let Some(context_window) = context_window else {
+    let Some(context_window) = context_window.filter(|window| *window > 0) else {
         return;
     };
-    let Some((threshold_bytes, estimated_tokens)) =
-        request_size_warning_for_window(context_window, body_bytes)
-    else {
-        return;
-    };
-    warn!(
-        request_id,
-        compact_request,
-        prompt_too_long_attempt,
-        model,
-        body_bytes,
-        threshold_bytes,
-        estimated_tokens,
-        warning_ratio = CHATGPT_REQUEST_WARNING_RATIO,
-        "ChatGPT request is approaching the model context window"
-    );
+    let threshold_tokens = context_warning_threshold(context_window);
+    if input_tokens >= threshold_tokens {
+        warn!(
+            request_id,
+            model,
+            input_tokens,
+            context_window,
+            threshold_tokens,
+            "ChatGPT observed input token usage is approaching the model context window"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4863,6 +4997,7 @@ mod tests {
             thinking_diagnostics: Arc::new(ChatGptThinkingDiagnostics::default()),
             stream_started_at: Instant::now(),
             observer: Some(observer),
+            model_context_window: None,
             pending_context_usage: None,
         });
 
@@ -4938,20 +5073,57 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_request_size_warning_uses_model_context_metadata() {
-        let config = ChatGptProviderConfig::default();
-        let threshold = chatgpt_request_warning_threshold("gpt-5.6-sol", &config).unwrap();
+    fn context_warning_threshold_uses_model_tokens() {
+        assert_eq!(context_warning_threshold(272_000), 217_600);
+        assert_eq!(context_warning_threshold(500_000), 400_000);
+    }
 
-        assert_eq!(
-            threshold,
-            872_000 * CHATGPT_BYTES_PER_ESTIMATED_TOKEN * 80 / 100
+    #[tokio::test]
+    async fn context_usage_reuses_measured_input_with_normalized_output_and_isolates_sessions() {
+        let provider = test_chatgpt_provider("http://127.0.0.1:1/responses".into()).await;
+        let token = chatgpt_test_token();
+        let first = json!({"model":"gpt-6-astra", "instructions":"fixed", "input":[{"role":"user", "content":"first"}]});
+        let (estimate, pending) = provider.context_usage_estimate(
+            &first,
+            &token,
+            Some("session"),
+            CompactRequestKind::None,
+            true,
         );
-        assert!(request_size_warning("gpt-5.6-sol", &config, threshold - 1).is_none());
+        assert!(estimate.is_none());
+        let pending = pending.unwrap();
+        let event = json!({"type":"response.completed", "response":{
+            "usage":{"input_tokens":190_000,"output_tokens":20},
+            "output":[{"type":"message","id":"upstream-item","role":"assistant","content":"done"}]
+        }});
         assert_eq!(
-            request_size_warning("gpt-5.6-sol", &config, threshold),
-            Some((threshold, threshold / CHATGPT_BYTES_PER_ESTIMATED_TOKEN))
+            record_context_usage(&provider.context_usage, Some(&pending), &event),
+            Some(190_000)
         );
-        assert!(request_size_warning("unknown-model", &config, threshold).is_none());
+        let mut next = first.clone();
+        next["input"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"message","role":"assistant","content":"done"}));
+        let estimate = |body: &Value, session, allow_input_prefix| {
+            provider
+                .context_usage_estimate(
+                    body,
+                    &token,
+                    session,
+                    CompactRequestKind::None,
+                    allow_input_prefix,
+                )
+                .0
+        };
+        assert_eq!(estimate(&next, Some("session"), false), None);
+        assert_eq!(
+            estimate(&next, Some("session"), true),
+            Some(190_000 + estimate_context_value_tokens(&next["input"][1]))
+        );
+        assert_eq!(estimate(&next, Some("another-session"), true), None);
+        next["instructions"] = json!("changed");
+        assert_eq!(estimate(&next, Some("session"), true), None);
     }
 
     #[tokio::test]
@@ -6814,8 +6986,16 @@ mod tests {
             key,
             ContextUsageBaseline {
                 static_body: context_static_body(&first),
-                context_items: first["input"].as_array().unwrap().clone(),
+                context_items: first["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(context_value_hash)
+                    .collect(),
+                input_item_count: 1,
+                input_tokens: 1_000,
                 total_tokens: 1_000,
+                request_started_at: Instant::now(),
                 updated_at: Instant::now(),
             },
         );
@@ -8735,6 +8915,7 @@ mod tests {
             stable_client_conversation_id: stable_client_conversation_id.map(ToOwned::to_owned),
             responses_lite: ResponsesLiteDecision::enabled(ResponsesLiteDecisionSource::ForcedOn),
             observer: None,
+            model_context_window: None,
             pending_context_usage: None,
         }
     }
@@ -8745,7 +8926,12 @@ mod tests {
         token: &ChatGptToken,
         session_id: &str,
     ) -> PendingContextUsage {
-        let full_input = prepared.body["input"].as_array().unwrap().clone();
+        let full_input = prepared.body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(context_value_hash)
+            .collect();
         PendingContextUsage {
             key: ContextUsageKey {
                 provider_id: provider.id.clone(),
@@ -8756,6 +8942,7 @@ mod tests {
             static_body: context_static_body(&prepared.body),
             full_input,
             compact_kind: CompactRequestKind::None,
+            started_at: Instant::now(),
         }
     }
 

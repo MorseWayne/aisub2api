@@ -20,6 +20,7 @@ pub use provider::{
     NativeProviderEvent, NativeResponsesRequest, NativeResponsesResponse, Provider, ProviderError,
     ProviderEvent,
 };
+pub use responses::native_failure_metadata as native_responses_failure_metadata;
 
 use std::sync::Arc;
 

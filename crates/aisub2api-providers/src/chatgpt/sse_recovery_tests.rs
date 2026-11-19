@@ -232,6 +232,7 @@ fn prepared() -> ChatGptPreparedRequest {
         stable_client_conversation_id: None,
         responses_lite: ResponsesLiteDecision::disabled(ResponsesLiteDecisionSource::ForcedOff),
         observer: None,
+        model_context_window: None,
         pending_context_usage: None,
     }
 }

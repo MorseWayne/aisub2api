@@ -122,7 +122,12 @@ pub(super) async fn chat_via_sse(
                     request_id: prepared.request_id,
                     compact_request: prepared.compact_request,
                     observer: prepared.observer.clone(),
-                    pending_context_usage: prepared.pending_context_usage.clone(),
+                    model_context_window: prepared.model_context_window,
+                    pending_context_usage: prepared
+                        .pending_context_usage
+                        .as_ref()
+                        .filter(|pending| pending.matches_account(&token))
+                        .cloned(),
                     responses_correlation: prepared.responses_correlation.clone(),
                 },
             )

@@ -25,7 +25,20 @@ pub struct RequestPayloadStats {
     pub messages: u64,
     pub content_blocks: u64,
     pub tool_results: u64,
+    pub tool_result_bytes: u64,
+    pub history_tool_result_bytes: u64,
+    pub largest_tool_result_bytes: u64,
     pub text_bytes: u64,
+}
+
+impl RequestPayloadStats {
+    pub(crate) fn record_tool_result(&mut self, payload: Option<&Value>) {
+        self.tool_results += 1;
+        if let Some(bytes) = payload.and_then(aisub2api_providers::provider::serialized_json_size) {
+            self.tool_result_bytes += bytes;
+            self.largest_tool_result_bytes = self.largest_tool_result_bytes.max(bytes);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -105,6 +118,12 @@ pub struct RequestObservabilityEvent {
     pub request_messages: u64,
     pub request_content_blocks: u64,
     pub request_tool_results: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_tool_result_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_history_tool_result_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_largest_tool_result_bytes: Option<u64>,
     pub request_text_bytes: u64,
 }
 
@@ -924,6 +943,9 @@ mod tests {
                     request_messages: 2,
                     request_content_blocks: 3,
                     request_tool_results: 1,
+                    request_tool_result_bytes: Some(42),
+                    request_history_tool_result_bytes: Some(42),
+                    request_largest_tool_result_bytes: Some(42),
                     request_text_bytes: 42,
                 },
                 false,
@@ -981,6 +1003,9 @@ mod tests {
                     request_messages: 1,
                     request_content_blocks: 1,
                     request_tool_results: 0,
+                    request_tool_result_bytes: Some(0),
+                    request_history_tool_result_bytes: Some(0),
+                    request_largest_tool_result_bytes: Some(0),
                     request_text_bytes: 10,
                 },
                 false,

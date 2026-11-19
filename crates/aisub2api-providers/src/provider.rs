@@ -75,9 +75,15 @@ impl ProviderEvent {
 fn sse_event_retained_size(event: &SseEvent) -> Option<u64> {
     let fixed = u64::try_from(size_of::<SseEvent>()).ok()?;
     let event_name = u64::try_from(event.event.len()).ok()?;
+    fixed
+        .checked_add(event_name)?
+        .checked_add(serialized_json_size(&event.data)?)
+}
+
+pub fn serialized_json_size(value: &Value) -> Option<u64> {
     let mut writer = CountingWriter::default();
-    serde_json::to_writer(&mut writer, &event.data).ok()?;
-    fixed.checked_add(event_name)?.checked_add(writer.bytes)
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(writer.bytes)
 }
 
 #[derive(Default)]

@@ -117,6 +117,18 @@ fn rebuild_usage_events_schema(conn: &Connection) -> rusqlite::Result<()> {
 
 fn ensure_request_observability_columns(conn: &Connection) -> rusqlite::Result<()> {
     for (name, definition) in [
+        (
+            "request_tool_result_bytes",
+            "request_tool_result_bytes INTEGER",
+        ),
+        (
+            "request_history_tool_result_bytes",
+            "request_history_tool_result_bytes INTEGER",
+        ),
+        (
+            "request_largest_tool_result_bytes",
+            "request_largest_tool_result_bytes INTEGER",
+        ),
         ("transport", "transport TEXT"),
         ("websocket_reused", "websocket_reused INTEGER"),
         ("continuation_used", "continuation_used INTEGER"),
@@ -474,8 +486,9 @@ impl MetricsStore {
                 prompt_too_long_retries,
                 prompt_too_long_original_body_bytes, prompt_too_long_shrunk_body_bytes,
                 prompt_too_long_dropped_items, request_messages, request_content_blocks,
-                request_tool_results, request_text_bytes
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50)",
+                request_tool_results, request_text_bytes, request_tool_result_bytes,
+                request_history_tool_result_bytes, request_largest_tool_result_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53)",
             rusqlite::params![
                 ev.request_id,
                 ev.provider,
@@ -529,6 +542,9 @@ impl MetricsStore {
                 ev.request_content_blocks as i64,
                 ev.request_tool_results as i64,
                 ev.request_text_bytes as i64,
+                ev.request_tool_result_bytes.map(|value| value as i64),
+                ev.request_history_tool_result_bytes.map(|value| value as i64),
+                ev.request_largest_tool_result_bytes.map(|value| value as i64),
             ],
         ),
     }
@@ -699,7 +715,8 @@ fn load_request_observability(conn: &Connection) -> RequestObservabilityStored {
                 prompt_too_long_retries,
                 prompt_too_long_original_body_bytes, prompt_too_long_shrunk_body_bytes,
                 prompt_too_long_dropped_items, request_messages, request_content_blocks,
-                request_tool_results, request_text_bytes
+                request_tool_results, request_text_bytes, request_tool_result_bytes,
+                request_history_tool_result_bytes, request_largest_tool_result_bytes
          FROM request_observability_events
          ORDER BY id DESC
          LIMIT 20",
@@ -770,6 +787,9 @@ fn request_observability_from_row(
         request_content_blocks: row.get::<_, i64>(47)? as u64,
         request_tool_results: row.get::<_, i64>(48)? as u64,
         request_text_bytes: row.get::<_, i64>(49)? as u64,
+        request_tool_result_bytes: row.get::<_, Option<i64>>(50)?.map(|value| value as u64),
+        request_history_tool_result_bytes: row.get::<_, Option<i64>>(51)?.map(|value| value as u64),
+        request_largest_tool_result_bytes: row.get::<_, Option<i64>>(52)?.map(|value| value as u64),
     })
 }
 
@@ -1092,6 +1112,9 @@ mod tests {
             request_messages: 3,
             request_content_blocks: 5,
             request_tool_results: 1,
+            request_tool_result_bytes: Some(120),
+            request_history_tool_result_bytes: Some(100),
+            request_largest_tool_result_bytes: Some(100),
             request_text_bytes: 80,
         }
     }
@@ -1125,6 +1148,15 @@ mod tests {
         assert_eq!(stored.recent[1].request_id, "second");
         assert_eq!(stored.recent[1].terminal_reason, "stream_error");
         assert_eq!(stored.recent[1].request_tool_results, 1);
+        assert_eq!(stored.recent[1].request_tool_result_bytes, Some(120));
+        assert_eq!(
+            stored.recent[1].request_history_tool_result_bytes,
+            Some(100)
+        );
+        assert_eq!(
+            stored.recent[1].request_largest_tool_result_bytes,
+            Some(100)
+        );
         assert_eq!(stored.recent[0].transport.as_deref(), Some("websocket"));
         assert_eq!(stored.recent[0].websocket_reused, Some(true));
         assert_eq!(stored.recent[0].continuation_used, Some(true));
@@ -1265,6 +1297,9 @@ mod tests {
         assert_eq!(event.context_estimated_tokens, None);
         assert_eq!(event.context_local_blocked, None);
         assert_eq!(event.context_upstream_overflow, None);
+        assert_eq!(event.request_tool_result_bytes, None);
+        assert_eq!(event.request_history_tool_result_bytes, None);
+        assert_eq!(event.request_largest_tool_result_bytes, None);
         assert_eq!(stored.summary.responses_lite_requests, 0);
         assert_eq!(stored.summary.websocket_requests, 0);
         assert_eq!(stored.summary.continuation_used_requests, 0);
