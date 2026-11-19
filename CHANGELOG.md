@@ -1,5 +1,21 @@
 # Changelog
 
+## v6.0.10 - 2026-11-19
+
+### Added
+
+- Add GPT-6.2 Sol and Astra to the ChatGPT fallback catalog with active context windows of 500K and 272K. GPT-6.1 Sol now uses 500K. GPT-6.2 Ultra maps to `xhigh`, and per-model configuration takes precedence over the catalog's Responses Lite hint.
+
+### Fixed
+
+- Preserve upstream HTTP and SSE error codes, request IDs, and retry advice on native Responses. API key, project, and organization spend limits return HTTP 429 without replay. Ordinary rate limiting retains its retry policy.
+- Bound ChatGPT upstream WebSocket frames to 1 MiB and honor the handshake message limit. Auto mode uses SSE for the individual oversized request if the peer limit is exceeded or the peer sends close code 1009 before its first text frame.
+- Retry a ChatGPT SSE request once with the same JSON body and identity encoding when the upstream rejects its zstd body with a generic HTTP 400. This retry shares the request's existing retry budget.
+
+### Validation
+
+- Passed 694 workspace tests, 27 isolated protocol probes, formatting, and workspace Clippy with warnings denied. The protocol probes used synthetic upstreams and credentials.
+
 ## v6.0.9 - 2026-11-06
 
 ### Fixed
