@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use crate::http::{json_headers_to_header_map, upstream_error_metadata_from_parts};
+use crate::http::upstream_error_metadata_from_parts;
 use crate::provider::ProviderEvent;
+use crate::responses::{responses_error_headers, responses_error_status, terminal_responses_error};
 use aisub2api_config::settings::ReasoningMarkerMode;
 use base64::Engine;
 use futures::{SinkExt, Stream, StreamExt, stream::BoxStream};
@@ -15,12 +16,18 @@ use reqwest::{
     StatusCode, Url,
     header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue, USER_AGENT},
 };
-use serde::Deserialize;
 use serde_json::{Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
-use tokio_tungstenite::tungstenite::{Error as WsError, Message, client::IntoClientRequest};
+use tokio_tungstenite::tungstenite::{
+    Bytes, Error as WsError, Message,
+    client::IntoClientRequest,
+    protocol::frame::{
+        Frame,
+        coding::{CloseCode, Data, OpCode},
+    },
+};
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
     connect_async_tls_with_config,
@@ -41,6 +48,8 @@ const CHATGPT_WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const CHATGPT_WEBSOCKET_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const CHATGPT_WEBSOCKET_STARTUP_MAX_EVENTS: usize = 64;
 const CHATGPT_WEBSOCKET_STARTUP_MAX_BYTES: usize = 256 * 1024;
+const CHATGPT_WEBSOCKET_SEND_FRAME_BYTES: usize = 1024 * 1024;
+const CHATGPT_WEBSOCKET_MAX_MESSAGE_HEADER: &str = "x-codex-websocket-max-message-bytes";
 const CHATGPT_WEBSOCKET_SESSION_IDLE_TTL: Duration = Duration::from_secs(60);
 const CHATGPT_CONTINUATION_SCHEMA_VERSION: &str = "chatgpt-continuation-v1";
 const WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY: &str =
@@ -79,6 +88,13 @@ pub(super) struct ChatGptWebSocketStartError {
 }
 
 impl ChatGptWebSocketStartError {
+    pub(super) fn message_too_large(&self) -> bool {
+        matches!(
+            self.error.without_upstream_metadata(),
+            ProviderError::RequestTooLarge(_)
+        )
+    }
+
     fn new(error: ProviderError, fallback_allowed: bool) -> Self {
         Self::with_phase(error, fallback_allowed, ChatGptWebSocketPhase::Protocol)
     }
@@ -120,6 +136,11 @@ struct ResolvedChatGptWebSocketProxy {
 }
 
 type ChatGptWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+struct ChatGptWsConnection {
+    stream: ChatGptWsStream,
+    max_message_bytes: Option<usize>,
+}
 
 struct AbortOnDropStream {
     inner: BoxStream<'static, Result<ProviderEvent, ProviderError>>,
@@ -179,7 +200,7 @@ impl ChatGptWebSocketSession {
         &mut self,
         key: &WebSocketConnectionKey,
         preferred_connection_id: Option<u64>,
-    ) -> Option<(ChatGptWsStream, u64)> {
+    ) -> Option<(ChatGptWsConnection, u64)> {
         self.prune_expired_connections();
         let index = preferred_connection_id
             .and_then(|connection_id| {
@@ -189,12 +210,12 @@ impl ChatGptWebSocketSession {
             })
             .or_else(|| self.cached.iter().position(|cached| cached.key == *key))?;
         let cached = self.cached.swap_remove(index);
-        Some((cached.stream, cached.connection_id))
+        Some((cached.connection, cached.connection_id))
     }
 
     fn store_connection(
         &mut self,
-        stream: ChatGptWsStream,
+        connection: ChatGptWsConnection,
         key: WebSocketConnectionKey,
         connection_id: Option<u64>,
     ) -> u64 {
@@ -211,7 +232,7 @@ impl ChatGptWebSocketSession {
         }
         let connection_id = connection_id.unwrap_or_else(|| self.allocate_connection_id());
         self.cached.push(CachedWebSocketConnection {
-            stream,
+            connection,
             key,
             connection_id,
             last_used: Instant::now(),
@@ -691,7 +712,7 @@ impl ContinuationAttempt {
 }
 
 struct CachedWebSocketConnection {
-    stream: ChatGptWsStream,
+    connection: ChatGptWsConnection,
     key: WebSocketConnectionKey,
     connection_id: u64,
     last_used: Instant,
@@ -1045,7 +1066,7 @@ where
     let request_body_bytes = serde_json::to_vec(&body).map_or(0, |bytes| bytes.len());
     let idle_timeout = websocket_idle_timeout(provider);
     let connection_key = websocket_connection_key(provider, token, &body);
-    let (mut stream, reused, checked_out_connection_id) = match checkout_connection(
+    let (mut connection, reused, checked_out_connection_id) = match checkout_connection(
         provider,
         token,
         &connection_key,
@@ -1124,14 +1145,21 @@ where
     // One budget covers sending and every prelude/control frame. Individual
     // ping/pong or metadata messages must not extend startup indefinitely.
     let startup = tokio::time::timeout(startup_timeout, async {
-        send_websocket_request(&mut stream, request_text, idle_timeout)
+        send_websocket_request(&mut connection, request_text, idle_timeout)
             .await
             .map_err(|error| {
                 ChatGptWebSocketStartError::with_phase(error, true, ChatGptWebSocketPhase::Send)
             })?;
         startup_phase = ChatGptWebSocketPhase::FirstEvent;
         loop {
-            let event = read_next_json_event(&mut stream, idle_timeout, true).await?;
+            let event = read_next_json_event(&mut connection.stream, idle_timeout, true)
+                .await
+                .map_err(|mut error| {
+                    if error.message_too_large() && !startup_events.is_empty() {
+                        error.fallback_allowed = false;
+                    }
+                    error
+                })?;
             if websocket_event_can_emit_downstream_sse(&event) {
                 return Ok(event);
             }
@@ -1200,7 +1228,7 @@ where
                     websocket_prelude_events = startup_events.len(),
                     "ChatGPT websocket continuation response id was rejected"
                 );
-                close_or_release_websocket(stream).await;
+                close_or_release_websocket(connection.stream).await;
                 error.fallback_allowed = true;
                 return Err(error);
             }
@@ -1259,11 +1287,11 @@ where
                     "upstream server_error",
                 );
                 websocket_session.lock().await.clear_volatile_state();
-                close_or_release_websocket(stream).await;
+                close_or_release_websocket(connection.stream).await;
             } else {
                 complete_and_store_connection(
                     websocket_session,
-                    stream,
+                    connection,
                     connection_key,
                     &continuation,
                     &first_event,
@@ -1285,10 +1313,10 @@ where
                         .lock()
                         .await
                         .fail_continuation_for_connection(&continuation, checked_out_connection_id);
-                    close_or_release_websocket(stream).await;
+                    close_or_release_websocket(connection.stream).await;
                     return;
                 }
-                result = read_next_json_event(&mut stream, idle_timeout, false) => {
+                result = read_next_json_event(&mut connection.stream, idle_timeout, false) => {
                     match result {
                         Ok(event) => {
                             let terminal = is_terminal_response_event(&event);
@@ -1300,7 +1328,7 @@ where
                                         &continuation,
                                         checked_out_connection_id,
                                     );
-                                close_or_release_websocket(stream).await;
+                                close_or_release_websocket(connection.stream).await;
                                 return;
                             }
                             if terminal {
@@ -1318,11 +1346,11 @@ where
                                         "upstream server_error",
                                     );
                                     websocket_session.lock().await.clear_volatile_state();
-                                    close_or_release_websocket(stream).await;
+                                    close_or_release_websocket(connection.stream).await;
                                 } else {
                                     complete_and_store_connection(
                                         websocket_session,
-                                        stream,
+                                        connection,
                                         connection_key,
                                         &continuation,
                                         &event,
@@ -1391,21 +1419,21 @@ async fn checkout_connection(
     key: &WebSocketConnectionKey,
     body: &Value,
     stable_client_conversation_id: Option<&str>,
-) -> Result<(ChatGptWsStream, bool, Option<u64>), ChatGptWebSocketStartError> {
+) -> Result<(ChatGptWsConnection, bool, Option<u64>), ChatGptWebSocketStartError> {
     let cached = {
         let mut session = provider.websocket_session.lock().await;
         let preferred_connection_id =
             session.preferred_connection_id(provider, token, body, stable_client_conversation_id);
         session.take_fresh(key, preferred_connection_id)
     };
-    if let Some((stream, connection_id)) = cached {
-        return Ok((stream, true, Some(connection_id)));
+    if let Some((connection, connection_id)) = cached {
+        return Ok((connection, true, Some(connection_id)));
     }
 
     let url = websocket_url(provider)?;
     let headers = websocket_headers(provider, token, body)?;
-    let stream = connect_websocket(provider, url, headers).await?;
-    Ok((stream, false, None))
+    let connection = connect_websocket(provider, url, headers).await?;
+    Ok((connection, false, None))
 }
 
 struct WebSocketCompletionContext {
@@ -1416,7 +1444,7 @@ struct WebSocketCompletionContext {
 
 async fn complete_and_store_connection(
     websocket_session: Arc<tokio::sync::Mutex<ChatGptWebSocketSession>>,
-    stream: ChatGptWsStream,
+    connection: ChatGptWsConnection,
     key: WebSocketConnectionKey,
     continuation: &ContinuationAttempt,
     terminal_event: &Value,
@@ -1428,7 +1456,7 @@ async fn complete_and_store_connection(
         checked_out_connection_id,
     } = context;
     let mut session = websocket_session.lock().await;
-    let cached_connection_id = session.store_connection(stream, key, checked_out_connection_id);
+    let cached_connection_id = session.store_connection(connection, key, checked_out_connection_id);
     session.complete_continuation_if_connection_cached(
         continuation,
         terminal_event,
@@ -1600,7 +1628,7 @@ async fn connect_websocket(
     provider: &ChatGptProvider,
     url: Url,
     headers: HeaderMap,
-) -> Result<ChatGptWsStream, ChatGptWebSocketStartError> {
+) -> Result<ChatGptWsConnection, ChatGptWebSocketStartError> {
     let mut request = url.as_str().into_client_request().map_err(|error| {
         ChatGptWebSocketStartError::new(
             ProviderError::InvalidRequest(format!(
@@ -1660,7 +1688,18 @@ async fn connect_websocket(
         extra_ca_certs = provider.extra_ca_certs.len(),
         "ChatGPT websocket connected"
     );
-    Ok(stream)
+    Ok(ChatGptWsConnection {
+        stream,
+        max_message_bytes: websocket_max_message_bytes(response.headers()),
+    })
+}
+
+fn websocket_max_message_bytes(headers: &HeaderMap) -> Option<usize> {
+    headers
+        .get(CHATGPT_WEBSOCKET_MAX_MESSAGE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
 }
 
 fn resolve_websocket_proxy(
@@ -2089,19 +2128,52 @@ fn response_create_request_text(
 }
 
 async fn send_websocket_request(
-    stream: &mut ChatGptWsStream,
+    connection: &mut ChatGptWsConnection,
     request_text: String,
     idle_timeout: Duration,
 ) -> Result<(), ProviderError> {
+    if let Some(limit) = connection.max_message_bytes
+        && request_text.len() > limit
+    {
+        return Err(ProviderError::RequestTooLarge(format!(
+            "ChatGPT websocket request has {} bytes and exceeds the peer's {limit}-byte message limit",
+            request_text.len(),
+        )));
+    }
     tokio::time::timeout(
         idle_timeout,
-        stream.send(Message::Text(request_text.into())),
+        send_websocket_text(&mut connection.stream, request_text),
     )
     .await
     .map_err(|_| ProviderError::Timeout)?
     .map_err(|error| {
         ProviderError::Network(format!("failed to send ChatGPT websocket request: {error}"))
     })
+}
+
+async fn send_websocket_text(
+    stream: &mut ChatGptWsStream,
+    request_text: String,
+) -> Result<(), WsError> {
+    if request_text.len() <= CHATGPT_WEBSOCKET_SEND_FRAME_BYTES {
+        return stream.send(Message::Text(request_text.into())).await;
+    }
+    let bytes = Bytes::from(request_text);
+    for start in (0..bytes.len()).step_by(CHATGPT_WEBSOCKET_SEND_FRAME_BYTES) {
+        let end = (start + CHATGPT_WEBSOCKET_SEND_FRAME_BYTES).min(bytes.len());
+        let opcode = if start == 0 {
+            Data::Text
+        } else {
+            Data::Continue
+        };
+        let frame = Frame::message(
+            bytes.slice(start..end),
+            OpCode::Data(opcode),
+            end == bytes.len(),
+        );
+        stream.feed(Message::Frame(frame)).await?;
+    }
+    stream.flush().await
 }
 
 async fn read_next_json_event(
@@ -2155,6 +2227,18 @@ async fn read_next_json_event(
                 ));
             }
             Message::Close(frame) => {
+                if frame
+                    .as_ref()
+                    .is_some_and(|frame| frame.code == CloseCode::Size)
+                {
+                    return Err(ChatGptWebSocketStartError::with_phase(
+                        ProviderError::RequestTooLarge(
+                            "ChatGPT websocket peer rejected the message size (1009)".into(),
+                        ),
+                        before_first_event,
+                        websocket_read_phase(before_first_event),
+                    ));
+                }
                 let reason = frame
                     .as_ref()
                     .map(|frame| frame.reason.to_string())
@@ -2276,67 +2360,40 @@ fn websocket_http_fallback_allowed(status: StatusCode, body: &str) -> bool {
     !lower.contains("usage_limit") && !lower.contains("rate_limit")
 }
 
-#[derive(Debug, Deserialize)]
-struct WrappedWebSocketErrorEvent {
-    #[serde(alias = "status_code")]
-    status: Option<u16>,
-    #[serde(default)]
-    error: Option<WrappedWebSocketError>,
-    #[serde(default)]
-    headers: Option<serde_json::Map<String, Value>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WrappedWebSocketError {
-    code: Option<String>,
-    message: Option<String>,
-}
-
 fn map_wrapped_websocket_error_event(value: &Value, original_text: &str) -> ProviderError {
-    let parsed = serde_json::from_value::<WrappedWebSocketErrorEvent>(value.clone()).ok();
-    let status = parsed
-        .as_ref()
-        .and_then(|event| event.status)
-        .unwrap_or(200);
-    let message = parsed
-        .as_ref()
-        .and_then(|event| event.error.as_ref())
-        .and_then(|error| error.message.clone())
-        .unwrap_or_else(|| original_text.to_string());
-    let code = parsed
-        .as_ref()
-        .and_then(|event| event.error.as_ref())
-        .and_then(|error| error.code.as_deref());
-
-    let headers = parsed
-        .as_ref()
-        .and_then(|event| event.headers.clone())
-        .map(json_headers_to_header_map)
+    let explicit_status = responses_error_status(value);
+    let status = explicit_status.unwrap_or(200);
+    let error = value.get("error").unwrap_or(value);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or(original_text);
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
         .unwrap_or_default();
+    let headers = responses_error_headers(value, error);
     let metadata =
-        upstream_error_metadata_from_parts(status, &headers, original_text, message.clone());
-    if code == Some(WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE) {
+        upstream_error_metadata_from_parts(status, &headers, original_text, message.to_string());
+    // The ChatGPT adapter keeps its existing context-overflow message and downstream status.
+    if code != "context_length_exceeded"
+        && let Some(error) = terminal_responses_error(code, explicit_status, message)
+    {
+        return error.with_upstream_metadata(metadata);
+    }
+    if code == WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE || code == "server_is_overloaded" {
         return ProviderError::Overloaded {
-            message,
+            message: message.into(),
             retry_after: metadata.retry_after,
         }
         .with_upstream_metadata(metadata);
     }
-    if code == Some("flex_unavailable") {
-        return ProviderError::FlexUnavailable(message).with_upstream_metadata(metadata);
-    }
-    if code == Some("policy_capacity_unavailable") {
+    if code == "policy_capacity_unavailable" {
         return ProviderError::PolicyCapacityUnavailable {
-            message,
+            message: message.into(),
             retry_after: metadata.retry_after,
         }
         .with_upstream_metadata(metadata);
-    }
-    if code == Some("model_not_found") {
-        return ProviderError::ModelNotFound(message).with_upstream_metadata(metadata);
-    }
-    if code.is_some_and(crate::http::is_audio_validation_error_code) {
-        return ProviderError::InvalidRequest(message).with_upstream_metadata(metadata);
     }
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     map_chatgpt_error_status_body_with_headers(status, &headers, original_text.to_string())
@@ -2386,6 +2443,80 @@ mod tests {
     use aisub2api_config::settings::{ProviderRequestConfig, ProviderRuntimeConfig};
     use serde_json::json;
 
+    #[tokio::test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "tungstenite handshake callbacks use its HTTP error response"
+    )]
+    async fn websocket_frames_reassemble_utf8_and_respect_the_peer_message_limit() {
+        use tokio_tungstenite::accept_hdr_async_with_config;
+        use tokio_tungstenite::tungstenite::{
+            handshake::server::{Request, Response},
+            protocol::WebSocketConfig,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!(
+            "ws://{}/responses",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let provider = super::super::tests::test_chatgpt_provider(url.to_string()).await;
+        let request = format!("{}界", "a".repeat(CHATGPT_WEBSOCKET_SEND_FRAME_BYTES - 1));
+        let expected = request.clone();
+        let limit = request.len();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut websocket = accept_hdr_async_with_config(
+                socket,
+                move |_: &Request, mut response: Response| {
+                    response.headers_mut().insert(
+                        CHATGPT_WEBSOCKET_MAX_MESSAGE_HEADER,
+                        HeaderValue::from(limit),
+                    );
+                    Ok(response)
+                },
+                Some(
+                    WebSocketConfig::default()
+                        .max_frame_size(Some(CHATGPT_WEBSOCKET_SEND_FRAME_BYTES)),
+                ),
+            )
+            .await
+            .unwrap();
+            let message = websocket.next().await.unwrap().unwrap();
+            assert_eq!(message.into_text().unwrap().as_str(), expected);
+        });
+
+        let mut connection = connect_websocket(&provider, url, HeaderMap::new())
+            .await
+            .unwrap();
+        assert_eq!(connection.max_message_bytes, Some(limit));
+        let oversized = send_websocket_request(
+            &mut connection,
+            format!("{request}a"),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(matches!(oversized, Err(ProviderError::RequestTooLarge(_))));
+        send_websocket_request(&mut connection, request, Duration::from_secs(2))
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn websocket_message_limit_ignores_missing_and_invalid_advertisements() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(websocket_max_message_bytes(&headers), None);
+        for value in ["", "0", "-1", "1MiB", "99999999999999999999999"] {
+            headers.insert(
+                CHATGPT_WEBSOCKET_MAX_MESSAGE_HEADER,
+                HeaderValue::from_static(value),
+            );
+            assert_eq!(websocket_max_message_bytes(&headers), None);
+        }
+    }
+
     #[test]
     fn websocket_connection_limit_preserves_retry_after() {
         let value = json!({"type":"error", "status":429, "error":{"code":"websocket_connection_limit_reached", "message":"too many sockets"}, "headers":{"retry-after-ms":90500, "x-request-id":"req-ws"}});
@@ -2429,6 +2560,18 @@ mod tests {
         assert!(matches!(
             error.without_upstream_metadata(),
             ProviderError::ModelNotFound(message) if message == "unknown model"
+        ));
+
+        let context_error = json!({"type":"error", "status_code":503, "error":{
+            "code":"context_length_exceeded", "message":"temporarily unavailable", "headers":{"Retry-After":2}
+        }});
+        let error = map_wrapped_websocket_error_event(&context_error, &context_error.to_string());
+        assert!(matches!(
+            error.without_upstream_metadata(),
+            ProviderError::Overloaded {
+                retry_after: Some(2),
+                ..
+            }
         ));
     }
 

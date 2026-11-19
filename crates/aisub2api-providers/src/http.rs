@@ -48,14 +48,26 @@ const NON_RETRYABLE_RATE_LIMIT_VALUES: &[&str] = &[
     "payment_required",
     "quota_exceeded",
     "credit_balance_exhausted",
-    "organization_spend_limit_exceeded",
-    "project_spend_limit_exceeded",
     "usage_not_included",
+];
+const SPEND_LIMIT_CODES: &[&str] = &[
+    "api_key_spend_limit_exceeded",
+    "project_spend_limit_exceeded",
+    "organization_spend_limit_exceeded",
+];
+const UPSTREAM_ERROR_CODE_HEADERS: &[&str] = &["x-openai-error-code", "openai-error-code"];
+const RATE_LIMIT_REASON_HEADERS: &[&str] = &[
+    "x-openai-error-code",
+    "openai-error-code",
+    "x-ratelimit-reason",
+    "x-rate-limit-reason",
 ];
 const NON_RETRYABLE_RATE_LIMIT_BODY_POINTERS: &[&str] = &[
     "/error/code",
     "/error/type",
     "/error/reason",
+    "/detail/code",
+    "/response/error/code",
     "/code",
     "/type",
     "/reason",
@@ -272,6 +284,10 @@ impl UpstreamRetryBudget {
         }
     }
 
+    pub(crate) fn has_request_attempts_remaining(&self) -> bool {
+        self.attempts < self.policy.max_attempts()
+    }
+
     pub(crate) fn overload_retry_delay(&self, error: &ProviderError) -> Option<Duration> {
         let ProviderError::Overloaded { retry_after, .. } = error.without_upstream_metadata()
         else {
@@ -323,7 +339,7 @@ pub(crate) async fn send_upstream_request_with_budget(
         }
 
         budget.attempts += 1;
-        let response = detailed.map_err(|error| error.error);
+        let mut response = detailed.map_err(|error| error.error);
         if budget.attempts >= max_attempts || !should_retry_result(&response, policy) {
             return response;
         }
@@ -337,6 +353,17 @@ pub(crate) async fn send_upstream_request_with_budget(
             .is_some_and(|delay| delay > MAX_RETRY_AFTER_DELAY)
         {
             return response;
+        }
+        if let Ok(response) = &mut response
+            && response.status() == StatusCode::TOO_MANY_REQUESTS
+            && let Ok(body) = timeout(
+                UPSTREAM_ERROR_BODY_IDLE_TIMEOUT,
+                read_limited_response_text(response, MAX_UPSTREAM_ERROR_BODY_BYTES),
+            )
+            .await
+            && is_non_retryable_rate_limit_error_body(&body)
+        {
+            return Err(map_upstream_error_body(429, response.headers(), body));
         }
         warn_retrying_upstream_request(budget.attempts, max_attempts, &response);
         sleep(retry_delay(budget.attempts, response.as_ref().ok(), policy)).await;
@@ -531,16 +558,10 @@ fn is_retryable_status(status: StatusCode) -> bool {
 }
 
 pub(crate) fn is_non_retryable_rate_limit_headers(headers: &HeaderMap) -> bool {
-    header_contains_any(
-        headers,
-        &[
-            "x-openai-error-code",
-            "openai-error-code",
-            "x-ratelimit-reason",
-            "x-rate-limit-reason",
-        ],
-        NON_RETRYABLE_RATE_LIMIT_VALUES,
-    )
+    RATE_LIMIT_REASON_HEADERS
+        .iter()
+        .filter_map(|name| header_value(headers, name))
+        .any(|value| value_contains_non_retryable_rate_limit(&value))
 }
 
 pub(crate) fn is_non_retryable_rate_limit_error_body(body: &str) -> bool {
@@ -555,11 +576,29 @@ pub(crate) fn is_non_retryable_rate_limit_error_body(body: &str) -> bool {
 }
 
 pub(crate) fn upstream_error_code(body: &str) -> Option<String> {
-    serde_json::from_str::<Value>(body)
-        .ok()?
-        .pointer("/error/code")?
-        .as_str()
-        .map(str::to_string)
+    let value = serde_json::from_str::<Value>(body).ok()?;
+    [
+        "/error/code",
+        "/detail/code",
+        "/response/error/code",
+        "/code",
+    ]
+    .into_iter()
+    .filter_map(|path| value.pointer(path).and_then(Value::as_str))
+    .find(|code| valid_upstream_error_code(code))
+    .map(str::to_string)
+}
+
+pub fn is_spend_limit_code(code: &str) -> bool {
+    SPEND_LIMIT_CODES.contains(&code)
+}
+
+fn valid_upstream_error_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= MAX_SAFE_UPSTREAM_HEADER_VALUE_BYTES
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 pub(crate) fn is_audio_validation_error_code(code: &str) -> bool {
@@ -578,6 +617,7 @@ fn value_contains_non_retryable_rate_limit(value: &str) -> bool {
     let value = value.to_ascii_lowercase();
     NON_RETRYABLE_RATE_LIMIT_VALUES
         .iter()
+        .chain(SPEND_LIMIT_CODES)
         .any(|needle| value.contains(needle))
 }
 
@@ -655,38 +695,26 @@ fn retry_after_duration_to_seconds(delay: Duration) -> u64 {
     delay.as_secs() + u64::from(delay.subsec_nanos() > 0)
 }
 
-pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError {
+pub async fn map_upstream_response(mut response: reqwest::Response) -> ProviderError {
     let status = response.status().as_u16();
-    let non_retryable_rate_limit_headers =
-        status == 429 && is_non_retryable_rate_limit_headers(response.headers());
-    let retry_after = retry_after_seconds_from_headers(response.headers());
-    let request_id = upstream_request_id_from_headers(response.headers());
-    let safe_headers = safe_upstream_error_headers(response.headers());
-    let body = read_limited_response_text(response, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    let body = read_limited_response_text(&mut response, MAX_UPSTREAM_ERROR_BODY_BYTES).await;
+    map_upstream_error_body(status, response.headers(), body)
+}
+
+fn map_upstream_error_body(status: u16, headers: &HeaderMap, body: String) -> ProviderError {
     let message = extract_upstream_error_message(&body);
-    let error_code = upstream_error_code(&body);
-    let non_retryable_rate_limit =
-        non_retryable_rate_limit_headers || is_non_retryable_rate_limit_error_body(&body);
-    let metadata = UpstreamErrorMetadata {
-        status,
-        retry_after,
-        request_id,
-        message: Some(message.clone()),
-        body_preview: upstream_error_body_preview(&body),
-        headers: safe_headers,
-    };
+    let metadata = upstream_error_metadata_from_parts(status, headers, &body, message.clone());
+    let error_code = metadata.code.as_deref();
+    let retry_after = metadata.retry_after;
 
     let error = match status {
-        400 if error_code
-            .as_deref()
-            .is_some_and(is_audio_validation_error_code) =>
-        {
+        400 if error_code.is_some_and(is_audio_validation_error_code) => {
             ProviderError::InvalidRequest(message)
         }
-        400 | 403 | 404 if error_code.as_deref() == Some("model_not_found") => {
+        400 | 403 | 404 if error_code == Some("model_not_found") => {
             ProviderError::ModelNotFound(message)
         }
-        503 if error_code.as_deref() == Some("policy_capacity_unavailable") => {
+        503 if error_code == Some("policy_capacity_unavailable") => {
             ProviderError::PolicyCapacityUnavailable {
                 message,
                 retry_after,
@@ -696,13 +724,13 @@ pub async fn map_upstream_response(response: reqwest::Response) -> ProviderError
         401 => ProviderError::Authentication(message),
         404 => ProviderError::ModelNotFound(message),
         413 => ProviderError::RequestTooLarge(message),
-        429 if error_code.as_deref() == Some("flex_unavailable") => {
-            ProviderError::FlexUnavailable(message)
+        429 if error_code == Some("flex_unavailable") => ProviderError::FlexUnavailable(message),
+        503 if error_code == Some("slow_down") => ProviderError::RateLimited { retry_after },
+        429 if is_non_retryable_rate_limit_headers(headers)
+            || is_non_retryable_rate_limit_error_body(&body) =>
+        {
+            ProviderError::InvalidRequest(message)
         }
-        503 if error_code.as_deref() == Some("slow_down") => {
-            ProviderError::RateLimited { retry_after }
-        }
-        429 if non_retryable_rate_limit => ProviderError::InvalidRequest(message),
         429 => ProviderError::RateLimited { retry_after },
         status if is_retryable_overload_status(status) => ProviderError::Overloaded {
             message,
@@ -745,6 +773,10 @@ pub fn upstream_error_metadata_from_parts(
 ) -> UpstreamErrorMetadata {
     UpstreamErrorMetadata {
         status,
+        code: upstream_error_code(body).or_else(|| {
+            header_value_from_any(headers, UPSTREAM_ERROR_CODE_HEADERS)
+                .filter(|code| valid_upstream_error_code(code))
+        }),
         retry_after: retry_after_seconds_from_headers(headers),
         request_id: upstream_request_id_from_headers(headers),
         message: Some(message),
@@ -804,20 +836,6 @@ fn header_value_from_any(headers: &reqwest::header::HeaderMap, names: &[&str]) -
     names.iter().find_map(|name| header_value(headers, name))
 }
 
-fn header_contains_any(
-    headers: &reqwest::header::HeaderMap,
-    names: &[&str],
-    needles: &[&str],
-) -> bool {
-    names
-        .iter()
-        .filter_map(|name| header_value(headers, name))
-        .any(|value| {
-            let value = value.to_ascii_lowercase();
-            needles.iter().any(|needle| value.contains(needle))
-        })
-}
-
 fn header_value(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
@@ -857,34 +875,30 @@ fn upstream_error_body_preview(body: &str) -> Option<String> {
     Some(preview)
 }
 
-async fn read_limited_response_text(response: reqwest::Response, limit: usize) -> String {
+async fn read_limited_response_text(response: &mut reqwest::Response, limit: usize) -> String {
     read_limited_response_text_with_timeout(response, limit, UPSTREAM_ERROR_BODY_IDLE_TIMEOUT).await
 }
 
 async fn read_limited_response_text_with_timeout(
-    response: reqwest::Response,
+    response: &mut reqwest::Response,
     limit: usize,
     idle_timeout: Duration,
 ) -> String {
-    let mut stream = response.bytes_stream();
     let mut body = Vec::new();
     let mut truncated = false;
     let mut timed_out = false;
 
     loop {
-        let next_chunk = match timeout(idle_timeout, stream.next()).await {
+        let next_chunk = match timeout(idle_timeout, response.chunk()).await {
             Ok(next_chunk) => next_chunk,
             Err(_) => {
                 timed_out = true;
                 break;
             }
         };
-        let Some(chunk) = next_chunk else {
-            break;
-        };
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(_) => break,
+        let chunk = match next_chunk {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) | Err(_) => break,
         };
         let remaining = limit.saturating_sub(body.len());
         if remaining == 0 {
@@ -915,6 +929,7 @@ pub fn extract_upstream_error_message(body: &str) -> String {
         .and_then(|value| {
             value
                 .pointer("/error/message")
+                .or_else(|| value.pointer("/detail/message"))
                 .or_else(|| value.get("message"))
                 .and_then(Value::as_str)
                 .map(str::to_string)
@@ -1356,6 +1371,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_spend_limit_bodies_stop_retries_before_the_next_request() {
+        for code in SPEND_LIMIT_CODES
+            .iter()
+            .copied()
+            .chain(["rate_limit_exceeded"])
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let body = serde_json::json!({"error": {"code": code, "message": "fixture"}});
+                let response = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0\r\nX-Request-Id: req-test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.to_string().len(),
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                if let Ok(Ok((mut retry, _))) =
+                    timeout(Duration::from_millis(250), listener.accept()).await
+                {
+                    assert!(retry.read(&mut request).await.unwrap() > 0);
+                    retry
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                    true
+                } else {
+                    false
+                }
+            });
+            let request = reqwest::Client::new().get(format!("http://{address}/"));
+            let result = send_upstream_request(request).await;
+            if is_spend_limit_code(code) {
+                let error = result.unwrap_err();
+                assert!(matches!(
+                    error.without_upstream_metadata(),
+                    ProviderError::InvalidRequest(_)
+                ));
+                let metadata = error.upstream_metadata().unwrap();
+                assert_eq!(
+                    (metadata.status, metadata.code.as_deref()),
+                    (429, Some(code))
+                );
+                assert_eq!(metadata.request_id.as_deref(), Some("req-test"));
+                assert!(!server.await.unwrap());
+            } else {
+                assert_eq!(result.unwrap().status(), StatusCode::OK);
+                assert!(server.await.unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn upstream_stream_item_times_out_when_idle() {
         let result = next_upstream_stream_item_with_timeout(
             std::future::pending::<Option<Result<(), reqwest::Error>>>(),
@@ -1426,10 +1495,10 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_error_body_read_times_out_when_idle() {
-        let response = response_with_stalled_body("partial upstream failure").await;
+        let mut response = response_with_stalled_body("partial upstream failure").await;
 
         let body = read_limited_response_text_with_timeout(
-            response,
+            &mut response,
             MAX_UPSTREAM_ERROR_BODY_BYTES,
             Duration::from_millis(20),
         )

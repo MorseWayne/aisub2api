@@ -65,8 +65,15 @@ fn retry_message_fallback_only_applies_to_throttling() {
 fn quota_and_policy_errors_are_terminal_and_flex_retains_its_classification() {
     for code in [
         "credit_balance_exhausted",
+        "api_key_spend_limit_exceeded",
         "organization_spend_limit_exceeded",
         "project_spend_limit_exceeded",
+        "budget_reached",
+        "inference_hook_denied",
+        "invalid_access_program",
+        "unsupported_access_program",
+        "content_policy_violation",
+        "access_program_not_enabled",
         "misalignment_policy_violation",
     ] {
         let error = responses_error_event(
@@ -88,6 +95,38 @@ fn quota_and_policy_errors_are_terminal_and_flex_retains_its_classification() {
             ProviderError::FlexUnavailable(_)
         ));
     }
+}
+
+#[test]
+fn explicit_overload_status_disambiguates_context_window_errors() {
+    let mut event = json!({"type":"error", "status_code":503,
+        "headers":{"retry-after-ms":1500}, "error":{
+            "code":"context_length_exceeded", "message":"fixture", "headers":{"x-request-id":"req-test"}
+        }
+    });
+    let overloaded = responses_error_event(&event).unwrap();
+    assert!(matches!(
+        overloaded.without_upstream_metadata(),
+        ProviderError::Overloaded {
+            retry_after: Some(2),
+            ..
+        }
+    ));
+    assert_eq!(
+        overloaded
+            .upstream_metadata()
+            .unwrap()
+            .request_id
+            .as_deref(),
+        Some("req-test")
+    );
+
+    event["status_code"] = json!(400);
+    let overflow = responses_error_event(&event).unwrap();
+    assert!(matches!(
+        overflow.without_upstream_metadata(),
+        ProviderError::RequestTooLarge(_)
+    ));
 }
 
 #[test]

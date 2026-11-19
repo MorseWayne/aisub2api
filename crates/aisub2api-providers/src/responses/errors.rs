@@ -1,7 +1,8 @@
 //! Responses failures keep their server retry advice across SSE and WebSocket streams.
 
 use crate::http::{
-    is_audio_validation_error_code, json_headers_to_header_map, upstream_error_metadata_from_parts,
+    is_audio_validation_error_code, is_spend_limit_code, json_headers_to_header_map,
+    upstream_error_metadata_from_parts,
 };
 use crate::provider::ProviderError;
 use serde_json::Value;
@@ -41,56 +42,102 @@ pub(super) fn responses_error_event(value: &Value) -> Option<ProviderError> {
         .filter(|message| !message.trim().is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| format!("Responses API request failed ({code})"));
-    let status = value
-        .get("status")
-        .or_else(|| value.get("status_code"))
-        .and_then(Value::as_u64)
-        .and_then(|value| u16::try_from(value).ok())
-        .unwrap_or(200);
-    let headers = error
-        .get("headers")
-        .or_else(|| value.get("headers"))
-        .and_then(Value::as_object)
-        .cloned()
-        .map(json_headers_to_header_map)
-        .unwrap_or_default();
+    let explicit_status = responses_error_status(value);
+    let status = explicit_status.unwrap_or(200);
+    let headers = responses_error_headers(value, error);
     let mut metadata =
         upstream_error_metadata_from_parts(status, &headers, &value.to_string(), message.clone());
     if metadata.retry_after.is_none() && matches!(code, "rate_limit_exceeded" | "slow_down") {
         metadata.retry_after = retry_delay_from_message(&message);
     }
     let retry_after = metadata.retry_after;
-    let mapped = match code {
-        "context_length_exceeded" => ProviderError::RequestTooLarge(message),
-        code if is_audio_validation_error_code(code) => ProviderError::InvalidRequest(message),
-        "model_not_found" => ProviderError::ModelNotFound(message),
-        "invalid_prompt"
-        | "bio_policy"
-        | "cyber_policy"
-        | "misalignment_policy_violation"
-        | "insufficient_quota"
-        | "credit_balance_exhausted"
-        | "organization_spend_limit_exceeded"
-        | "project_spend_limit_exceeded"
-        | "usage_not_included" => ProviderError::InvalidRequest(message),
-        // Flex capacity failures are terminal for this requested tier. In particular,
-        // do not treat HTTP 429 as an invitation to select a different service tier.
-        "flex_unavailable" => ProviderError::FlexUnavailable(message),
-        "policy_capacity_unavailable" => ProviderError::PolicyCapacityUnavailable {
-            message,
-            retry_after,
-        },
-        "rate_limit_exceeded" | "slow_down" => ProviderError::RateLimited { retry_after },
-        "server_error" | "server_is_overloaded" => ProviderError::Overloaded {
-            message,
-            retry_after,
-        },
-        _ => ProviderError::UpstreamError {
-            status,
-            body: value.to_string(),
-        },
-    };
+    let mapped =
+        terminal_responses_error(code, explicit_status, &message).unwrap_or_else(|| match code {
+            "policy_capacity_unavailable" => ProviderError::PolicyCapacityUnavailable {
+                message,
+                retry_after,
+            },
+            "rate_limit_exceeded" | "slow_down" => ProviderError::RateLimited { retry_after },
+            "server_error" | "server_is_overloaded" => ProviderError::Overloaded {
+                message,
+                retry_after,
+            },
+            _ if status == 429 => ProviderError::RateLimited { retry_after },
+            _ if matches!(status, 408 | 409 | 500..=599) => ProviderError::Overloaded {
+                message,
+                retry_after,
+            },
+            _ => ProviderError::UpstreamError {
+                status,
+                body: value.to_string(),
+            },
+        });
     Some(mapped.with_upstream_metadata(metadata))
+}
+
+pub(crate) fn responses_error_status(value: &Value) -> Option<u16> {
+    value
+        .get("status")
+        .and_then(Value::as_u64)
+        .or_else(|| value.get("status_code").and_then(Value::as_u64))
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|status| (400..=599).contains(status))
+}
+
+pub(crate) fn terminal_responses_error(
+    code: &str,
+    status: Option<u16>,
+    message: &str,
+) -> Option<ProviderError> {
+    let error = match (code, status) {
+        ("context_length_exceeded", None | Some(400)) => {
+            ProviderError::RequestTooLarge(message.into())
+        }
+        ("model_not_found", None | Some(400 | 403 | 404)) => {
+            ProviderError::ModelNotFound(message.into())
+        }
+        ("flex_unavailable", None | Some(429)) => ProviderError::FlexUnavailable(message.into()),
+        (code, None | Some(400)) if is_audio_validation_error_code(code) => {
+            ProviderError::InvalidRequest(message.into())
+        }
+        (code, None | Some(429)) if is_spend_limit_code(code) => {
+            ProviderError::InvalidRequest(message.into())
+        }
+        (
+            "budget_reached"
+            | "content_policy_violation"
+            | "invalid_access_program"
+            | "unsupported_access_program",
+            None | Some(400),
+        )
+        | ("inference_hook_denied" | "access_program_not_enabled", None | Some(403))
+        | (
+            "invalid_prompt"
+            | "bio_policy"
+            | "cyber_policy"
+            | "misalignment_policy_violation"
+            | "insufficient_quota"
+            | "credit_balance_exhausted"
+            | "usage_not_included",
+            None,
+        ) => ProviderError::InvalidRequest(message.into()),
+        _ => return None,
+    };
+    Some(error)
+}
+
+pub(crate) fn responses_error_headers(event: &Value, error: &Value) -> reqwest::header::HeaderMap {
+    let headers = |value: &Value| {
+        value
+            .get("headers")
+            .and_then(Value::as_object)
+            .cloned()
+            .map(json_headers_to_header_map)
+            .unwrap_or_default()
+    };
+    let mut merged = headers(event);
+    merged.extend(headers(error));
+    merged
 }
 
 fn retry_delay_from_message(message: &str) -> Option<u64> {

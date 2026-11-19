@@ -1082,6 +1082,7 @@ mod tests {
                 "rate limited",
                 Some(UpstreamErrorMetadata {
                     status: 429,
+                    code: None,
                     retry_after: Some(5),
                     request_id: Some("req_123".to_string()),
                     message: Some("slow down".to_string()),

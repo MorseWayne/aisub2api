@@ -151,11 +151,13 @@ async fn default_lane_policy_respects_user_choices_and_leaves_other_models_on_au
 #[tokio::test]
 async fn new_codex_models_use_default_lanes_and_catalog_tiers() {
     let provider = tests::test_chatgpt_provider("http://127.0.0.1:1/responses".to_string()).await;
-    for (model, context_window, expected_lite) in [
-        ("gpt-6-sol", 272_000, true),
-        ("gpt-6-luna", 272_000, true),
-        ("gpt-6.1-sol", 272_000, false),
-        ("gpt-6.1-terra", 500_000, true),
+    for (model, context_window, expected_lite, expected_effort) in [
+        ("gpt-6-sol", 272_000, true, "max"),
+        ("gpt-6-luna", 272_000, true, "max"),
+        ("gpt-6.1-sol", 500_000, false, "max"),
+        ("gpt-6.1-terra", 500_000, true, "max"),
+        ("gpt-6.2-sol", 500_000, true, "xhigh"),
+        ("gpt-6.2-astra", 272_000, true, "xhigh"),
     ] {
         let mut request: MessagesRequest = serde_json::from_value(json!({
             "model": model, "messages":[{"role":"user","content":"hi"}],
@@ -185,7 +187,10 @@ async fn new_codex_models_use_default_lanes_and_catalog_tiers() {
         } else {
             assert!(!body["tools"].as_array().unwrap().is_empty());
         }
-        assert_eq!(body["reasoning"]["effort"], "max");
+        assert_eq!(body["reasoning"]["effort"], expected_effort);
+        let mut native = json!({"reasoning": {"effort": "ultra"}});
+        normalize_chatgpt_native_reasoning(&mut native, model);
+        assert_eq!(native["reasoning"]["effort"], expected_effort);
         assert_eq!(
             body["reasoning"]["context"].as_str(),
             expected_lite.then_some("all_turns")

@@ -253,6 +253,10 @@ pub(crate) fn provider_error_response(
     }
 
     let metadata = error.upstream_metadata();
+    let native_metadata = metadata.filter(|_| matches!(protocol, DownstreamProtocol::Responses(_)));
+    let native_code = native_metadata.and_then(|metadata| metadata.code.as_deref());
+    let spend_limit = native_metadata.is_some_and(|metadata| metadata.status == 429)
+        && native_code.is_some_and(aisub2api_providers::http::is_spend_limit_code);
     let (status, response_error, retry_after, should_retry) =
         match error.without_upstream_metadata() {
             ProviderError::Authentication(message) => (
@@ -316,7 +320,9 @@ pub(crate) fn provider_error_response(
                 true,
             ),
             ProviderError::UpstreamError { status, body } => {
-                let message = extract_upstream_error_message(body);
+                let message = metadata
+                    .and_then(|metadata| metadata.message.clone())
+                    .unwrap_or_else(|| extract_upstream_error_message(body));
                 match *status {
                     400 => (
                         StatusCode::BAD_REQUEST,
@@ -374,15 +380,43 @@ pub(crate) fn provider_error_response(
             ProviderError::WithUpstreamMetadata { .. } => unreachable!(),
         };
 
-    let mut response = protocol_error_response(protocol, status, &response_error);
-    if should_retry {
+    let mut response = if spend_limit {
+        openai_error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            &response_error.error.message,
+            "rate_limit_error",
+            native_code,
+            None,
+        )
+    } else if let Some(code) = native_code {
+        let status = if code == "context_length_exceeded"
+            && native_metadata.is_some_and(|metadata| metadata.status == 400)
+        {
+            StatusCode::BAD_REQUEST
+        } else {
+            status
+        };
+        let (error_type, _) = openai_error_mapping(&response_error.error.error_type);
+        openai_error_response(
+            status,
+            &response_error.error.message,
+            error_type,
+            Some(code),
+            None,
+        )
+    } else {
+        protocol_error_response(protocol, status, &response_error)
+    };
+    if should_retry && !spend_limit {
         response
             .headers_mut()
             .insert("x-should-retry", HeaderValue::from_static("true"));
-    } else if matches!(
-        error.without_upstream_metadata(),
-        ProviderError::FlexUnavailable(_) | ProviderError::UpstreamError { status: 403, .. }
-    ) {
+    } else if spend_limit
+        || matches!(
+            error.without_upstream_metadata(),
+            ProviderError::FlexUnavailable(_) | ProviderError::UpstreamError { status: 403, .. }
+        )
+    {
         response
             .headers_mut()
             .insert("x-should-retry", HeaderValue::from_static("false"));
@@ -393,6 +427,11 @@ pub(crate) fn provider_error_response(
         response.headers_mut().insert("retry-after", value);
     }
     attach_upstream_error_headers(&mut response, metadata);
+    if let Some(request_id) = native_metadata.and_then(|metadata| metadata.request_id.as_deref())
+        && let Ok(value) = HeaderValue::from_str(request_id)
+    {
+        response.headers_mut().insert("x-request-id", value);
+    }
     response
 }
 
@@ -1380,7 +1419,7 @@ impl ResponsesStreamEncoder {
         }
         if matches!(
             event_name,
-            "response.completed" | "response.incomplete" | "response.failed"
+            "response.completed" | "response.incomplete" | "response.failed" | "error"
         ) {
             self.done = true;
         }
@@ -2043,6 +2082,49 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test]
+    async fn native_responses_preserves_terminal_http_error_codes_and_statuses() {
+        for (status, code, error) in [
+            (
+                429,
+                "api_key_spend_limit_exceeded",
+                ProviderError::InvalidRequest("fixture".into()),
+            ),
+            (
+                400,
+                "context_length_exceeded",
+                ProviderError::RequestTooLarge("fixture".into()),
+            ),
+            (
+                403,
+                "invalid_workspace_selected",
+                ProviderError::UpstreamError {
+                    status: 403,
+                    body: "fixture".into(),
+                },
+            ),
+        ] {
+            let error = error.with_upstream_metadata(UpstreamErrorMetadata {
+                status,
+                code: Some(code.into()),
+                request_id: Some("req-test".into()),
+                ..Default::default()
+            });
+            let protocol = DownstreamProtocol::responses("model", Default::default());
+            let response = provider_error_response(&protocol, &error);
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.headers()["x-request-id"], "req-test");
+            if status != 400 {
+                assert_eq!(response.headers()["x-should-retry"], "false");
+            }
+            let data = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&data).unwrap();
+            assert_eq!(body["error"]["code"], code);
+        }
+    }
 
     #[test]
     fn anthropic_stream_provider_errors_keep_type_and_safe_message() {

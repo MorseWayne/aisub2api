@@ -123,6 +123,7 @@ fn success() -> Reply {
 struct Fixture {
     endpoint: String,
     requests: Arc<Mutex<Vec<Value>>>,
+    headers: Arc<Mutex<Vec<String>>>,
     websocket_upgrades: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -138,6 +139,8 @@ async fn fixture(replies: Vec<Reply>) -> Fixture {
     let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&requests);
+    let headers = Arc::new(Mutex::new(Vec::new()));
+    let captured_headers = Arc::clone(&headers);
     let websocket_upgrades = Arc::new(AtomicUsize::new(0));
     let captured_upgrades = Arc::clone(&websocket_upgrades);
     let task = tokio::spawn(async move {
@@ -186,6 +189,7 @@ async fn fixture(replies: Vec<Reply>) -> Fixture {
                     .lock()
                     .await
                     .push(serde_json::from_slice(&decoded).unwrap());
+                captured_headers.lock().await.push(headers);
                 break;
             }
             let reply = replies
@@ -204,6 +208,7 @@ async fn fixture(replies: Vec<Reply>) -> Fixture {
     Fixture {
         endpoint,
         requests,
+        headers,
         websocket_upgrades,
         task,
     }
@@ -252,6 +257,143 @@ async fn collect(provider: &ChatGptProvider) -> Result<Vec<ProviderEvent>, Provi
         events.push(event?);
     }
     Ok(events)
+}
+
+fn compression_rejection() -> Reply {
+    Reply {
+        status: 400,
+        body: r#"{"detail":"Bad Request"}"#.into(),
+        headers: "x-request-id: compression-rejected\r\n",
+    }
+}
+
+#[tokio::test]
+async fn compressed_native_request_retries_identical_json_without_encoding() {
+    let fixture = fixture(vec![compression_rejection(), success()]).await;
+    let provider = provider(&fixture, 2).await;
+    let mut body = json!({
+        "model":"gpt-6.1-sol", "stream":true, "store":false,
+        "input":[{"role":"user","content":[{"type":"input_text","text":"Review a read."}]}],
+        "prompt_cache_key":"review-session", "future_option":{"enabled":true}
+    });
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("x-codex-turn-state", "review-turn".parse().unwrap());
+    let response = provider
+        .send_responses_request_with_prompt_too_long_retry_and_headers(
+            &mut body,
+            &token(),
+            ChatGptSseRequestContext {
+                compact_request: false,
+                request_id: 1,
+                budget: ChatGptOutputTokenBudget::default(),
+                responses_lite: ResponsesLiteDecision::disabled(
+                    ResponsesLiteDecisionSource::ForcedOff,
+                ),
+            },
+            None,
+            Some(&headers),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(*fixture.requests.lock().await, [body.clone(), body]);
+    let headers = fixture.headers.lock().await;
+    assert_eq!(headers.len(), 2);
+    assert!(headers[0].contains("content-encoding: zstd"));
+    assert!(!headers[1].contains("content-encoding:"));
+    for headers in headers.iter() {
+        assert!(headers.contains("x-codex-turn-state: review-turn"));
+        assert!(headers.contains("authorization: bearer fixture"));
+    }
+}
+
+#[tokio::test]
+async fn compressed_messages_request_recovers_before_output() {
+    let fixture = fixture(vec![compression_rejection(), success()]).await;
+    let events = collect(&provider(&fixture, 2).await).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .flat_map(ProviderEvent::normalized_events)
+            .any(|e| e.event == "message_stop")
+    );
+    let requests = fixture.requests.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+    let headers = fixture.headers.lock().await;
+    assert!(headers[0].contains("content-encoding: zstd"));
+    assert!(!headers[1].contains("content-encoding:"));
+}
+
+#[tokio::test]
+async fn compression_recovery_is_once_and_shares_the_stream_retry_budget() {
+    for (replies, attempts) in [
+        (
+            vec![compression_rejection(), compression_rejection(), success()],
+            5,
+        ),
+        (
+            vec![
+                compression_rejection(),
+                sse(vec![overload("error")]),
+                success(),
+            ],
+            2,
+        ),
+        (
+            vec![
+                Reply {
+                    status: 503,
+                    body: "overloaded".into(),
+                    headers: "",
+                },
+                compression_rejection(),
+                success(),
+            ],
+            2,
+        ),
+    ] {
+        let fixture = fixture(replies).await;
+        assert!(collect(&provider(&fixture, attempts).await).await.is_err());
+        assert_eq!(fixture.requests.lock().await.len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn compression_recovery_preserves_validation_errors_and_retry_opt_out() {
+    for (body, attempts) in [
+        (r#"{"detail":"Bad Request"}"#, 1),
+        (r#"{"detail":"Unsupported parameter: temperature"}"#, 2),
+        (
+            r#"{"error":{"message":"Bad Request","code":"invalid_field"}}"#,
+            2,
+        ),
+        (r#"{"detail":"Bad Request","code":"invalid_field"}"#, 2),
+    ] {
+        let fixture = fixture(vec![
+            Reply {
+                status: 400,
+                body: body.into(),
+                headers: "x-request-id: rejected-field\r\n",
+            },
+            success(),
+        ])
+        .await;
+        let error = collect(&provider(&fixture, attempts).await)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.without_upstream_metadata(),
+            ProviderError::InvalidRequest(_)
+        ));
+        assert_eq!(error.upstream_metadata().unwrap().status, 400);
+        assert_eq!(
+            error.upstream_metadata().unwrap().request_id.as_deref(),
+            Some("rejected-field")
+        );
+        assert_eq!(fixture.requests.lock().await.len(), 1);
+    }
 }
 
 #[tokio::test]

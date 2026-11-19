@@ -282,10 +282,14 @@ ChatGPT provider 会优先通过 OAuth 从 Codex `/models` 获取在线模型目
 | `gpt-6-astra` | 可选高级模型 | 272k | `low`…`ultra` | Full |
 | `gpt-6-sol` | 可选通用模型 | 272k | `low`…`ultra` | Lite（跟随目录） |
 | `gpt-6-luna` | 可选轻量模型 | 272k | `low`…`max` | Lite |
-| `gpt-6.1-sol` | 可选通用模型 | 272k | `low`…`ultra` | Full |
+| `gpt-6.1-sol` | 可选通用模型 | 500k | `low`…`ultra` | Full |
 | `gpt-6.1-terra` | 可选通用模型 | 500k | `low`…`ultra` | Lite（跟随目录） |
+| `gpt-6.2-sol` | 可选通用模型 | 500k | `low`…`ultra` | Lite（跟随目录） |
+| `gpt-6.2-astra` | 可选高级模型 | 272k | `low`…`ultra` | Lite（跟随目录） |
 
-Astra、GPT-6 Sol/Luna 和 GPT-6.1 Sol 的 ChatGPT 回退使用 Codex 目录中的 272K active context；GPT-6.1 Terra 使用 500K active context，均不自动启用可选的 872K 扩展窗口。`openai/gpt-6-astra` 则声明公开 API 的 1,050,000 context、128,000 output 和 `low` 到 `max` 推理能力，Messages 请求也使用 Responses；两种提供商的限制分别处理。
+ChatGPT 回退使用 Codex 目录中的活跃窗口。两款 GPT-6.2 的 Ultra 在上游请求中使用 `xhigh`。`openai/gpt-6-astra` 声明公开 API 的 1,050,000 context、128,000 output 和 `low` 到 `max` 推理能力，Messages 请求也使用 Responses。
+
+原生 Responses 保留失败事件的结构、机器码和退避信息。API key、项目和组织支出上限保留 HTTP 429，并跳过上游重试。ChatGPT 上游 WebSocket 单帧最大 1 MiB。Auto 模式下，超过握手声明的消息上限或在首条服务端文本前收到 1009 时，仅当前请求改用 SSE。
 
 升级后，ChatGPT Messages SSE 的输出前 overload 恢复、Anthropic 错误类型和 request ID 保留自动生效，无需迁移 token 或手工添加 Claude Code 环境变量。恢复窗口最多 5 秒，累计达到 64 个事件或 256 KiB 时交付；HTTP 和 SSE 共用重试次数，文本、thinking、工具调用或未知事件交付后不再透明重放。原生 Responses 和 WebSocket 保留现有恢复行为。
 
@@ -546,6 +550,10 @@ Outputs 能力和不支持的参数。每个模型还会返回 `provider` 和可
 Codex 后端不接受 `max_output_tokens`、`temperature` 或 `top_p`；Proxy 会在
 `unsupported_parameters` 中声明并在转发前移除，即使传入的是 `temperature: 0`。
 原生 OpenAI Provider 仍会原样收到这些字段。
+
+ChatGPT HTTP 请求使用 zstd 压缩后若收到确切的
+`400 {"detail":"Bad Request"}`，代理会在现有重试预算内，将相同 JSON 不压缩重发一次。
+Messages 和原生 Responses（包括工具自动审核请求）均适用，其他参数校验错误保持原有处理。
 
 服务档位只在请求或配置指定时发送；显式 `flex` 不会因为目录缺少该档位而被移除，目录中的默认档位提示也不会隐式启用 priority。Flex 容量不足在开流前返回 HTTP 503 和 `x-should-retry: false`。
 

@@ -192,6 +192,8 @@ pub enum ProviderError {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpstreamErrorMetadata {
     pub status: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
     #[serde(default)]
     pub retry_after: Option<u64>,
     #[serde(default)]

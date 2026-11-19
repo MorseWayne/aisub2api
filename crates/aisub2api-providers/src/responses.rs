@@ -25,6 +25,9 @@ use crate::tool_choice::normalize_for_responses;
 mod correlation;
 mod errors;
 use errors::responses_error_event;
+pub(crate) use errors::{
+    responses_error_headers, responses_error_status, terminal_responses_error,
+};
 mod signature;
 
 #[cfg(test)]
@@ -1518,25 +1521,15 @@ where
                         }
                         if let Some(value) = parse_sse_json(&event) {
                             on_event(&value);
-                            if let Some(error) =
-                                responses_stream_error(&value, preserve_failed_events)
+                            if !forward_responses_event(
+                                &tx,
+                                &mut converter,
+                                &native_correlation,
+                                value,
+                                preserve_failed_events,
+                            )
+                            .await
                             {
-                                let _ = tx.send(Err(error)).await;
-                                return;
-                            }
-                            let normalized = converter.process_event(&value);
-                            let native = native_correlation.restore_response_event(&value);
-                            if tx
-                                .send(Ok(ProviderEvent::openai_responses(
-                                    response_sse_event(native),
-                                    normalized,
-                                )))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            if converter.stopped {
                                 return;
                             }
                         }
@@ -1552,21 +1545,14 @@ where
                                 saw_done = true;
                             } else if let Some(value) = parse_sse_json(&event) {
                                 on_event(&value);
-                                if let Some(error) =
-                                    responses_stream_error(&value, preserve_failed_events)
-                                {
-                                    let _ = tx.send(Err(error)).await;
-                                    return;
-                                }
-                                let normalized = converter.process_event(&value);
-                                let native = native_correlation.restore_response_event(&value);
-                                if tx
-                                    .send(Ok(ProviderEvent::openai_responses(
-                                        response_sse_event(native),
-                                        normalized,
-                                    )))
-                                    .await
-                                    .is_err()
+                                if !forward_responses_event(
+                                    &tx,
+                                    &mut converter,
+                                    &native_correlation,
+                                    value,
+                                    preserve_failed_events,
+                                )
+                                .await
                                 {
                                     return;
                                 }
@@ -1598,19 +1584,14 @@ where
             Ok(Some(event)) if !is_sse_done(&event) => {
                 if let Some(value) = parse_sse_json(&event) {
                     on_event(&value);
-                    if let Some(error) = responses_stream_error(&value, preserve_failed_events) {
-                        let _ = tx.send(Err(error)).await;
-                        return;
-                    }
-                    let normalized = converter.process_event(&value);
-                    let native = native_correlation.restore_response_event(&value);
-                    if tx
-                        .send(Ok(ProviderEvent::openai_responses(
-                            response_sse_event(native),
-                            normalized,
-                        )))
-                        .await
-                        .is_err()
+                    if !forward_responses_event(
+                        &tx,
+                        &mut converter,
+                        &native_correlation,
+                        value,
+                        preserve_failed_events,
+                    )
+                    .await
                     {
                         return;
                     }
@@ -1733,17 +1714,33 @@ fn response_sse_event(data: Value) -> SseEvent {
     SseEvent { event, data }
 }
 
-fn responses_stream_error(value: &Value, preserve_failed_events: bool) -> Option<ProviderError> {
-    if preserve_failed_events
-        && value
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| matches!(kind, "response.failed" | "response.incomplete"))
-    {
-        None
-    } else {
-        responses_error_event(value)
+async fn forward_responses_event(
+    tx: &mpsc::Sender<Result<ProviderEvent, ProviderError>>,
+    converter: &mut ResponsesStreamConverter,
+    correlation: &ResponsesCorrelation,
+    value: Value,
+    preserve_failed_events: bool,
+) -> bool {
+    let native_failure = preserve_failed_events
+        && matches!(
+            value["type"].as_str(),
+            Some("error" | "response.failed" | "response.incomplete")
+        );
+    if !native_failure && let Some(error) = responses_error_event(&value) {
+        let _ = tx.send(Err(error)).await;
+        return false;
     }
+
+    let normalized = converter.process_event(&value);
+    let native = correlation.restore_response_event(&value);
+    tx.send(Ok(ProviderEvent::openai_responses(
+        response_sse_event(native),
+        normalized,
+    )))
+    .await
+    .is_ok()
+        && !native_failure
+        && !converter.stopped
 }
 
 pub(crate) fn notify_stream_metadata(observer: Option<&ProviderRequestObserver>, event: &Value) {
@@ -3860,6 +3857,30 @@ mod tests {
         let failed = failed.expect("response.failed event");
         assert_eq!(failed["response"]["error"]["code"], "rate_limit_exceeded");
         assert_eq!(failed["response"]["error"]["message"], "retry in 2s");
+    }
+
+    #[tokio::test]
+    async fn native_stream_preserves_error_shape_and_stops_before_completion() {
+        for failure in [
+            json!({"type":"error", "error":{"code":"policy_capacity_unavailable", "message":"busy", "headers":{"Retry-After":"2"}}}),
+            json!({"type":"error", "code":"unknown_provider_code", "message":"failed"}),
+        ] {
+            let body = format!(
+                "data: {failure}\n\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"unexpected\"}}}}\n\n"
+            );
+            let response = response_from_body("text/event-stream", &body).await;
+            let mut stream = stream_native_responses_response_with_provider_observer(
+                response,
+                None,
+                1024 * 1024,
+            );
+            let event = stream.next().await.unwrap().unwrap();
+            let Some(NativeProviderEvent::OpenAiResponses(event)) = event.native_event() else {
+                panic!("expected native error event");
+            };
+            assert_eq!(event.data, failure);
+            assert!(stream.next().await.is_none());
+        }
     }
 
     #[test]

@@ -266,6 +266,11 @@ struct ChatGptSseRequestBody {
     content_encoding: Option<&'static str>,
 }
 
+struct ChatGptSseRequestAttempt {
+    prompt_too_long_attempt: usize,
+    body: ChatGptSseRequestBody,
+}
+
 #[derive(Debug, Clone)]
 struct ChatGptRequestHeaders {
     originator: HeaderValue,
@@ -587,8 +592,11 @@ impl ChatGptUpstreamEventHandlerState {
     }
 
     fn record_upstream_context_overflow(&self, event: &Value) {
+        let status = crate::responses::responses_error_status(event)
+            .and_then(|status| StatusCode::from_u16(status).ok())
+            .unwrap_or(StatusCode::OK);
         let body = event.to_string();
-        if !is_prompt_too_long_error(StatusCode::OK, &body) {
+        if !is_prompt_too_long_error(status, &body) {
             return;
         }
         notify_request_metadata_observer(
@@ -1128,7 +1136,10 @@ impl ChatGptProvider {
             body,
             token,
             context,
-            prompt_too_long_attempt,
+            ChatGptSseRequestAttempt {
+                prompt_too_long_attempt,
+                body: prepare_chatgpt_sse_request_body(body, true)?,
+            },
             None,
             None,
         )
@@ -1140,7 +1151,7 @@ impl ChatGptProvider {
         body: &Value,
         token: &ChatGptToken,
         context: ChatGptSseRequestContext,
-        prompt_too_long_attempt: usize,
+        attempt: ChatGptSseRequestAttempt,
         forwarded_headers: Option<&HeaderMap>,
         retry_budget: Option<&mut UpstreamRetryBudget>,
     ) -> Result<Response, ProviderError> {
@@ -1150,7 +1161,10 @@ impl ChatGptProvider {
             budget,
             responses_lite,
         } = context;
-        let request_body = prepare_chatgpt_sse_request_body(body)?;
+        let ChatGptSseRequestAttempt {
+            prompt_too_long_attempt,
+            body: request_body,
+        } = attempt;
         let body_bytes = request_body.original_len;
         let body_wire_bytes = request_body.bytes.len();
         let body_content_encoding = request_body.content_encoding.unwrap_or("identity");
@@ -1323,53 +1337,78 @@ impl ChatGptProvider {
             requested: context.budget.requested,
             effective: body.get("max_output_tokens").and_then(Value::as_u64),
         };
-        let response = self
-            .send_responses_request_with_headers(
-                body,
-                token,
-                ChatGptSseRequestContext {
-                    budget: current_budget,
-                    ..context
-                },
-                0,
-                forwarded_headers,
-                retry_budget,
-            )
-            .await?;
-        let status = response.status();
-        if status.is_success() || status == StatusCode::UNAUTHORIZED {
-            if context.compact_request {
-                info!(
+        let mut owned_retry_budget = UpstreamRetryBudget::new(self.request_policy);
+        let retry_budget = retry_budget.unwrap_or(&mut owned_retry_budget);
+        let mut request_body = prepare_chatgpt_sse_request_body(body, true)?;
+        loop {
+            let compressed = request_body.content_encoding == Some("zstd");
+            let response = self
+                .send_responses_request_with_headers(
+                    body,
+                    token,
+                    ChatGptSseRequestContext {
+                        budget: current_budget,
+                        ..context
+                    },
+                    ChatGptSseRequestAttempt {
+                        prompt_too_long_attempt: 0,
+                        body: request_body,
+                    },
+                    forwarded_headers,
+                    Some(&mut *retry_budget),
+                )
+                .await?;
+            let status = response.status();
+            if status.is_success() || status == StatusCode::UNAUTHORIZED {
+                if context.compact_request {
+                    info!(
+                        request_id = context.request_id,
+                        status = status.as_u16(),
+                        prompt_too_long_retry_triggered = false,
+                        prompt_too_long_retries = 0,
+                        "Compact request prompt-too-long retry result"
+                    );
+                }
+                return Ok(response);
+            }
+
+            if !is_prompt_too_long_candidate_status(status) {
+                return Err(map_upstream_response(response).await);
+            }
+
+            let headers = response.headers().clone();
+            let error_body =
+                read_upstream_response_text(response, self.payload_limits.max_response_body_bytes)
+                    .await?;
+            // Some valid zstd frames are rejected before inference with only
+            // {"detail":"Bad Request"}. Retry the identical JSON once without
+            // encoding, within the shared HTTP/stream retry allowance.
+            if compressed
+                && status == StatusCode::BAD_REQUEST
+                && is_chatgpt_compression_rejection(&error_body)
+                && retry_budget.has_request_attempts_remaining()
+            {
+                warn!(
                     request_id = context.request_id,
-                    status = status.as_u16(),
-                    prompt_too_long_retry_triggered = false,
-                    prompt_too_long_retries = 0,
-                    "Compact request prompt-too-long retry result"
+                    upstream_request_id = upstream_request_id_from_headers(&headers),
+                    "ChatGPT rejected compressed request; retrying once with uncompressed JSON"
+                );
+                request_body = prepare_chatgpt_sse_request_body(body, false)?;
+                continue;
+            }
+            if is_prompt_too_long_error(status, &error_body) {
+                notify_request_metadata_observer(
+                    observer,
+                    ProviderRequestMetadata {
+                        context_upstream_overflow: Some(true),
+                        ..ProviderRequestMetadata::default()
+                    },
                 );
             }
-            return Ok(response);
+            return Err(map_chatgpt_error_status_body_with_headers(
+                status, &headers, error_body,
+            ));
         }
-
-        if !is_prompt_too_long_candidate_status(status) {
-            return Err(map_upstream_response(response).await);
-        }
-
-        let headers = response.headers().clone();
-        let error_body =
-            read_upstream_response_text(response, self.payload_limits.max_response_body_bytes)
-                .await?;
-        if is_prompt_too_long_error(status, &error_body) {
-            notify_request_metadata_observer(
-                observer,
-                ProviderRequestMetadata {
-                    context_upstream_overflow: Some(true),
-                    ..ProviderRequestMetadata::default()
-                },
-            );
-        }
-        Err(map_chatgpt_error_status_body_with_headers(
-            status, &headers, error_body,
-        ))
     }
 
     async fn chat_prepared_with_token(
@@ -1393,12 +1432,14 @@ impl ChatGptProvider {
                         self.websocket_stats
                             .fallbacks
                             .fetch_add(1, Ordering::Relaxed);
-                        Self::activate_websocket_http_fallback(
-                            &self.websocket_http_fallback,
-                            prepared.request_id,
-                            "websocket",
-                            "startup failure before first event",
-                        );
+                        if !error.message_too_large() {
+                            Self::activate_websocket_http_fallback(
+                                &self.websocket_http_fallback,
+                                prepared.request_id,
+                                "websocket",
+                                "startup failure before first event",
+                            );
+                        }
                         let stats = self.websocket_stats.snapshot();
                         warn!(
                             request_id = prepared.request_id,
@@ -3257,19 +3298,10 @@ fn is_prompt_too_long_error(status: StatusCode, body: &str) -> bool {
         return false;
     }
 
-    if serde_json::from_str::<Value>(body).is_ok_and(|value| {
-        value
-            .pointer("/error/code")
-            .and_then(Value::as_str)
-            .is_some_and(|code| code == "context_length_exceeded")
-    }) {
-        return true;
-    }
-
-    matches!(
-        status,
-        StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNPROCESSABLE_ENTITY
-    ) && body.to_ascii_lowercase().contains("prompt is too long")
+    let candidate_status = is_prompt_too_long_candidate_status(status);
+    ((status.is_success() || candidate_status)
+        && crate::http::upstream_error_code(body).as_deref() == Some("context_length_exceeded"))
+        || (candidate_status && body.to_ascii_lowercase().contains("prompt is too long"))
 }
 
 fn is_prompt_too_long_candidate_status(status: StatusCode) -> bool {
@@ -3304,25 +3336,23 @@ fn map_chatgpt_error_status_body_with_headers(
 
     let metadata =
         upstream_error_metadata_from_parts(status.as_u16(), headers, &body, message.clone());
-    let error_code = crate::http::upstream_error_code(&body);
+    let error_code = metadata.code.as_deref();
     let error = if prompt_too_long {
         ProviderError::InvalidRequest(message)
     } else {
         match status {
             StatusCode::BAD_REQUEST
-                if error_code
-                    .as_deref()
-                    .is_some_and(crate::http::is_audio_validation_error_code) =>
+                if error_code.is_some_and(crate::http::is_audio_validation_error_code) =>
             {
                 ProviderError::InvalidRequest(message)
             }
             StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
-                if error_code.as_deref() == Some("model_not_found") =>
+                if error_code == Some("model_not_found") =>
             {
                 ProviderError::ModelNotFound(message)
             }
             StatusCode::SERVICE_UNAVAILABLE
-                if error_code.as_deref() == Some("policy_capacity_unavailable") =>
+                if error_code == Some("policy_capacity_unavailable") =>
             {
                 ProviderError::PolicyCapacityUnavailable {
                     message,
@@ -3333,10 +3363,10 @@ fn map_chatgpt_error_status_body_with_headers(
             StatusCode::UNAUTHORIZED => ProviderError::Authentication(message),
             StatusCode::NOT_FOUND => ProviderError::ModelNotFound(message),
             StatusCode::PAYLOAD_TOO_LARGE => ProviderError::RequestTooLarge(message),
-            StatusCode::TOO_MANY_REQUESTS if error_code.as_deref() == Some("flex_unavailable") => {
+            StatusCode::TOO_MANY_REQUESTS if error_code == Some("flex_unavailable") => {
                 ProviderError::FlexUnavailable(message)
             }
-            StatusCode::SERVICE_UNAVAILABLE if error_code.as_deref() == Some("slow_down") => {
+            StatusCode::SERVICE_UNAVAILABLE if error_code == Some("slow_down") => {
                 ProviderError::RateLimited {
                     retry_after: metadata.retry_after,
                 }
@@ -3367,7 +3397,7 @@ fn chatgpt_error_message_from_body(body: &str) -> String {
     serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|value| {
-            ["/error/message", "/detail", "/message"]
+            ["/error/message", "/detail/message", "/detail", "/message"]
                 .iter()
                 .find_map(|pointer| value.pointer(pointer).and_then(chatgpt_error_message_value))
         })
@@ -3428,6 +3458,9 @@ fn looks_like_output_limit_error(message: &str) -> bool {
 fn chatgpt_websocket_fallback_reason(
     error: &transport::ChatGptWebSocketStartError,
 ) -> &'static str {
+    if error.message_too_large() {
+        return "websocket_message_too_large";
+    }
     let message = error.error.to_string().to_ascii_lowercase();
     if message.contains("previous response") && message.contains("not found") {
         return "previous_response_not_found";
@@ -3553,10 +3586,25 @@ fn virtual_context_limit_error(estimate: &VirtualContextEstimate) -> Option<Prov
     })
 }
 
-fn prepare_chatgpt_sse_request_body(body: &Value) -> Result<ChatGptSseRequestBody, ProviderError> {
+fn is_chatgpt_compression_rejection(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .is_ok_and(|value| value == serde_json::json!({"detail": "Bad Request"}))
+}
+
+fn prepare_chatgpt_sse_request_body(
+    body: &Value,
+    compress: bool,
+) -> Result<ChatGptSseRequestBody, ProviderError> {
     let json_bytes = serde_json::to_vec(body).map_err(|error| {
         ProviderError::InvalidRequest(format!("invalid ChatGPT request body: {error}"))
     })?;
+    if !compress {
+        return Ok(ChatGptSseRequestBody {
+            original_len: json_bytes.len(),
+            bytes: json_bytes,
+            content_encoding: None,
+        });
+    }
     Ok(chatgpt_sse_request_body_from_json(json_bytes, |bytes| {
         zstd::bulk::compress(bytes, CHATGPT_SSE_REQUEST_ZSTD_LEVEL)
     }))
@@ -3722,7 +3770,7 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
     },
     ChatGptModelSpec {
         model_id: "gpt-6.1-sol",
-        context_window: 272_000,
+        context_window: 500_000,
         image_input: true,
         responses_lite: true,
         reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
@@ -3731,6 +3779,22 @@ const CHATGPT_MODEL_SPECS: &[ChatGptModelSpec] = &[
     ChatGptModelSpec {
         model_id: "gpt-6.1-terra",
         context_window: 500_000,
+        image_input: true,
+        responses_lite: true,
+        reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
+        service_tiers: &["priority"],
+    },
+    ChatGptModelSpec {
+        model_id: "gpt-6.2-sol",
+        context_window: 500_000,
+        image_input: true,
+        responses_lite: true,
+        reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
+        service_tiers: &["priority"],
+    },
+    ChatGptModelSpec {
+        model_id: "gpt-6.2-astra",
+        context_window: 272_000,
         image_input: true,
         responses_lite: true,
         reasoning_efforts: &["low", "medium", "high", "xhigh", "max", "ultra"],
@@ -3941,10 +4005,25 @@ fn normalize_chatgpt_model_id(model: &str) -> &str {
 
 fn supports_chatgpt_reasoning_aliases(model: &str) -> bool {
     model.starts_with("gpt-5.6")
-        || matches!(
-            model,
-            "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna" | "gpt-6.1-sol" | "gpt-6.1-terra"
-        )
+        || CHATGPT_MODEL_SPECS
+            .iter()
+            .any(|spec| spec.model_id == model)
+}
+
+fn normalize_chatgpt_reasoning_alias(effort: &mut Value, model: &str) -> bool {
+    let ultra_effort = match model {
+        "gpt-6.2-sol" | "gpt-6.2-astra" => "xhigh",
+        _ => "max",
+    };
+    match effort.as_str() {
+        Some("none" | "minimal") => *effort = Value::String("low".into()),
+        Some("ultra") => {
+            *effort = Value::String(ultra_effort.into());
+            return true;
+        }
+        _ => {}
+    }
+    false
 }
 
 fn normalize_chatgpt_reasoning(request: &mut MessagesRequest) -> bool {
@@ -3957,41 +4036,12 @@ fn normalize_chatgpt_reasoning(request: &mut MessagesRequest) -> bool {
     if let Some(reasoning) = request
         .extra
         .get_mut("reasoning")
-        .and_then(Value::as_object_mut)
-        && let Some(effort) = reasoning.get("effort").and_then(Value::as_str)
+        .and_then(|reasoning| reasoning.get_mut("effort"))
     {
-        match effort {
-            "none" | "minimal" => {
-                reasoning.insert("effort".to_string(), Value::String("low".to_string()));
-            }
-            "ultra" => {
-                reasoning.insert("effort".to_string(), Value::String("max".to_string()));
-                mapped = true;
-            }
-            _ => {}
-        }
+        mapped = normalize_chatgpt_reasoning_alias(reasoning, model);
     }
-    if let Some(effort) = request
-        .extra
-        .get("reasoning_effort")
-        .and_then(Value::as_str)
-    {
-        match effort {
-            "none" | "minimal" => {
-                request.extra.insert(
-                    "reasoning_effort".to_string(),
-                    Value::String("low".to_string()),
-                );
-            }
-            "ultra" => {
-                request.extra.insert(
-                    "reasoning_effort".to_string(),
-                    Value::String("max".to_string()),
-                );
-                mapped = true;
-            }
-            _ => {}
-        }
+    if let Some(effort) = request.extra.get_mut("reasoning_effort") {
+        mapped |= normalize_chatgpt_reasoning_alias(effort, model);
     }
     if request
         .thinking
@@ -4020,11 +4070,7 @@ fn normalize_chatgpt_native_reasoning(body: &mut Value, model: &str) {
     else {
         return;
     };
-    match effort.as_str() {
-        Some("none" | "minimal") => *effort = Value::String("low".to_string()),
-        Some("ultra") => *effort = Value::String("max".to_string()),
-        _ => {}
-    }
+    normalize_chatgpt_reasoning_alias(effort, model);
 }
 
 fn normalize_chatgpt_native_responses_body(
@@ -4992,7 +5038,9 @@ mod tests {
                 "gpt-6-sol",
                 "gpt-6-luna",
                 "gpt-6.1-sol",
-                "gpt-6.1-terra"
+                "gpt-6.1-terra",
+                "gpt-6.2-sol",
+                "gpt-6.2-astra",
             ]
         );
         assert!(chatgpt_model_info("gpt-5.4", &ChatGptProviderConfig::default()).is_none());
@@ -8139,6 +8187,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chatgpt_websocket_size_close_replays_only_before_the_first_text_frame_in_auto() {
+        for (transport, before_text, expected_fallback) in [
+            (ChatGptTransport::Auto, true, true),
+            (ChatGptTransport::Auto, false, false),
+            (ChatGptTransport::Websocket, true, false),
+        ] {
+            let (endpoint, requests, sse_requests) =
+                websocket_startup_fixture(StartupFixture::SizeClose { before_text }).await;
+            let mut provider = test_chatgpt_provider(endpoint).await;
+            provider.transport = transport;
+            let prime = provider
+                .chat_prepared_with_token(chatgpt_test_prepared_request(405), chatgpt_test_token())
+                .await
+                .unwrap();
+            assert!(
+                collect_stream_results(prime)
+                    .await
+                    .iter()
+                    .all(Result::is_ok)
+            );
+
+            let result = provider
+                .chat_prepared_with_token(chatgpt_test_prepared_request(406), chatgpt_test_token())
+                .await;
+            if expected_fallback {
+                let events = collect_stream_results(result.unwrap()).await;
+                assert!(events.iter().all(Result::is_ok));
+            } else {
+                assert!(matches!(result, Err(ProviderError::RequestTooLarge(_))));
+            }
+            assert_eq!(provider.effective_transport(), transport);
+            assert_eq!(requests.lock().unwrap().len(), 2);
+            assert_eq!(
+                sse_requests.lock().await.len(),
+                usize::from(expected_fallback)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn chatgpt_websocket_abort_closes_upstream_connection() {
         let (endpoint, close_rx) = websocket_hanging_after_created_server().await;
         let mut provider = test_chatgpt_provider(endpoint).await;
@@ -8397,6 +8485,10 @@ mod tests {
         assert!(!is_prompt_too_long_error(
             StatusCode::BAD_REQUEST,
             r#"{"error":{"code":"invalid_request","message":"bad tool schema"}}"#
+        ));
+        assert!(!is_prompt_too_long_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"code":"context_length_exceeded","message":"context limit"}}"#
         ));
     }
 
@@ -9335,6 +9427,7 @@ mod tests {
         Heartbeats,
         PeriodicMetadata,
         DelayedCompletion(Duration),
+        SizeClose { before_text: bool },
     }
 
     async fn websocket_startup_fixture(
@@ -9382,6 +9475,25 @@ mod tests {
                 }
             }
             tokio::spawn(async move {
+                if let StartupFixture::SizeClose { before_text } = behavior {
+                    use tokio_tungstenite::tungstenite::protocol::{
+                        CloseFrame, frame::coding::CloseCode,
+                    };
+
+                    if !before_text {
+                        websocket
+                            .send(WsMessage::Text(r#"{"type":"codex.rate_limits"}"#.into()))
+                            .await
+                            .unwrap();
+                    }
+                    let _ = websocket
+                        .close(Some(CloseFrame {
+                            code: CloseCode::Size,
+                            reason: "too big".into(),
+                        }))
+                        .await;
+                    return;
+                }
                 if matches!(
                     behavior,
                     StartupFixture::Heartbeats | StartupFixture::PeriodicMetadata

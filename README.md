@@ -261,29 +261,41 @@ not accept `max_output_tokens`, `temperature`, or `top_p`; the proxy advertises
 them in `unsupported_parameters` and removes them before forwarding, including
 `temperature: 0`. Native OpenAI providers receive these fields unchanged.
 
+If a zstd-compressed ChatGPT HTTP request receives exactly
+`400 {"detail":"Bad Request"}`, the proxy retries the same JSON once without
+compression, within the existing retry budget. This covers Messages and native
+Responses, including tool auto-review requests. Other validation errors retain
+their normal behavior.
+
 `openai/gpt-6-astra` advertises Responses and reasoning capabilities, including
 the public API's 1,050,000-token context and 128,000-token output limit. Messages
 requests for this model also use Responses. The ChatGPT fallback uses the Codex
 catalog's 272,000-token default context; online metadata and explicit capability
 overrides take precedence. These provider limits are separate.
 
-The ChatGPT fallback catalog also includes `gpt-6-sol`, `gpt-6-luna`, and
-`gpt-6.1-sol` with the 272,000-token active context, plus `gpt-6.1-terra` with
-the Codex catalog's 500,000-token active context. Lane selection follows the
-default policy below.
+The ChatGPT fallback catalog uses 500,000-token active windows for
+`gpt-6.1-sol`, `gpt-6.1-terra`, and `gpt-6.2-sol`. It uses 272,000 for
+`gpt-6-sol`, `gpt-6-luna`, and `gpt-6.2-astra`. Both GPT-6.2 models use the
+catalog's Lite hint and map Ultra to an upstream `xhigh` effort.
 Service tiers are sent only when requested or configured; an explicit `flex`
 tier is retained even when the catalog omits it. Flex capacity failures return
 503 with `x-should-retry: false` before streaming begins.
 
 Responses failures retain server retry advice and request IDs. HTTP retry delays
-over five seconds are returned to the caller instead of retried early. Unknown
-incomplete-response reasons are errors on translated Messages/Chat streams;
-native Responses preserves the original terminal event. Token-limit and
+over five seconds are returned to the caller. Unknown incomplete-response reasons
+are errors on translated Messages/Chat streams. Native Responses preserves the
+original terminal event and structured error codes. API key, project, and
+organization spend limits keep their native HTTP 429 status and skip upstream
+retries. Token-limit and
 content-filter finish reasons retain their existing mappings. Terminal SSE events
 close the upstream read without waiting for the server to close its socket.
 Model-not-found and audio-validation failures are terminal across HTTP, SSE,
 and WebSocket transports. Policy-restricted capacity remains retryable and is
 returned as 529 with the upstream `Retry-After` advice.
+
+ChatGPT upstream WebSocket requests use frames of up to 1 MiB and honor the
+peer's advertised message size. In Auto mode, requests over the peer limit or
+closed with code 1009 before the first server text frame use SSE for that request.
 
 Messages translation over ChatGPT SSE briefly stages known initialization events
 before exposing output for up to five seconds, committing when 64 events or

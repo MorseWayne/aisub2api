@@ -1911,6 +1911,7 @@ async fn stream_leader_response(
                                 had_error = true;
                                 terminal_reason = "response_failed";
                                 last_error = Some(message);
+                                tool_use_pending = false;
                             }
                             if provider_event_starts_tool_use(&event) {
                                 tool_use_pending = true;
@@ -2806,15 +2807,16 @@ fn provider_event_type(event: &ProviderEvent) -> String {
 
 fn native_response_failure_message(event: &ProviderEvent) -> Option<String> {
     let aisub2api_providers::NativeProviderEvent::OpenAiResponses(event) = event.native_event()?;
-    if event.data.get("type").and_then(Value::as_str) != Some("response.failed") {
-        return None;
-    }
+    let message_paths = match event.data.get("type").and_then(Value::as_str) {
+        Some("response.failed") => &["/response/error/message"][..],
+        Some("error") => &["/error/message", "/message"][..],
+        _ => return None,
+    };
     Some(
-        event
-            .data
-            .pointer("/response/error/message")
-            .and_then(Value::as_str)
-            .filter(|message| !message.trim().is_empty())
+        message_paths
+            .iter()
+            .filter_map(|path| event.data.pointer(path).and_then(Value::as_str))
+            .find(|message| !message.trim().is_empty())
             .unwrap_or("upstream response failed")
             .to_string(),
     )
@@ -4813,6 +4815,7 @@ mod tests {
             }
             .with_upstream_metadata(UpstreamErrorMetadata {
                 status: 429,
+                code: None,
                 retry_after: Some(5),
                 request_id: Some("req_abc".to_string()),
                 message: Some("slow down".to_string()),
