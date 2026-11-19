@@ -152,10 +152,8 @@ fn convert_chat_request(
         .ok_or_else(|| RequestError::invalid("messages", "messages must be an array"))?;
     let (system, messages) = convert_chat_messages(messages_array)?;
 
-    let max_tokens = merge_token_limits(
-        optional_u32(&object, "max_tokens")?,
-        optional_u32(&object, "max_completion_tokens")?,
-    )?;
+    let legacy_max_tokens = optional_u32(&object, "max_tokens")?;
+    let max_tokens = optional_u32(&object, "max_completion_tokens")?.or(legacy_max_tokens);
     let stream = optional_bool(&object, "stream")?.unwrap_or(false);
     let include_usage = chat_include_usage(&object)?;
     let (mut tools, tool_choice) =
@@ -385,20 +383,6 @@ fn optional_f32(object: &Map<String, Value>, key: &str) -> Result<Option<f32>, R
             .as_f64()
             .map(|value| Some(value as f32))
             .ok_or_else(|| RequestError::invalid(key, format!("{key} must be a finite number"))),
-    }
-}
-
-fn merge_token_limits(
-    legacy: Option<u32>,
-    current: Option<u32>,
-) -> Result<Option<u32>, RequestError> {
-    match (legacy, current) {
-        (Some(legacy), Some(current)) if legacy != current => Err(RequestError::invalid(
-            "max_completion_tokens",
-            "max_tokens and max_completion_tokens must match when both are supplied",
-        )),
-        (_, Some(current)) => Ok(Some(current)),
-        (legacy, None) => Ok(legacy),
     }
 }
 
@@ -908,20 +892,21 @@ mod tests {
             (Some(4096), None, 4096),
             (None, Some(1200), 1200),
             (Some(16384), Some(16384), 16384),
+            (Some(4096), Some(1200), 1200),
+            (Some(4096), Some(8192), 8192),
         ] {
             let (request, _) =
                 convert_chat_request(chat_request_with_token_limits(legacy, current)).unwrap();
             assert_eq!(request.max_tokens, Some(expected));
         }
 
-        let error = convert_chat_request(chat_request_with_token_limits(Some(4096), Some(1200)))
-            .unwrap_err();
-        assert_eq!(error.param.as_deref(), Some("max_completion_tokens"));
-        assert_eq!(
-            error.message,
-            "max_tokens and max_completion_tokens must match when both are supplied"
-        );
-        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+        for key in ["max_tokens", "max_completion_tokens"] {
+            let mut input = chat_request_with_token_limits(Some(4096), Some(1200));
+            input[key] = json!(-1);
+            let error = convert_chat_request(input).unwrap_err();
+            assert_eq!(error.param.as_deref(), Some(key));
+            assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+        }
     }
 
     #[test]

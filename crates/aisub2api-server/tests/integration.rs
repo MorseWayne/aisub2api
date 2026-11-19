@@ -818,7 +818,9 @@ async fn test_openai_chat_completions_non_streaming() {
             "messages": [
                 {"role": "developer", "content": "Be concise"},
                 {"role": "user", "content": "Hi"}
-            ]
+            ],
+            "max_tokens": 4096,
+            "max_completion_tokens": 1200
         }))
         .send()
         .await
@@ -847,6 +849,8 @@ async fn test_openai_chat_completions_streaming() {
         .json(&json!({
             "model": "gpt-4",
             "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 4096,
+            "max_completion_tokens": 8192,
             "stream": true,
             "stream_options": {"include_usage": true}
         }))
